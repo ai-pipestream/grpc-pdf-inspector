@@ -296,12 +296,24 @@ const server = createServer(async (req, res) => {
       let html = await readFile(path.join(publicDir, "index.html"), "utf8");
       if (UI_BASE) {
         html = html.replace("</head>", `<meta name="ui-base" content="${UI_BASE}">\n</head>`);
+        // Module imports are resolved against the page URL; point the vendored
+        // renderer at the prefixed path so it survives the shell mount.
+        html = html.replace('"./vendor/', `"${UI_BASE}/vendor/`);
       }
       res.writeHead(200, {
         "content-type": "text/html; charset=utf-8",
         "cache-control": "no-store",
       });
       return res.end(html);
+    }
+    // The markdown renderer, served straight out of node_modules so the page
+    // stays buildless. Pinned by package-lock like every other dependency.
+    if (req.method === "GET" && pathname === "/vendor/marked.esm.js") {
+      res.writeHead(200, {
+        "content-type": "text/javascript; charset=utf-8",
+        "cache-control": "no-store",
+      });
+      return res.end(await readFile(path.join(path.dirname(fileURLToPath(import.meta.url)), "node_modules", "marked", "lib", "marked.esm.js")));
     }
     if (req.method === "GET" && pathname === "/favicon.ico") {
       res.writeHead(204);

@@ -92,6 +92,9 @@ export function summarizeEvent(response) {
       pageNo: payload.pageNo,
       chars: markdown.length,
       preview: clip(markdown.replace(/\s+/g, " ").trim()),
+      // Verbatim, for the rendered preview pane. Demo-scale PDFs only; a
+      // production client would not forward whole documents over SSE.
+      markdown,
     }];
   }
   if (kind === "document") {
