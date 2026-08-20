@@ -1,0 +1,141 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// gRPC service contract for the PDF inspector.
+//
+// The server takes a PDF, classifies it in memory, and — when the pages
+// carry a real text layer — streams the markdown back page by page. It is
+// the fleet's cheap routing answer for PDF: text-based documents extract
+// locally in milliseconds; scanned and image-based pages are reported by
+// number so the caller can send only those to a heavy OCR path.
+//
+// The stream is the product. `info` arrives after the ~10-50ms
+// classification, long before extraction finishes, so a caller can route
+// the document without paying for the body of the stream. Each `page`
+// arrives as that page's markdown is ready. `status` is a trailer carrying
+// counts and the layout analysis, never the payload. There is deliberately
+// no unary "give me the whole document" RPC: it would be a batch API
+// wearing this one's clothes.
+//
+// Nothing is written to disk at any point, and the server never OCRs.
+
+syntax = "proto3";
+
+package ai.pipestream.pdf.v1;
+
+import "ai/pipestream/pdf/v1/types.proto";
+
+option java_multiple_files = true;
+option java_outer_classname = "PdfServiceProto";
+
+// PdfParseService classifies PDFs and streams per-page markdown.
+//
+// Named for what it parses rather than for `ParsePdf`, because a service
+// name is baked into every method path and is the one thing here that
+// cannot be changed additively later.
+service PdfParseService {
+  // Classifies a PDF and streams the results, chunks in and events out.
+  //
+  // The first request message must carry `options`; every subsequent
+  // message carries a `chunk` of PDF bytes, in order. Half-close the
+  // request stream to signal the end of the upload.
+  //
+  // The upload is fully received before the first event, and that is a
+  // property of PDF rather than a choice: the cross-reference table lives
+  // at the end of the file, so no page can be located until the last byte
+  // has arrived. Streaming begins the moment it is possible to begin,
+  // which is why this is `info`-then-pages rather than one big response.
+  //
+  // A successful stream is exactly: one `info`, then `page` events in
+  // requested page order (FULL mode, text-bearing documents only), then
+  // one `status`. A failed stream ends with a gRPC status and no `status`
+  // event:
+  //
+  //   RESOURCE_EXHAUSTED  the upload exceeded its byte cap
+  //   INVALID_ARGUMENT    not a PDF, truncated or malformed, encrypted
+  //                       without a working password, or page 0 in
+  //                       `options.pages`
+  //   INTERNAL            a bug here; the parser panicked
+  //
+  // Events already delivered before a failure remain valid. They describe
+  // what was really in the document, and a partial extraction is still
+  // worth what was paid for it.
+  rpc ParsePdf(stream ParsePdfRequest) returns (stream ParsePdfResponse);
+
+  // Reports the build and the limits this server enforces.
+  //
+  // Cheap and side-effect free. Call it to learn the ceilings before
+  // uploading.
+  rpc GetServiceInfo(GetServiceInfoRequest) returns (GetServiceInfoResponse);
+}
+
+// ParsePdfRequest is one frame of the request stream.
+message ParsePdfRequest {
+  // Exactly one per message, in the order given.
+  oneof frame {
+    // Must be the first frame. Sending it twice is an error.
+    PdfOptions options = 1;
+
+    // A chunk of PDF bytes, in order. Chunks are concatenated; where the
+    // boundaries fall has no effect on the events produced. Chunk size is
+    // a throughput knob, bounded by `ServerLimits.max_chunk_bytes`.
+    bytes chunk = 2;
+  }
+}
+
+// ParsePdfResponse is one event of the response stream.
+message ParsePdfResponse {
+  // Exactly one per message.
+  //
+  // Unknown variants must be ignored rather than treated as failures: this
+  // oneof is the extension point, and a later server may add events an
+  // older client has no name for.
+  oneof event {
+    // Always the first event: the classification. Sent before any page is
+    // extracted.
+    PdfInfo info = 1;
+
+    // One extracted page of markdown, in requested page order. FULL mode
+    // only.
+    PageMarkdown page = 2;
+
+    // Always the last event of a successful stream. Counts, warnings, and
+    // the layout analysis.
+    ParseStatus status = 3;
+  }
+}
+
+// GetServiceInfoRequest asks for the server's build and limits. It carries
+// no arguments; the message exists so the RPC can gain them additively.
+message GetServiceInfoRequest {}
+
+// GetServiceInfoResponse describes the running server.
+message GetServiceInfoResponse {
+  // Service name, always `grpc-pdf-inspector`.
+  string name = 1;
+
+  // Crate version of the running binary, for example `0.1.0`.
+  string version = 2;
+
+  // The limits this server enforces on every ParsePdf call.
+  ServerLimits limits = 3;
+
+  // Optional capability tokens, for clients that need to branch on what
+  // this build can do. Unrecognized tokens must be ignored.
+  repeated string features = 4;
+
+  // Frontend advertisement for the shared demo shell.
+  UiInfo ui = 5;
+}
+
+// Frontend advertisement. Same shape in every ai-pipestream grpc service:
+// the demo shell reads it to build its tab bar.
+message UiInfo {
+  // Tab title.
+  string title = 1;
+
+  // Shell mount path.
+  string path = 2;
+
+  // One line, used as the tab tooltip.
+  string description = 3;
+}

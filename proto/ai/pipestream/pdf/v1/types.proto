@@ -1,0 +1,247 @@
+// SPDX-License-Identifier: Apache-2.0
+//
+// Shared types for the PDF inspector: the per-call options, the three event
+// payloads that make up the response stream, and the server's advertised
+// limits.
+//
+// A PDF is either cheap to read or expensive to read, and the difference is
+// whether its pages carry a real text layer. This service exists to answer
+// that question in tens of milliseconds (`info`), and to stream the text
+// layer out page by page when there is one (`page` events). Pages without a
+// usable text layer are *reported* (`pages_needing_ocr`) so a caller can
+// route only those to a heavy OCR path; this server never OCRs.
+
+syntax = "proto3";
+
+package ai.pipestream.pdf.v1;
+
+option java_multiple_files = true;
+option java_outer_classname = "PdfTypesProto";
+
+// ProcessMode selects how far the pipeline runs for one call.
+//
+// Detection is always performed and always reported in `info`; the mode only
+// governs what happens after it.
+enum ProcessMode {
+  // The server default: FULL.
+  PROCESS_MODE_UNSPECIFIED = 0;
+
+  // Classify only. The stream is `info`, then `status`; no page is
+  // extracted. This is the ~10-50ms routing answer.
+  PROCESS_MODE_DETECT_ONLY = 1;
+
+  // Classify and analyze the text layer (layout complexity, encoding
+  // issues) without producing markdown. The stream is `info`, then
+  // `status` carrying the analysis; no `page` events.
+  PROCESS_MODE_ANALYZE = 2;
+
+  // Classify and extract markdown per page. The stream is `info`, then one
+  // `page` event per extracted page, then `status`.
+  PROCESS_MODE_FULL = 3;
+}
+
+// PdfOptions configures a single ParsePdf call.
+message PdfOptions {
+  // How far the pipeline runs. Absent means FULL.
+  ProcessMode mode = 1;
+
+  // 1-indexed pages to process, empty meaning all pages. Page 0 is
+  // rejected with INVALID_ARGUMENT. Detection always covers the whole
+  // document; this selects which pages are analyzed or extracted.
+  //
+  // Note the indexing: PDF page numbers on this wire are 1-indexed, as
+  // they are in every viewer. (The underlying library's per-page
+  // extraction API is 0-indexed; the server converts.)
+  repeated uint32 pages = 2;
+
+  // Password for an encrypted PDF. Empty means none; an encrypted PDF
+  // without a working password fails with INVALID_ARGUMENT.
+  //
+  // With a password set, FULL mode falls back to whole-document extraction
+  // (the library's per-page API takes no password): the markdown arrives
+  // as a single `page` event with `page_no` 0 and the trailer carries a
+  // PARSE_WARNING_CODE_PASSWORD_FALLBACK warning.
+  string password = 3;
+}
+
+// PdfType is the routing answer: how the pages' content is stored.
+enum PdfType {
+  // Never sent by the server; the detection always reaches a conclusion or
+  // the call fails.
+  PDF_TYPE_UNSPECIFIED = 0;
+
+  // Pages carry a real text layer (text operators). Markdown extraction is
+  // cheap and reliable.
+  PDF_TYPE_TEXT_BASED = 1;
+
+  // Pages are raster scans with no text layer. Every page needs OCR.
+  PDF_TYPE_SCANNED = 2;
+
+  // Pages are mostly images with minimal or no text. Extraction is
+  // skipped; most pages need OCR.
+  PDF_TYPE_IMAGE_BASED = 3;
+
+  // Some pages have text, some are image-heavy. Text pages extract
+  // normally; `pages_needing_ocr` names the rest.
+  PDF_TYPE_MIXED = 4;
+}
+
+// OcrReason names why a page's text layer is unusable, when known.
+enum OcrReason {
+  // Never sent. Present because proto3 requires a zero value.
+  OCR_REASON_UNSPECIFIED = 0;
+
+  // The page has no extractable text and no image to OCR: blank, or
+  // content the parser cannot reach.
+  OCR_REASON_NO_TEXT = 1;
+
+  // The page is a scanned image (a full-page raster) with no usable text
+  // layer.
+  OCR_REASON_SCANNED = 2;
+
+  // The page has a text layer, but it decodes to mojibake (broken font
+  // encodings), so extraction cannot be trusted.
+  OCR_REASON_SUSPECTED_GARBLED = 3;
+
+  // The page's text is drawn as vector outlines (path operators) rather
+  // than real text operators, so there are no characters to extract.
+  OCR_REASON_VECTOR_TEXT = 4;
+}
+
+// PageOcrReasons lists the OCR reasons for one page.
+message PageOcrReasons {
+  // The 1-indexed page the reasons concern.
+  uint32 page = 1;
+
+  // Machine-readable reasons, in detection order.
+  repeated OcrReason reasons = 2;
+}
+
+// LayoutComplexity reports whether the text layer's layout is simple
+// enough for plain markdown to represent faithfully.
+//
+// It is computed from extracted text positions, which is why it arrives on
+// the `status` trailer rather than on `info`: detection alone does not
+// look at positions.
+message LayoutComplexity {
+  // True when any page has tables or multi-column text.
+  bool is_complex = 1;
+
+  // 1-indexed pages where table borders were detected.
+  repeated uint32 pages_with_tables = 2;
+
+  // 1-indexed pages where multi-column text was detected.
+  repeated uint32 pages_with_columns = 3;
+}
+
+// PdfInfo is the opening event of every successful stream.
+//
+// It is sent as soon as classification completes — tens of milliseconds
+// for a typical document, before a single page has been extracted — so a
+// caller can make its routing decision (fast local markdown versus the
+// OCR path) without waiting for the body of the stream.
+message PdfInfo {
+  // How the document's content is stored; the routing answer.
+  PdfType pdf_type = 1;
+
+  // Detection confidence, 0.0 to 1.0.
+  float confidence = 2;
+
+  // Total pages in the document.
+  uint32 page_count = 3;
+
+  // Title from the PDF metadata, empty when the document declares none.
+  string title = 4;
+
+  // 1-indexed pages whose text layer is unusable and which therefore need
+  // OCR. Empty for a fully text-based document. In FULL mode these pages
+  // still get a `page` event, with empty markdown.
+  repeated uint32 pages_needing_ocr = 5;
+
+  // Why each of those pages needs OCR, when the cause is known.
+  repeated PageOcrReasons ocr_reasons = 6;
+
+  // Milliseconds the classification itself took, so a caller can check
+  // that the cheap answer stayed cheap.
+  uint64 detection_time_ms = 7;
+}
+
+// PageMarkdown is one extracted page, in requested page order.
+//
+// Emitted only in FULL mode, and only for text-based and mixed documents;
+// scanned and image-based documents have nothing to extract and produce
+// none. With the password fallback (see PdfOptions.password) the whole
+// document's markdown arrives as one event with `page_no` 0.
+message PageMarkdown {
+  // The 1-indexed page this markdown came from, or 0 for the
+  // whole-document fallback.
+  uint32 page_no = 1;
+
+  // The page's text layer as markdown. Empty when the page needs OCR.
+  string markdown = 2;
+}
+
+// ParseWarningCode names a condition that did not stop the parse.
+enum ParseWarningCode {
+  // Never sent. Present because proto3 requires a zero value.
+  PARSE_WARNING_CODE_UNSPECIFIED = 0;
+
+  // A password was supplied, so FULL mode used whole-document extraction:
+  // the markdown arrived as one `page` event with `page_no` 0 instead of
+  // one event per page.
+  PARSE_WARNING_CODE_PASSWORD_FALLBACK = 1;
+}
+
+// ParseWarning is one non-fatal observation, carried on ParseStatus.
+message ParseWarning {
+  // What happened.
+  ParseWarningCode code = 1;
+
+  // Human-readable detail, for logs. Not a stable contract; switch on
+  // `code`.
+  string message = 2;
+}
+
+// ParseStatus is the trailer that closes every successful stream.
+//
+// It is a receipt, not the payload: everything worth having has already
+// been delivered by the time it arrives. The layout analysis lives here
+// rather than on `info` because it is computed from extracted text
+// positions, after `info` has already gone out.
+message ParseStatus {
+  // How many `page` events were emitted. Equals the number of requested
+  // pages on a complete FULL stream; zero in DETECT_ONLY and ANALYZE.
+  uint32 pages_extracted = 1;
+
+  // Non-fatal observations, in the order they occurred.
+  repeated ParseWarning warnings = 2;
+
+  // Layout complexity of the text layer. Populated in ANALYZE and FULL for
+  // text-bearing documents; the zero value otherwise.
+  LayoutComplexity layout = 3;
+
+  // True when broken font encodings were detected in the text layer
+  // (garbled text, replacement characters). Extraction output should not
+  // be trusted; route to OCR. Meaningful in ANALYZE and FULL only.
+  bool has_encoding_issues = 4;
+
+  // Wall-clock milliseconds for the whole call, classification included.
+  uint64 processing_time_ms = 5;
+}
+
+// ServerLimits reports the ceilings a server actually enforces.
+message ServerLimits {
+  // Largest accepted upload in bytes, measured as it is received.
+  // Exceeding it fails the call with RESOURCE_EXHAUSTED before the
+  // document is parsed.
+  uint64 max_document_bytes = 1;
+
+  // Largest single `chunk` frame the server will accept on the request
+  // stream. A larger upload is legal; split it across more frames.
+  uint64 max_chunk_bytes = 2;
+
+  // How many ParsePdf calls may run concurrently. Further calls wait
+  // rather than being refused, because the bound exists to cap CPU and
+  // heap, not to shed load.
+  uint32 max_concurrent_parses = 3;
+}

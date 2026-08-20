@@ -1,0 +1,36 @@
+[package]
+name = "grpc-pdf-inspector"
+version = "0.1.0"
+description = "A gRPC server that classifies PDFs in memory and streams per-page markdown back"
+license = "Apache-2.0"
+readme = "README.md"
+keywords = ["pdf", "grpc", "streaming", "classification", "markdown"]
+categories = ["parsing", "network-programming"]
+edition = "2024"
+# tonic 0.14 and tonic-prost 0.14 both declare 1.88; nothing else here is
+# newer, so the transport sets the floor.
+rust-version = "1.88"
+publish = false # Server binary; not a library for crates.io.
+
+[dependencies]
+# firecrawl's MIT-licensed PDF classifier/extractor. Default features only:
+# pure Rust (lopdf + rayon), no models, no ONNX. The firecrawl monorepo itself
+# is AGPL and is never touched; this is the published crate only.
+pdf-inspector = "1.15"
+prost = "0.14.4"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+tonic = { version = "0.14.6", features = ["gzip", "zstd"] }
+tonic-health = "0.14.6"
+tonic-prost = "0.14.6"
+tonic-reflection = "0.14.6"
+
+[dev-dependencies]
+# Tests author every PDF fixture in memory with the same PDF library
+# pdf-inspector reads with; nothing binary is committed.
+lopdf = "0.38"
+tokio-stream = { version = "0.1.19", features = ["net"] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"
