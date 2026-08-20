@@ -1,0 +1,471 @@
+<!doctype html>
+<!-- SPDX-License-Identifier: Apache-2.0 -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>grpc-pdf-inspector: classify first, then stream</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #fbfbfd;      --panel: #fff;    --ink: #16181d;   --dim: #6a7080;
+    --line: #e2e5ec;    --accent: #2f6df6; --live: #12a150; --warn: #d1442f;
+    --ocr: #b7791f;     --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1014;    --panel: #171a21; --ink: #e6e8ee;   --dim: #949bab;
+      --line: #262b36;  --accent: #6b9bff; --live: #37d67a; --warn: #ff7a63;
+      --ocr: #e0a94f;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { padding: 24px 24px 8px; }
+  h1 { margin: 0; font-size: 20px; letter-spacing: -.01em; }
+  h1 code { font: 600 19px/1 var(--mono); color: var(--accent); }
+  .sub { margin: 6px 0 0; color: var(--dim); max-width: 68ch; }
+  main { padding: 16px 24px 40px; display: grid; gap: 16px; }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 10px; padding: 14px 16px;
+  }
+  .controls { display: flex; flex-wrap: wrap; gap: 12px; align-items: flex-end; }
+  label { display: block; font-size: 12px; color: var(--dim); margin-bottom: 4px; }
+  select {
+    font: 13px var(--mono); padding: 7px 9px; border-radius: 7px;
+    border: 1px solid var(--line); background: var(--bg); color: var(--ink);
+  }
+  .checks { display: flex; gap: 14px; padding-bottom: 6px; }
+  .checks label { display: flex; gap: 5px; align-items: center; margin: 0; font-size: 12.5px; color: var(--ink); }
+  button {
+    font: 600 13px system-ui; padding: 8px 16px; border-radius: 7px; border: 0;
+    background: var(--accent); color: #fff; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  .throttle { display: flex; align-items: center; gap: 8px; }
+  .throttle input { width: 130px; }
+  .hint { font-size: 12px; color: var(--dim); }
+
+  /* Upload bar. It always fills before the first event: a PDF cannot be
+     read until its last byte, so the bar's job is to make that visible. */
+  .track {
+    position: relative; height: 26px; border-radius: 6px;
+    background: var(--bg); border: 1px solid var(--line); overflow: hidden;
+  }
+  .fill { height: 100%; width: 0; background: var(--accent); opacity: .22; transition: width .08s linear; }
+  .fill.done { background: var(--live); }
+  .track-label {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: space-between; padding: 0 10px;
+    font: 11px var(--mono); color: var(--dim);
+  }
+  .verdict { margin-top: 10px; font-size: 14px; }
+  .verdict strong { color: var(--live); }
+  .verdict.idle { color: var(--dim); }
+
+  /* The classification card: the routing answer, drawn from `info`. */
+  #classify { display: none; }
+  #classify.on { display: block; }
+  .badge {
+    display: inline-block; font: 600 13px var(--mono); padding: 3px 10px;
+    border-radius: 999px; border: 1px solid var(--line);
+  }
+  .badge.text { color: var(--live); border-color: var(--live); }
+  .badge.ocr { color: var(--ocr); border-color: var(--ocr); }
+  .classify-grid { display: flex; flex-wrap: wrap; gap: 22px; margin-top: 10px; }
+  .classify-grid b { display: block; font: 600 18px/1.2 var(--mono); }
+  .classify-grid span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+
+  .stats { display: flex; flex-wrap: wrap; gap: 22px; }
+  .stat b { display: block; font: 600 20px/1.2 var(--mono); }
+  .stat span { font-size: 11px; color: var(--dim); text-transform: uppercase; letter-spacing: .05em; }
+
+  .split { display: grid; grid-template-columns: minmax(0, 1fr) 300px; gap: 16px; }
+  @media (max-width: 860px) { .split { grid-template-columns: 1fr; } }
+
+  #feed { max-height: 52vh; min-height: 220px; overflow-y: auto; font: 12.5px/1.65 var(--mono); }
+  .ev { padding: 1px 0; }
+  .ev.new { animation: flash .5s ease-out; }
+  @keyframes flash { from { background: color-mix(in srgb, var(--live) 26%, transparent); } }
+  .k { color: var(--dim); }
+  .n { color: var(--accent); font-weight: 600; }
+  .doc { color: var(--ocr); font-weight: 600; }
+  .txt { color: var(--live); }
+  .err { color: var(--warn); font-weight: 600; }
+
+  #pages h2 { margin: 0 0 2px; font-size: 15px; }
+  #pages .meta { font-size: 12.5px; color: var(--dim); }
+  #pages .meta div { padding: 1px 0; }
+  #pages .meta b { color: var(--ink); font-weight: 600; }
+  .pages-track {
+    margin-top: 10px; height: 8px; border-radius: 4px;
+    background: var(--bg); border: 1px solid var(--line); overflow: hidden;
+  }
+  .pages-fill { height: 100%; width: 0; background: var(--live); transition: width .15s ease-out; }
+  footer { padding: 0 24px 32px; color: var(--dim); font-size: 12.5px; max-width: 78ch; }
+  footer code { font-family: var(--mono); }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>Watching <code>grpc-pdf-inspector</code> route a PDF</h1>
+  <p class="sub">
+    One HTTP request carries the PDF up while events come back down, the
+    same shape as the gRPC call underneath. A PDF's cross-reference table is
+    its last bytes, so nothing can begin until the upload bar fills &mdash;
+    then <code>info</code>, the classification, arrives in tens of
+    milliseconds, long before any page is extracted. That event is the
+    routing answer: text-based documents stream their markdown page by page;
+    scanned and image pages are named in <code>pages_needing_ocr</code> so a
+    caller can send only those to a heavy OCR path. This server never OCRs.
+  </p>
+</header>
+
+<main>
+  <div class="panel controls">
+    <div>
+      <label for="sample">Document</label>
+      <select id="sample"></select>
+    </div>
+    <div>
+      <label for="pick">&hellip;or a local .pdf</label>
+      <input id="pick" type="file" accept=".pdf,application/pdf">
+    </div>
+    <div>
+      <label for="mode">Mode</label>
+      <select id="mode">
+        <option value="full">full (classify + markdown)</option>
+        <option value="detect">detect only (the routing answer)</option>
+        <option value="analyze">analyze (layout, no markdown)</option>
+      </select>
+    </div>
+    <div class="checks">
+      <label><input id="document" type="checkbox"> document fold</label>
+    </div>
+    <div class="throttle">
+      <div>
+        <label for="delay">Upload throttle</label>
+        <input id="delay" type="range" min="0" max="120" step="10" value="30">
+      </div>
+      <span class="hint"><span id="delayLabel">30 ms / chunk</span><br><span id="chunkLabel"></span></span>
+    </div>
+    <div class="throttle">
+      <div>
+        <label for="pace">Event pace</label>
+        <input id="pace" type="range" min="0" max="500" step="20" value="140">
+      </div>
+      <span class="hint"><span id="paceLabel">140 ms / event</span><br>display only</span>
+    </div>
+    <button id="run">Inspect it</button>
+  </div>
+
+  <div class="panel">
+    <div class="track">
+      <div class="fill" id="fill"></div>
+      <div class="track-label"><span id="fedLabel">idle</span><span id="sizeLabel"></span></div>
+    </div>
+    <p class="verdict idle" id="verdict">Pick a document and press inspect.</p>
+  </div>
+
+  <div class="panel" id="classify">
+    <span class="badge" id="cType">?</span>
+    <div class="classify-grid">
+      <div><b id="cConf">&ndash;</b><span>confidence</span></div>
+      <div><b id="cPages">&ndash;</b><span>pages</span></div>
+      <div><b id="cOcr">&ndash;</b><span>pages needing OCR</span></div>
+      <div><b id="cMs">&ndash;</b><span>detection ms (server-side)</span></div>
+    </div>
+  </div>
+
+  <div class="panel stats">
+    <div class="stat"><b id="sEvents">0</b><span>events</span></div>
+    <div class="stat"><b id="sPages">0</b><span>pages streamed</span></div>
+    <div class="stat"><b id="sChars">0</b><span>markdown chars</span></div>
+    <div class="stat"><b id="sMs">&ndash;</b><span>ms, last byte &rarr; classification</span></div>
+  </div>
+
+  <div class="split">
+    <div class="panel">
+      <div id="feed"></div>
+    </div>
+    <div class="panel" id="pages">
+      <h2 id="pTitle">No document yet</h2>
+      <div class="meta" id="pMeta"></div>
+      <div class="pages-track"><div class="pages-fill" id="pagesFill"></div></div>
+      <div class="meta" id="pagesLabel" style="margin-top:4px">page progress</div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  The upload throttle delays the <em>upload</em> only; the event pace delays
+  how fast rows are <em>drawn</em>, by pausing the gRPC stream between
+  events. Neither changes what the server does. Try
+  <code>scanned-image.pdf</code> against <code>hello-text.pdf</code>: the
+  classification arrives just as fast for both, but the scanned document has
+  no text layer, so instead of page markdown its <code>info</code> names
+  every page in <code>pages_needing_ocr</code> &mdash; that list is the whole
+  point of the service. <code>mixed.pdf</code> shows both at once. Detect
+  mode stops after the classification: no page is ever extracted.
+</footer>
+
+<script type="module">
+const $ = (id) => document.getElementById(id);
+const feed = $("feed");
+
+// The BFF injects this meta tag when it serves the page under a path prefix
+// (UI_BASE). Empty when the bridge runs at the root, so calls below are
+// unprefixed and nothing changes.
+const BASE = document.querySelector('meta[name="ui-base"]')?.content ?? "";
+
+/// More rows than any real document has pages.
+const MAX_ROWS = 500;
+
+let sizeBytes = 0;
+
+const esc = (s) => String(s).replace(/[&<>]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+const clip = (s, n = 110) => (s.length > n ? s.slice(0, n) + "…" : s);
+const num = (n) => n.toLocaleString("en-US");
+const kb = (n) =>
+  n < 1024 ? `${n} B`
+  : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KiB`
+  : `${(n / 1024 / 1024).toFixed(1)} MiB`;
+
+const TYPE_LABEL = {
+  PDF_TYPE_TEXT_BASED: "text-based",
+  PDF_TYPE_SCANNED: "scanned",
+  PDF_TYPE_IMAGE_BASED: "image-based",
+  PDF_TYPE_MIXED: "mixed",
+};
+const REASON_LABEL = {
+  OCR_REASON_NO_TEXT: "no text",
+  OCR_REASON_SCANNED: "scanned image",
+  OCR_REASON_SUSPECTED_GARBLED: "garbled encoding",
+  OCR_REASON_VECTOR_TEXT: "vector outlines",
+};
+
+async function loadSamples() {
+  const { files } = await (await fetch(`${BASE}/api/samples`)).json();
+  $("sample").innerHTML = files
+    .map((f) => `<option value="${esc(f.name)}">${esc(f.name)} (${kb(f.size)})</option>`)
+    .join("");
+  if (files.some((f) => f.name === "long-text.pdf")) $("sample").value = "long-text.pdf";
+}
+
+// A locally picked file wins over the dropdown, so changing the dropdown
+// clears the picker and the two cannot disagree silently.
+$("sample").addEventListener("change", () => { $("pick").value = ""; });
+$("delay").addEventListener("input", (e) => {
+  $("delayLabel").textContent = `${e.target.value} ms / chunk`;
+});
+$("pace").addEventListener("input", (e) => {
+  $("paceLabel").textContent = `${e.target.value} ms / event`;
+});
+
+function row(html) {
+  const div = document.createElement("div");
+  div.className = "ev new";
+  div.innerHTML = html;
+  feed.append(div);
+  while (feed.childElementCount > MAX_ROWS) feed.firstElementChild.remove();
+  feed.scrollTop = feed.scrollHeight;
+}
+
+/** Render one event as a feed row, or null to skip it. */
+function render(kind, d) {
+  switch (kind) {
+    case "info": {
+      const ocr = (d.pagesNeedingOcr ?? []).length;
+      return `<span class="k">info</span> <b>${esc(TYPE_LABEL[d.pdfType] ?? d.pdfType)}</b>`
+        + ` <span class="k">confidence ${(d.confidence ?? 0).toFixed(2)}, ${d.pageCount} pages,`
+        + ` ${ocr ? `<span class="err">${ocr} need OCR</span>` : "none need OCR"},`
+        + ` classified in ${d.detectionTimeMs} ms</span>`;
+    }
+    case "page":
+      return `<span class="n">page ${d.pageNo}</span>`
+        + ` <span class="k">${num(d.chars)} chars of markdown</span>`
+        + (d.preview ? `<br><span class="txt">${esc(clip(d.preview))}</span>` : ` <span class="err">empty &mdash; this page needs OCR</span>`);
+    case "document":
+      return `<span class="doc">document</span> the whole parse folded into one Document:`
+        + ` <b>${esc(d.name)}</b> <span class="k">${d.texts} text items, ${d.pages} pages</span>`;
+    case "status":
+      return `<span class="k">status</span> ${d.pagesExtracted} pages extracted,`
+        + ` ${d.processingTimeMs} ms wall clock`
+        + (d.layout?.isComplex ? ` <span class="err">complex layout</span>` : "")
+        + (d.hasEncodingIssues ? ` <span class="err">encoding issues</span>` : "")
+        + (d.warnings?.length ? ` <span class="err">${d.warnings.length} warnings</span>` : "");
+    case "grpc-error":
+      return `<span class="err">rpc failed</span> ${esc(d.message)}`;
+    default:
+      return null; // an arm this page has no name for; the contract says ignore it
+  }
+}
+
+function renderClassification(info) {
+  const label = TYPE_LABEL[info.pdfType] ?? info.pdfType;
+  const ocrPages = info.pagesNeedingOcr ?? [];
+  const needsOcr = ocrPages.length > 0;
+  const badge = $("cType");
+  badge.textContent = label;
+  badge.className = `badge ${needsOcr ? "ocr" : "text"}`;
+  $("cConf").textContent = (info.confidence ?? 0).toFixed(2);
+  $("cPages").textContent = num(info.pageCount);
+  $("cOcr").textContent = needsOcr ? ocrPages.join(", ") : "none";
+  $("cMs").textContent = info.detectionTimeMs;
+  $("classify").classList.add("on");
+
+  $("pTitle").textContent = info.title || "(untitled)";
+  const reasons = (info.ocrReasons ?? [])
+    .map((r) => `page ${r.page}: ${(r.reasons ?? []).map((x) => REASON_LABEL[x] ?? x).join(", ")}`);
+  const lines = [
+    ["classification", label],
+    ["needs OCR", reasons.length ? reasons.join("; ") : ""],
+  ].filter(([, v]) => v);
+  $("pMeta").innerHTML = lines.map(([k, v]) => `<div><b>${k}</b> ${esc(v)}</div>`).join("");
+  return info.pageCount;
+}
+
+function pageProgress(extracted, total) {
+  const pct = total > 0 ? (extracted / total) * 100 : 0;
+  $("pagesFill").style.width = `${pct}%`;
+  $("pagesLabel").textContent = total > 0 ? `${extracted} of ${total} pages` : "page progress";
+}
+
+// ---------------------------------------------------------------------------
+// The run
+// ---------------------------------------------------------------------------
+
+async function run() {
+  const button = $("run");
+  button.disabled = true;
+  feed.innerHTML = "";
+  $("fill").className = "fill";
+  $("fill").style.width = "0";
+  $("verdict").className = "verdict idle";
+  $("verdict").textContent = "uploading…";
+  for (const id of ["sEvents", "sPages"]) $(id).textContent = "0";
+  $("sChars").textContent = "0";
+  $("sMs").textContent = "–";
+  $("classify").classList.remove("on");
+  $("pTitle").textContent = "No document yet";
+  $("pMeta").innerHTML = "";
+  pageProgress(0, 0);
+
+  try {
+    await stream();
+  } catch (err) {
+    row(`<span class="err">page error</span> ${esc(String(err))}`);
+  } finally {
+    button.disabled = false;
+  }
+}
+
+async function stream() {
+  const picked = $("pick").files[0];
+  const body = picked
+    ? await picked.arrayBuffer()
+    : await (await fetch(`${BASE}/api/samples/${$("sample").value}`)).arrayBuffer();
+  sizeBytes = body.byteLength;
+  $("sizeLabel").textContent = kb(sizeBytes);
+
+  const params = new URLSearchParams();
+  params.set("mode", $("mode").value);
+  if ($("document").checked) params.set("document", "");
+  params.set("delayMs", $("delay").value);
+  params.set("paceMs", $("pace").value);
+
+  // Aim for roughly 40 upload steps whatever the document size. Chunk size
+  // changes nothing about the events — the server concatenates chunks before
+  // opening the PDF — only how finely the upload bar moves.
+  const chunkBytes = Math.min(1 << 20, Math.max(64, Math.ceil(sizeBytes / 40)));
+  params.set("chunkBytes", chunkBytes);
+  $("chunkLabel").textContent = `${kb(chunkBytes)} chunks`;
+
+  let events = 0, pages = 0, chars = 0, pageTotal = 0;
+  let uploadedAt = null, classifiedAt = null;
+
+  const res = await fetch(`${BASE}/api/parse?${params}`, { method: "POST", body });
+  if (!res.ok) {
+    const problem = await res.json();
+    row(`<span class="err">${esc(problem.error)}</span>`);
+    return;
+  }
+
+  // SSE over a POST response, so it is parsed by hand: EventSource only does
+  // GET, and the whole point is that the upload and the event stream are one
+  // request.
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+
+  for (;;) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+
+    let split;
+    while ((split = buffer.indexOf("\n\n")) !== -1) {
+      const raw = buffer.slice(0, split);
+      buffer = buffer.slice(split + 2);
+
+      const nl = raw.indexOf("\n");
+      if (nl < 0 || !raw.startsWith("event: ")) continue;
+      const kind = raw.slice(7, nl);
+      const rest = raw.slice(nl + 1);
+      if (!rest.startsWith("data: ")) continue;
+      const data = JSON.parse(rest.slice(6));
+
+      if (kind === "fed") {
+        $("fill").style.width = `${(data.bytes / sizeBytes) * 100}%`;
+        $("fedLabel").textContent = `${kb(data.bytes)} of ${kb(sizeBytes)} uploaded`;
+        if (data.bytes >= sizeBytes && uploadedAt === null) {
+          uploadedAt = performance.now();
+          $("fill").classList.add("done");
+          $("fedLabel").textContent = `${kb(sizeBytes)} uploaded, classifying…`;
+          $("verdict").textContent =
+            "Last byte sent. The server can only start now: a PDF's cross-reference table is at the end of the file.";
+        }
+        continue;
+      }
+      if (kind === "done") continue;
+
+      events++;
+      if (kind === "info") {
+        pageTotal = renderClassification(data);
+        pageProgress(0, pageTotal);
+        if (uploadedAt !== null) {
+          classifiedAt = performance.now();
+          const ms = Math.round(classifiedAt - uploadedAt);
+          $("sMs").textContent = ms;
+          $("verdict").className = "verdict";
+          $("verdict").innerHTML = `Classification <strong>${ms} ms</strong> after the last byte landed.`
+            + ` That is the routing answer; extraction is only now beginning.`;
+        }
+      }
+      if (kind === "page") {
+        pages++;
+        chars += data.chars;
+        pageProgress(pages, pageTotal);
+      }
+      if (kind === "status") pageProgress(data.pagesExtracted, pageTotal);
+
+      $("sEvents").textContent = num(events);
+      $("sPages").textContent = pageTotal > 0 ? `${pages} / ${pageTotal}` : num(pages);
+      $("sChars").textContent = num(chars);
+
+      const html = render(kind, data);
+      if (html) row(html);
+    }
+  }
+}
+
+$("run").addEventListener("click", run);
+await loadSamples();
+</script>
+</body>
+</html>

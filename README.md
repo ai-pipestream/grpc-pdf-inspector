@@ -112,6 +112,18 @@ grpcurl -plaintext localhost:50067 list
 grpcurl -plaintext localhost:50067 grpc.health.v1.Health/Check
 ```
 
+## Web demo
+
+`demos/node-client` is a dependency-light Node viewer: it POSTs a PDF and
+reads the parse events back off the same HTTP response, so the page shows
+the classification arriving first (with its millisecond cost) and the page
+markdown streaming behind it.
+
+```sh
+cd demos/node-client && npm install && npm start
+# open http://127.0.0.1:8093  (PDF_ADDR, PORT, UI_BASE overridable)
+```
+
 ## Develop
 
 ```sh
