@@ -144,6 +144,7 @@ async fn get_service_info_reports_the_build_the_limits_and_the_ui() {
         "diskless",
         "classification",
         "markdown",
+        "document-projection",
         "health",
         "reflection",
     ] {

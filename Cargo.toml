@@ -18,6 +18,9 @@ publish = false # Server binary; not a library for crates.io.
 # is AGPL and is never touched; this is the published crate only.
 pdf-inspector = "1.15"
 prost = "0.14.4"
+# `google.protobuf.Value`, which the vendored document schema uses for the
+# `BaseMeta.custom_fields` escape hatch the Document fold writes into.
+prost-types = "0.14.4"
 tokio = { version = "1.53.1", features = ["full"] }
 tokio-stream = { version = "0.1.19", features = ["sync"] }
 tonic = { version = "0.14.6", features = ["gzip", "zstd"] }

@@ -293,6 +293,22 @@ pub fn shape(events: &[pb::parse_pdf_response::Event]) -> Vec<&'static str> {
             pb::parse_pdf_response::Event::Info(_) => "info",
             pb::parse_pdf_response::Event::Page(_) => "page",
             pb::parse_pdf_response::Event::Status(_) => "status",
+            pb::parse_pdf_response::Event::Document(_) => "document",
+        })
+        .collect()
+}
+
+/// Every `document` event, in the order received. At most one, and only
+/// when `options.emit_document` was set.
+#[must_use]
+pub fn documents(
+    events: &[pb::parse_pdf_response::Event],
+) -> Vec<&grpc_pdf_inspector::proto::ai::pipestream::document::v1::Document> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            pb::parse_pdf_response::Event::Document(document) => Some(document),
+            _ => None,
         })
         .collect()
 }

@@ -21,6 +21,7 @@
 //!   CPU-bound and parallelizes internally with rayon). A panic becomes an
 //!   `INTERNAL` status, never a wedged stream.
 
+pub mod document_fold;
 pub mod limits;
 pub mod metrics;
 pub mod parse;
@@ -30,3 +31,16 @@ pub mod service;
 pub use limits::Limits;
 pub use metrics::Metrics;
 pub use service::PdfGrpc;
+
+/// Version of this server, reported by `GetServiceInfo` and attached to
+/// every Document item's `CollectorSource`.
+pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Name and version of the parser this build links, attached to every
+/// Document item's `CollectorSource.model`. Kept in sync with the
+/// `pdf-inspector` dependency in `Cargo.toml` by review.
+pub const PARSER: &str = "pdf-inspector 1.15";
+
+/// Value of `CollectorSource.collector` on every Document item this
+/// service produces.
+pub const COLLECTOR: &str = "pdf";

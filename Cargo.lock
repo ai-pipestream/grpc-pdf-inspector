@@ -560,6 +560,7 @@ dependencies = [
  "lopdf 0.38.0",
  "pdf-inspector",
  "prost",
+ "prost-types",
  "tokio",
  "tokio-stream",
  "tonic",

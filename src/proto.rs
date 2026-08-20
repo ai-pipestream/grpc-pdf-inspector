@@ -36,6 +36,20 @@ pub mod ai {
                 include!("gen/ai/pipestream/pdf/v1/ai.pipestream.pdf.v1.rs");
             }
         }
+
+        /// The `ai.pipestream.document` namespace.
+        pub mod document {
+            /// Messages for `ai.pipestream.document.v1`, the Document plane
+            /// this service can project a parse into.
+            ///
+            /// The schema is vendored byte-identical from the gRParse
+            /// repository and is never edited here; `document_fold` is the
+            /// only code in this crate that builds one. There is no tonic
+            /// half: the package declares no services.
+            pub mod v1 {
+                include!("gen/ai/pipestream/document/v1/ai.pipestream.document.v1.rs");
+            }
+        }
     }
 }
 

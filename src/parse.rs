@@ -35,6 +35,7 @@ use pdf_inspector::{PdfOptions, PdfType, ProcessMode};
 use tokio::sync::mpsc;
 use tonic::Status;
 
+use crate::document_fold::DocumentFold;
 use crate::metrics::Metrics;
 use crate::proto::v1 as pb;
 
@@ -154,7 +155,19 @@ fn parse(
     }
     let detected = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, detect))?;
 
-    sink.send(pb::parse_pdf_response::Event::Info(pb::PdfInfo {
+    // The optional second consumer of this stream: when the caller asked for
+    // a Document, every event is folded on its way out and the folded
+    // Document goes out after the last `page`, before the `status` trailer.
+    // With the flag off no fold is built and the path is what it was.
+    let mut fold = options.emit_document.then(DocumentFold::new);
+    let mut emit = |event: pb::parse_pdf_response::Event| -> Result<(), Abort> {
+        if let Some(fold) = fold.as_mut() {
+            fold.consume(&event);
+        }
+        sink.send(event)
+    };
+
+    emit(pb::parse_pdf_response::Event::Info(pb::PdfInfo {
         pdf_type: pdf_type(detected.pdf_type).into(),
         confidence: detected.confidence,
         page_count: detected.page_count,
@@ -213,7 +226,7 @@ fn parse(
             let processed = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, full))?;
             if let Some(markdown) = processed.markdown.filter(|md| !md.is_empty()) {
                 let markdown_bytes = markdown.len() as u64;
-                sink.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+                emit(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
                     page_no: 0,
                     markdown,
                 }))?;
@@ -238,7 +251,7 @@ fn parse(
             for page in extracted.pages {
                 let markdown_bytes = page.markdown.len() as u64;
                 // 0-indexed library page back to the 1-indexed wire page.
-                sink.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+                emit(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
                     page_no: page.page + 1,
                     markdown: page.markdown,
                 }))?;
@@ -261,6 +274,13 @@ fn parse(
         }
     }
 
+    // The fold has seen every content event now, so its Document goes out
+    // here — after the last `page`, before the `status` trailer that closes
+    // the stream. (`emit`'s borrow of the fold ended at its last call, so
+    // the fold is free to be taken.)
+    if let Some(fold) = fold.as_mut() {
+        sink.send(pb::parse_pdf_response::Event::Document(fold.take()))?;
+    }
     sink.send(pb::parse_pdf_response::Event::Status(pb::ParseStatus {
         pages_extracted,
         warnings,

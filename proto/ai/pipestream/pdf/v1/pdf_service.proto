@@ -24,6 +24,8 @@ package ai.pipestream.pdf.v1;
 
 import "ai/pipestream/pdf/v1/types.proto";
 
+import "ai/pipestream/document/v1/document.proto";
+
 option java_multiple_files = true;
 option java_outer_classname = "PdfServiceProto";
 
@@ -46,8 +48,9 @@ service PdfParseService {
   // which is why this is `info`-then-pages rather than one big response.
   //
   // A successful stream is exactly: one `info`, then `page` events in
-  // requested page order (FULL mode, text-bearing documents only), then
-  // one `status`. A failed stream ends with a gRPC status and no `status`
+  // requested page order (FULL mode, text-bearing documents only), then —
+  // only when `options.emit_document` was set — one `document`, then one
+  // `status`. A failed stream ends with a gRPC status and no `status`
   // event:
   //
   //   RESOURCE_EXHAUSTED  the upload exceeded its byte cap
@@ -101,6 +104,18 @@ message ParsePdfResponse {
     // Always the last event of a successful stream. Counts, warnings, and
     // the layout analysis.
     ParseStatus status = 3;
+
+    // The whole parse folded into one Document. Emitted once, after the
+    // last `page` event and immediately before `status`, and only when
+    // `PdfOptions.emit_document` was set.
+    //
+    // It is a projection of the events above rather than extra content:
+    // the fold that builds it consumes exactly this stream. Item refs are
+    // dense and local to this message (`#/texts/0`), so a coordinator can
+    // renumber them into a larger document. The structure is
+    // markdown-derived and coarse: paragraphs and ATX headings only, pages
+    // named but without sizes, no provenance boxes.
+    ai.pipestream.document.v1.Document document = 4;
   }
 }
 

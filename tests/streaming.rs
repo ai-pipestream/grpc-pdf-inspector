@@ -115,6 +115,9 @@ async fn info_arrives_before_extraction_runs() {
             pb::parse_pdf_response::Event::Page(_) => page_events += 1,
             pb::parse_pdf_response::Event::Status(_) => saw_trailer = true,
             pb::parse_pdf_response::Event::Info(_) => panic!("a second `info`"),
+            pb::parse_pdf_response::Event::Document(_) => {
+                panic!("a `document` without `emit_document`")
+            }
         }
     }
     assert!(matches!(

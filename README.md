@@ -32,6 +32,9 @@ info      always first: pdf_type, confidence, page_count, title,
           pages_needing_ocr + reasons, detection_time_ms
 page      FULL mode, text-bearing documents only: one per page,
           1-indexed, in requested page order
+document  only when options.emit_document is set: the whole parse folded
+          into one ai.pipestream.document.v1.Document, after the last
+          page, before status
 status    trailer: pages_extracted, warnings, layout complexity,
           has_encoding_issues, total processing_time_ms
 ```
@@ -39,6 +42,31 @@ status    trailer: pages_extracted, warnings, layout complexity,
 Modes (`options.mode`): `DETECT_ONLY` (classification only, the ~10–50ms
 routing answer), `ANALYZE` (classification + layout/encoding analysis, no
 markdown), `FULL` (classification + per-page markdown; the default).
+
+### The optional Document projection
+
+With `options.emit_document` set, the server additionally folds its own
+event stream into one `ai.pipestream.document.v1.Document` (the schema is
+vendored byte-identical from gRParse) and sends it as a `document` event
+after the last `page` and before `status`. The event stream stays the
+primary, lossless wire; the Document is a coarse, self-contained
+projection of it that a coordinator can merge additively with another
+collector's parse of the same document:
+
+- ATX headings (`#`–`####`) become `SectionHeaderItem`s with their level,
+  blank-line-separated blocks become paragraph `TextItem`s. Lists and
+  emphasis stay as markdown source in `text`.
+- `pages` carries one `PageItem` per page `info` reported — `page_no`
+  only; the stream has no page geometry, so `size` and `image` are
+  omitted rather than fabricated. Likewise items carry no `prov` boxes;
+  the page of each item is in `meta.custom_fields["pdf.page"]`.
+- Every item's `CollectorSource` is `collector: "pdf"`,
+  `model: "pdf-inspector <crate version>"`, `version: <this build's
+  version>`, `confidence: <the detection confidence from info>`.
+- Item refs are dense and local (`#/texts/0`), with headings as parents
+  docling-style, so refs renumber mechanically on merge.
+- Default off costs nothing: no fold is built and no markdown is
+  retained.
 
 Errors: oversize upload → `RESOURCE_EXHAUSTED`; not-a-PDF / truncated /
 malformed / encrypted-without-password / page 0 → `INVALID_ARGUMENT`;

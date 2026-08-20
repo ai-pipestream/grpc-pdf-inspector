@@ -190,6 +190,7 @@ impl pb::pdf_parse_service_server::PdfParseService for PdfGrpc {
                 "classification".to_owned(),
                 "page-stream".to_owned(),
                 "markdown".to_owned(),
+                "document-projection".to_owned(),
                 "health".to_owned(),
                 "reflection".to_owned(),
             ],

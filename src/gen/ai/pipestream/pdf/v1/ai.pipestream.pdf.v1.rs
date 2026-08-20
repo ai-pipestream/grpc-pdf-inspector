@@ -24,6 +24,18 @@ pub struct PdfOptions {
     /// PARSE_WARNING_CODE_PASSWORD_FALLBACK warning.
     #[prost(string, tag="3")]
     pub password: ::prost::alloc::string::String,
+    /// Also fold this parse into one `ai.pipestream.document.v1.Document` and
+    /// send it as a `document` event after the last `page` event and before
+    /// `status`. Default false, which costs nothing: no fold is built and no
+    /// markdown is retained.
+    ///
+    /// The event stream stays the primary, lossless wire; the Document is a
+    /// coarse structural projection of it — paragraphs and ATX headings parsed
+    /// back out of the page markdown, pages named but not measured — built so
+    /// a coordinator can merge it additively with another collector's parse of
+    /// the same document.
+    #[prost(bool, tag="4")]
+    pub emit_document: bool,
 }
 /// PageOcrReasons lists the OCR reasons for one page.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -354,7 +366,7 @@ pub struct ParsePdfResponse {
     /// Unknown variants must be ignored rather than treated as failures: this
     /// oneof is the extension point, and a later server may add events an
     /// older client has no name for.
-    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3")]
+    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4")]
     pub event: ::core::option::Option<parse_pdf_response::Event>,
 }
 /// Nested message and enum types in `ParsePdfResponse`.
@@ -378,6 +390,18 @@ pub mod parse_pdf_response {
         /// the layout analysis.
         #[prost(message, tag="3")]
         Status(super::ParseStatus),
+        /// The whole parse folded into one Document. Emitted once, after the
+        /// last `page` event and immediately before `status`, and only when
+        /// `PdfOptions.emit_document` was set.
+        ///
+        /// It is a projection of the events above rather than extra content:
+        /// the fold that builds it consumes exactly this stream. Item refs are
+        /// dense and local to this message (`#/texts/0`), so a coordinator can
+        /// renumber them into a larger document. The structure is
+        /// markdown-derived and coarse: paragraphs and ATX headings only, pages
+        /// named but without sizes, no provenance boxes.
+        #[prost(message, tag="4")]
+        Document(super::super::super::document::v1::Document),
     }
 }
 /// GetServiceInfoRequest asks for the server's build and limits. It carries

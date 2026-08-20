@@ -62,6 +62,18 @@ message PdfOptions {
   // as a single `page` event with `page_no` 0 and the trailer carries a
   // PARSE_WARNING_CODE_PASSWORD_FALLBACK warning.
   string password = 3;
+
+  // Also fold this parse into one `ai.pipestream.document.v1.Document` and
+  // send it as a `document` event after the last `page` event and before
+  // `status`. Default false, which costs nothing: no fold is built and no
+  // markdown is retained.
+  //
+  // The event stream stays the primary, lossless wire; the Document is a
+  // coarse structural projection of it — paragraphs and ATX headings parsed
+  // back out of the page markdown, pages named but not measured — built so
+  // a coordinator can merge it additively with another collector's parse of
+  // the same document.
+  bool emit_document = 4;
 }
 
 // PdfType is the routing answer: how the pages' content is stored.
