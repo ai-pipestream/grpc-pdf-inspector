@@ -19,6 +19,24 @@ It is the fleet's cheap routing answer for PDF:
 Nothing is written to disk at any point: the upload lives in one `Vec<u8>`
 and every library call is a `*_mem` entry point.
 
+```mermaid
+flowchart LR
+    client[Client] -->|"options, then chunk stream"| svc[PdfParseService]
+    svc --> classify["Classifier<br/>pdf-inspector detection"]
+    classify --> info["PdfInfo event<br/>pdf_type, confidence, page_count"]
+    info --> route{"Text layer<br/>per page?"}
+    route -->|"text-based / mixed pages"| extract["Per-page markdown extraction"]
+    extract --> pages["PageMarkdown events"]
+    route -->|"scanned / image-based pages"| ocr["pages_needing_ocr + reasons<br/>reported on PdfInfo"]
+    pages --> foldq{emit_document?}
+    ocr --> foldq
+    foldq -->|yes| doc["Document fold<br/>Document event"]
+    foldq -->|no| status
+    doc --> status["ParseStatus trailer"]
+    status --> client
+    ocr -.->|caller routes flagged pages| extocr["external OCR path"]
+```
+
 ## The stream
 
 `ParsePdf` is a bidirectional stream. The first request frame carries
