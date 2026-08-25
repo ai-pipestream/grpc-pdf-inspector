@@ -26,6 +26,10 @@
 //!   `page_no` and `unit` always set and `size` set from the page's own
 //!   visible box when the `metadata` event carried one. Nothing is
 //!   invented: a page whose box was never read has no size.
+//! - **Furniture is reported, not deleted.** Repeated headers, footers and
+//!   folio numbers are stripped from the body by default and used to
+//!   vanish. When the stream reports them they go into the furniture group
+//!   under `CONTENT_LAYER_FURNITURE`, which is what that layer is for.
 //! - **Metadata is the file's own.** `source_meta`, `outline`,
 //!   `attachments` and `anchors` come from the document's dictionaries
 //!   rather than from its text — an authored outline is better evidence of
@@ -76,8 +80,8 @@ pub const UNIT: &str = "pt";
 /// that is not under a section header.
 const BODY_REF: &str = "#/body";
 
-/// Self ref of the furniture group. Nothing is put in it: page chrome does
-/// not survive into extraction markdown.
+/// Self ref of the furniture group: where the lines the header, footer and
+/// folio stripper removed go, when the stream reports them.
 const FURNITURE_REF: &str = "#/furniture";
 
 /// The deepest heading level the fold recognizes. `#` through `####` map
@@ -339,6 +343,10 @@ impl DocumentFold {
 
     /// Fold one page's markdown into items.
     fn on_page(&mut self, page: &pb::PageMarkdown) {
+        self.on_page_quality(page);
+        for line in &page.furniture {
+            self.push_furniture(line, page.page_no);
+        }
         for block in blocks(&page.markdown) {
             match block {
                 Block::Table(text) => self.on_table(&text, page.page_no),
@@ -395,6 +403,61 @@ impl DocumentFold {
         }
         // A page ends whatever it was in the middle of.
         self.close_list();
+    }
+
+    /// Record what the reading pass measured about a page.
+    ///
+    /// These are measurements, not verdicts about the document: a page that
+    /// decoded to mojibake says so here even when the document as a whole
+    /// looked fine to the sampling detection.
+    fn on_page_quality(&mut self, page: &pb::PageMarkdown) {
+        if page.page_no == 0 || (!page.needs_ocr && page.replacement_runs == 0) {
+            return;
+        }
+        let page_no = i32::try_from(page.page_no).unwrap_or(i32::MAX);
+        let item = self.document.pages.entry(page_no).or_insert(doc::PageItem {
+            page_no,
+            unit: Some(UNIT.to_owned()),
+            ..doc::PageItem::default()
+        });
+        let quality = item.quality.get_or_insert_default();
+        quality.replacement_runs = Some(i32::try_from(page.replacement_runs).unwrap_or(i32::MAX));
+        if page.needs_ocr {
+            quality.ocr_recommended = Some(true);
+        }
+    }
+
+    /// Put one stripped line into the furniture layer.
+    ///
+    /// The stripper identifies repeated headers, footers and folio numbers
+    /// and deletes them. They are not body text and they do not go back
+    /// into it; they go here, which is what `CONTENT_LAYER_FURNITURE` and
+    /// the furniture group are for and why both existed empty.
+    fn push_furniture(&mut self, text: &str, page_no: u32) {
+        let self_ref = format!("#/texts/{}", self.document.texts.len());
+        self.document.texts.push(doc::BaseTextItem {
+            item: Some(doc::base_text_item::Item::Text(doc::TextItem {
+                base: Some(doc::TextItemBase {
+                    self_ref: self_ref.clone(),
+                    parent: Some(reference(FURNITURE_REF)),
+                    content_layer: doc::ContentLayer::Furniture as i32,
+                    meta: Some(doc::BaseMeta::default()),
+                    prov: provenance(page_no, None),
+                    // Which of header, footer or folio this was is not
+                    // reported by the stripper, so it is not claimed here.
+                    label: doc::DocItemLabel::Text as i32,
+                    orig: text.to_owned(),
+                    text: text.to_owned(),
+                    source: vec![doc::SourceType {
+                        source: Some(doc::source_type::Source::Collector(self.source.clone())),
+                    }],
+                    ..doc::TextItemBase::default()
+                }),
+            })),
+        });
+        if let Some(furniture) = self.document.furniture.as_mut() {
+            furniture.children.push(reference(&self_ref));
+        }
     }
 
     /// Fold one flattened table back into a grid.
@@ -978,6 +1041,13 @@ mod tests {
         })
     }
 
+    fn quality_of(document: &doc::Document, page_no: i32) -> &doc::PageQuality {
+        document.pages[&page_no]
+            .quality
+            .as_ref()
+            .expect("the page was measured")
+    }
+
     fn page(page_no: u32, markdown: &str) -> pb::parse_pdf_response::Event {
         pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
             page_no,
@@ -1064,6 +1134,14 @@ mod tests {
         let mut listed: Vec<String> = body
             .children
             .iter()
+            .chain(
+                document
+                    .furniture
+                    .as_ref()
+                    .map(|furniture| furniture.children.iter())
+                    .into_iter()
+                    .flatten(),
+            )
             .map(|child| child.r#ref.clone())
             .collect();
         for item in &document.texts {
@@ -1126,6 +1204,14 @@ mod tests {
     fn children_of(document: &doc::Document, self_ref: &str) -> Vec<doc::RefItem> {
         if self_ref == BODY_REF {
             return document.body.as_ref().expect("a body").children.clone();
+        }
+        if self_ref == FURNITURE_REF {
+            return document
+                .furniture
+                .as_ref()
+                .expect("a furniture group")
+                .children
+                .clone();
         }
         if let Some(index) = self_ref
             .strip_prefix("#/groups/")
@@ -1530,6 +1616,64 @@ mod tests {
         assert_eq!(document.texts.len(), 1, "so nothing was lost either");
         assert!(base_of(&document.texts[0]).text.contains('|'));
         assert_sound(&document);
+    }
+
+    #[test]
+    fn stripped_furniture_lands_in_the_furniture_layer() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: "the body of the page".to_owned(),
+            furniture: vec!["A Running Head".to_owned(), "12".to_owned()],
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+
+        let furniture = document.furniture.as_ref().expect("a furniture group");
+        assert_eq!(furniture.children.len(), 2);
+        let head = base_of(&document.texts[0]);
+        assert_eq!(head.text, "A Running Head");
+        assert_eq!(head.content_layer, doc::ContentLayer::Furniture as i32);
+        assert_eq!(head.prov[0].page_no, 1);
+        assert_eq!(head.parent.as_ref().unwrap().r#ref, FURNITURE_REF);
+
+        // And the body is still the body.
+        let body = base_of(&document.texts[2]);
+        assert_eq!(body.content_layer, doc::ContentLayer::Body as i32);
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_pages_text_quality_is_measured_not_asserted() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(2, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: "clean text".to_owned(),
+            ..pb::PageMarkdown::default()
+        }));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 2,
+            markdown: "garbled text".to_owned(),
+            needs_ocr: true,
+            ocr_reason: pb::OcrReason::SuspectedGarbled.into(),
+            replacement_runs: 7,
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+
+        assert!(
+            document.pages[&1].quality.is_none(),
+            "a clean page has nothing to report"
+        );
+        let quality = quality_of(&document, 2);
+        assert_eq!(quality.replacement_runs, Some(7));
+        assert_eq!(quality.ocr_recommended, Some(true));
+        assert!(
+            quality.garble_score.is_none(),
+            "the letter-frequency score is not this pipeline's to give"
+        );
     }
 
     #[test]

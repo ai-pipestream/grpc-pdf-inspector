@@ -85,6 +85,16 @@ pub struct PdfOptions {
     /// beyond the extraction pass that is already running.
     #[prost(bool, tag="8")]
     pub emit_tables: bool,
+    /// Report the page's text runs that did not survive into its markdown,
+    /// on `PageMarkdown.furniture`. Default false.
+    ///
+    /// Headers, footers and folio numbers are identified and deleted before
+    /// anything sees them, and other runs are discarded by the layout pass
+    /// for reasons no option reaches. Setting this compares the runs against
+    /// the rendering and names what is missing, so the removal is visible
+    /// without the body having to carry it.
+    #[prost(bool, tag="9")]
+    pub report_furniture: bool,
 }
 /// TableCells is one row of a detected table.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -304,6 +314,25 @@ pub struct PageMarkdown {
     /// Why, when the cause is known. UNSPECIFIED when `needs_ocr` is false.
     #[prost(enumeration="OcrReason", tag="4")]
     pub ocr_reason: i32,
+    /// How many runs of U+FFFD REPLACEMENT CHARACTER the page's text decoded
+    /// to, counting a consecutive run as one.
+    ///
+    /// This is the measurement behind `has_encoding_issues`, which is the
+    /// same fact reduced to a boolean. Three failed glyphs and a page of
+    /// cipher garble are the same boolean and very different numbers, and the
+    /// difference is what decides whether re-routing to OCR is worth it.
+    #[prost(uint32, tag="5")]
+    pub replacement_runs: u32,
+    /// The text runs that were on the page and are not in `markdown`:
+    /// repeated headers, footers, standalone folio numbers, and anything else
+    /// the layout pass discarded.
+    ///
+    /// Empty unless `PdfOptions.report_furniture` was set. Page chrome is
+    /// identified and deleted by default and the deletion used to be silent,
+    /// so it was neither visible nor auditable; this reports what went,
+    /// without putting it back into the body.
+    #[prost(string, repeated, tag="6")]
+    pub furniture: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.

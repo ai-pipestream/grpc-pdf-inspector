@@ -318,6 +318,7 @@ fn parse(
             let processed = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, full))?;
             if let Some(markdown) = processed.markdown.filter(|md| !md.is_empty()) {
                 let markdown_bytes = markdown.len() as u64;
+                let replacement_runs = replacement_runs(&markdown);
                 events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
                     page_no: 0,
                     markdown,
@@ -326,6 +327,10 @@ fn parse(
                     // `extraction_ocr_reasons` carries them instead.
                     needs_ocr: false,
                     ocr_reason: pb::OcrReason::Unspecified.into(),
+                    replacement_runs,
+                    // The whole-document API takes no markdown options, so
+                    // there is no second rendering to difference against.
+                    furniture: Vec::new(),
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -421,6 +426,25 @@ fn parse(
                     )?;
                 }
 
+                // What the page had, kept aside so the rendering can be
+                // compared against it. The runs are about to be consumed by
+                // the renderer, and their text is all the comparison needs.
+                let drawn: Vec<String> = if events.wanted(options.report_furniture) {
+                    page_items
+                        .iter()
+                        .filter(|item| {
+                            matches!(
+                                item.item_type,
+                                pdf_inspector::types::ItemType::Text
+                                    | pdf_inspector::types::ItemType::FormField
+                            )
+                        })
+                        .map(|item| item.text.clone())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+
                 let markdown = pdf_inspector::to_markdown_from_items_with_rects_and_page_count(
                     page_items,
                     MarkdownOptions::default(),
@@ -428,16 +452,20 @@ fn parse(
                     detected.page_count,
                 );
                 let markdown = markdown.trim().to_owned();
+                let furniture = dropped_runs(&drawn, &markdown);
                 let markdown_bytes = markdown.len() as u64;
                 let (needs_ocr, reason) = verdicts
                     .get(&page_no)
                     .copied()
                     .unwrap_or((false, pb::OcrReason::Unspecified));
+                let replacement_runs = replacement_runs(&markdown);
                 events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
                     page_no,
                     markdown,
                     needs_ocr,
                     ocr_reason: reason.into(),
+                    replacement_runs,
+                    furniture,
                 }))?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -463,6 +491,77 @@ fn parse(
         extraction_ocr_reasons,
     }))?;
     Ok(())
+}
+
+/// The runs the page drew that its markdown does not contain.
+///
+/// Comparing the runs against the rendering, rather than one rendering
+/// against another, is what makes this complete: a header the stripper
+/// removed and a folio the layout pass discarded for reasons no option
+/// reaches are both simply text that was on the page and is not in the
+/// output.
+///
+/// The comparison is on letters and digits only, because the renderer joins
+/// runs with spaces, repairs hyphenation across line ends and adds markdown
+/// punctuation — none of which changes a letter. A run with no letters at
+/// all (a rule, a bullet glyph) is not reported: there would be nothing to
+/// report.
+///
+/// It walks forwards through the rendering rather than searching all of it
+/// for each run, which is what keeps a one-character folio from matching
+/// the digit in a body line above it. The cost is that a run the renderer
+/// moved backwards past another run reads as dropped; reading order is
+/// what both sides are in, and a page that reorders is a page whose
+/// furniture report is approximate.
+fn dropped_runs(drawn: &[String], markdown: &str) -> Vec<String> {
+    if drawn.is_empty() {
+        return Vec::new();
+    }
+    let rendered = letters(markdown);
+    let mut cursor = 0;
+    let mut dropped = Vec::new();
+    for run in drawn {
+        let needle = letters(run);
+        if needle.is_empty() {
+            continue;
+        }
+        match rendered.get(cursor..).and_then(|rest| rest.find(&needle)) {
+            Some(at) => cursor += at + needle.len(),
+            None => dropped.push(run.trim().to_owned()),
+        }
+    }
+    dropped
+}
+
+/// A string reduced to its lower-case letters and digits.
+fn letters(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+/// How many runs of U+FFFD the text decoded to, a consecutive run counting
+/// once.
+///
+/// One replacement character is a glyph the font could not map; a run of
+/// forty is a page whose encoding is gone. Counting runs rather than
+/// characters keeps those two apart without letting a long word of garble
+/// outweigh a page of scattered failures.
+fn replacement_runs(text: &str) -> u32 {
+    let mut runs = 0;
+    let mut inside = false;
+    for character in text.chars() {
+        if character == char::REPLACEMENT_CHARACTER {
+            if !inside {
+                runs += 1;
+                inside = true;
+            }
+        } else {
+            inside = false;
+        }
+    }
+    runs
 }
 
 /// The 1-indexed pages a call asks for, in the order it asked for them.

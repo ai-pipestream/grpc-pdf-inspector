@@ -551,6 +551,66 @@ pub fn table_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a PDF of `pages` pages, each carrying a running head at the top,
+/// a folio number at the bottom, and a paragraph of body text between them.
+///
+/// The head repeats verbatim on every page and the folio counts, which is
+/// what the header, footer and page-number strippers look for. They strip
+/// by default and used to strip silently.
+#[must_use]
+pub fn furniture_pdf(pages: u32, head: &str) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let mut content = String::new();
+        content.push_str(&format!("BT /F1 9 Tf 72 760 Td ({head}) Tj ET\n"));
+        for line in 0..8 {
+            let y = 700 - 16 * line;
+            content.push_str(&format!(
+                "BT /F1 11 Tf 72 {y} Td (Body line {line} of page {page}, long enough to read as prose.) Tj ET\n"
+            ));
+        }
+        content.push_str(&format!("BT /F1 9 Tf 300 40 Td ({page}) Tj ET"));
+
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {
