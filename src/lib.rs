@@ -36,10 +36,9 @@ pub use service::PdfGrpc;
 /// every Document item's `CollectorSource`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-/// Name and version of the parser this build links, attached to every
-/// Document item's `CollectorSource.model`. Kept in sync with the
-/// `pdf-inspector` dependency in `Cargo.toml` by review.
-pub const PARSER: &str = "pdf-inspector 1.15";
+pub use parser_version::{PARSER, PARSER_CRATE, PARSER_VERSION};
+
+mod parser_version;
 
 /// Value of `CollectorSource.collector` on every Document item this
 /// service produces.
