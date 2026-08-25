@@ -15,9 +15,18 @@
 //! across line ends, and drops folios. None of that changes the letters, so
 //! none of it moves the match.
 //!
-//! A search that fails is answered with `None`, never with a box. A wrong
+//! A search that fails is answered with nothing, never with a box. A wrong
 //! box is worse than no box: it is a coordinate a downstream merge would
 //! reconcile on.
+//!
+//! The same index answers the link question. A link annotation is a
+//! rectangle and a target, and the runs whose boxes sit inside that
+//! rectangle are its anchor text — so once a block's letters are matched to
+//! its runs, the character range the link covers inside that block is
+//! arithmetic rather than inference. That is the difference between
+//! `InlineSpan.hyperlink` over the words someone actually linked and a
+//! regular expression looking for URLs in the visible text, which finds a
+//! bare URL nobody linked and misses a link whose anchor text is a word.
 
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
@@ -33,6 +42,9 @@ pub struct PageRuns {
     owners: Vec<usize>,
     /// Each run's box, in the same order the runs arrived.
     boxes: Vec<doc::BoundingBox>,
+    /// For each run, the target of the link annotation covering it, when
+    /// one does.
+    links: Vec<Option<String>>,
     /// How far into `letters` the fold has already matched. Blocks are
     /// folded in reading order, so a search normally succeeds at the
     /// cursor and never revisits the page.
@@ -63,11 +75,13 @@ impl PageRuns {
                 }
             }
         }
+        let links = anchor_targets(spans, &boxes);
         Self {
             page_no: spans.page_no,
             letters,
             owners,
             boxes,
+            links,
             cursor: 0,
         }
     }
@@ -87,20 +101,77 @@ impl PageRuns {
     /// does not move the cursor backwards, because a block found behind the
     /// cursor is evidence of reordering rather than a reason to re-read the
     /// page.
-    pub fn locate(&mut self, text: &str) -> Option<doc::BoundingBox> {
-        let needle: Vec<char> = text
-            .chars()
-            .filter(|c| c.is_alphanumeric())
-            .flat_map(char::to_lowercase)
-            .collect();
-        if needle.is_empty() {
-            return None;
+    pub fn locate(&mut self, text: &str) -> Located {
+        // Which character of `text` each of its letters came from, so a
+        // range measured in letters can be reported in the characters a
+        // consumer will index `text` with.
+        let mut needle = Vec::new();
+        let mut columns = Vec::new();
+        for (column, character) in text.chars().enumerate() {
+            if !character.is_alphanumeric() {
+                continue;
+            }
+            for lowered in character.to_lowercase() {
+                needle.push(lowered);
+                columns.push(column);
+            }
         }
-        let at = find(&self.letters, &needle, self.cursor)
-            .or_else(|| find(&self.letters, &needle, 0))?;
+        if needle.is_empty() {
+            return Located::default();
+        }
+        let Some(at) =
+            find(&self.letters, &needle, self.cursor).or_else(|| find(&self.letters, &needle, 0))
+        else {
+            return Located::default();
+        };
         let end = at + needle.len();
         self.cursor = self.cursor.max(end);
-        self.union(at, end)
+        let spans = self.hyperlink_spans(at, end, &columns);
+        // A block every one of whose letters is under the same annotation
+        // is a link in the upstream dialect's sense too, and saying so
+        // keeps the fragment readable to a consumer that has no inline
+        // spans.
+        let hyperlink = spans
+            .first()
+            .filter(|_| spans.len() == 1)
+            .filter(|span| {
+                span.range.as_ref().is_some_and(|range| {
+                    range.start == 0
+                        && usize::try_from(range.end).unwrap_or(0) == text.chars().count()
+                })
+            })
+            .and_then(|span| span.hyperlink.clone());
+        Located {
+            bbox: self.union(at, end),
+            spans,
+            hyperlink,
+        }
+    }
+
+    /// The link runs inside `letters[at..end]`, as character ranges into
+    /// the block those letters came from.
+    ///
+    /// Consecutive letters under the same annotation are one run; a block
+    /// with no linked letters gets no runs at all.
+    fn hyperlink_spans(&self, at: usize, end: usize, columns: &[usize]) -> Vec<doc::InlineSpan> {
+        let mut spans: Vec<doc::InlineSpan> = Vec::new();
+        let mut open: Option<(String, usize, usize)> = None;
+        for (offset, &owner) in self.owners[at..end].iter().enumerate() {
+            let target = self.links.get(owner).and_then(Option::as_ref);
+            match (&mut open, target) {
+                (Some((uri, _, last)), Some(target)) if uri == target => *last = offset,
+                (open_run, target) => {
+                    if let Some(run) = open_run.take() {
+                        spans.push(inline_link(&run, columns));
+                    }
+                    *open_run = target.map(|uri| (uri.clone(), offset, offset));
+                }
+            }
+        }
+        if let Some(run) = open {
+            spans.push(inline_link(&run, columns));
+        }
+        spans
     }
 
     /// The union of the boxes of every run contributing to `letters[at..end]`.
@@ -120,6 +191,72 @@ impl PageRuns {
         }
         hull
     }
+}
+
+/// One block of text, located among the runs that produced it.
+#[derive(Debug, Default)]
+pub struct Located {
+    /// The box around those runs, when they were found.
+    pub bbox: Option<doc::BoundingBox>,
+    /// Link runs inside the block, as character ranges into its text.
+    pub spans: Vec<doc::InlineSpan>,
+    /// The link covering the whole block, when one does.
+    pub hyperlink: Option<String>,
+}
+
+/// One link run as an inline span: `(target, first letter, last letter)`
+/// against the block's letter-to-character map.
+fn inline_link(run: &(String, usize, usize), columns: &[usize]) -> doc::InlineSpan {
+    let (uri, first, last) = run;
+    let start = columns.get(*first).copied().unwrap_or(0);
+    // The range is half-open and measured in characters, so it ends one
+    // past the last linked character.
+    let end = columns.get(*last).copied().unwrap_or(start) + 1;
+    doc::InlineSpan {
+        range: Some(doc::IntSpan {
+            start: i32::try_from(start).unwrap_or(i32::MAX),
+            end: i32::try_from(end).unwrap_or(i32::MAX),
+        }),
+        hyperlink: Some(uri.clone()),
+        ..doc::InlineSpan::default()
+    }
+}
+
+/// For each run, the target of the link annotation covering it.
+///
+/// A run is covered when its box's centre lies inside the annotation's
+/// rectangle. Centres rather than edges because an annotation is drawn to
+/// the anchor's visual extent, which routinely clips a glyph's box by a
+/// fraction of a point at either end.
+fn anchor_targets(spans: &pb::PageSpans, boxes: &[doc::BoundingBox]) -> Vec<Option<String>> {
+    let annotations: Vec<(&doc::BoundingBox, &str)> = spans
+        .spans
+        .iter()
+        .enumerate()
+        .filter(|(_, span)| {
+            pb::SpanKind::try_from(span.kind) == Ok(pb::SpanKind::Link) && !span.link_uri.is_empty()
+        })
+        .filter_map(|(index, span)| Some((boxes.get(index)?, span.link_uri.as_str())))
+        .collect();
+    if annotations.is_empty() {
+        return vec![None; boxes.len()];
+    }
+    spans
+        .spans
+        .iter()
+        .zip(boxes)
+        .map(|(span, run)| {
+            if !contributes_text(span) {
+                return None;
+            }
+            let x = f64::midpoint(run.l, run.r);
+            let y = f64::midpoint(run.b, run.t);
+            annotations
+                .iter()
+                .find(|(rect, _)| x >= rect.l && x <= rect.r && y >= rect.b && y <= rect.t)
+                .map(|(_, uri)| (*uri).to_owned())
+        })
+        .collect()
 }
 
 /// Whether a run's text is part of what the markdown renderer emitted.
@@ -196,7 +333,10 @@ mod tests {
             span("Hello", 10.0, 700.0, pb::SpanKind::Text),
             span("world", 60.0, 700.0, pb::SpanKind::Text),
         ]));
-        let bbox = runs.locate("Hello world").expect("both runs are found");
+        let bbox = runs
+            .locate("Hello world")
+            .bbox
+            .expect("both runs are found");
         assert!((bbox.l - 10.0).abs() < f64::EPSILON, "{bbox:?}");
         assert!((bbox.r - 100.0).abs() < f64::EPSILON, "{bbox:?}");
         assert!((bbox.b - 700.0).abs() < f64::EPSILON, "{bbox:?}");
@@ -213,7 +353,7 @@ mod tests {
             pb::SpanKind::Text,
         )]));
         assert!(
-            runs.locate("## **A Heading**").is_some(),
+            runs.locate("## **A Heading**").bbox.is_some(),
             "hashes and asterisks are not letters"
         );
     }
@@ -224,8 +364,8 @@ mod tests {
             span("alpha", 10.0, 700.0, pb::SpanKind::Text),
             span("alpha", 10.0, 600.0, pb::SpanKind::Text),
         ]));
-        let first = runs.locate("alpha").expect("the first run");
-        let second = runs.locate("alpha").expect("the second run");
+        let first = runs.locate("alpha").bbox.expect("the first run");
+        let second = runs.locate("alpha").bbox.expect("the second run");
         assert!((first.b - 700.0).abs() < f64::EPSILON);
         assert!(
             (second.b - 600.0).abs() < f64::EPSILON,
@@ -237,10 +377,87 @@ mod tests {
     fn text_that_is_not_on_the_page_gets_no_box() {
         let mut runs = PageRuns::new(&page(vec![span("alpha", 10.0, 700.0, pb::SpanKind::Text)]));
         assert!(
-            runs.locate("beta").is_none(),
+            runs.locate("beta").bbox.is_none(),
             "no box is better than a wrong one"
         );
-        assert!(runs.locate("   ").is_none(), "whitespace locates nothing");
+        assert!(
+            runs.locate("   ").bbox.is_none(),
+            "whitespace locates nothing"
+        );
+    }
+
+    /// A link annotation covering the box at `y`, one line tall.
+    fn annotation(y: f64, uri: &str) -> pb::TextSpan {
+        pb::TextSpan {
+            text: uri.to_owned(),
+            bbox: Some(pb::Rect {
+                x: 5.0,
+                y: y - 2.0,
+                width: 60.0,
+                height: 14.0,
+            }),
+            kind: pb::SpanKind::Link.into(),
+            link_uri: uri.to_owned(),
+            ..pb::TextSpan::default()
+        }
+    }
+
+    #[test]
+    fn a_link_covers_only_the_runs_under_its_rectangle() {
+        let mut runs = PageRuns::new(&page(vec![
+            span("Please ", 10.0, 700.0, pb::SpanKind::Text),
+            span("click here", 10.0, 690.0, pb::SpanKind::Text),
+            span(" now", 10.0, 680.0, pb::SpanKind::Text),
+            annotation(690.0, "https://example.invalid/x"),
+        ]));
+        let located = runs.locate("Please click here now");
+        assert_eq!(located.spans.len(), 1, "{:?}", located.spans);
+        let span = &located.spans[0];
+        assert_eq!(span.hyperlink.as_deref(), Some("https://example.invalid/x"));
+        let range = span.range.as_ref().expect("a range");
+        let text: Vec<char> = "Please click here now".chars().collect();
+        let linked: String = text[range.start as usize..range.end as usize]
+            .iter()
+            .collect();
+        assert_eq!(linked, "click here");
+        assert!(
+            located.hyperlink.is_none(),
+            "a partially linked block is not a link at item level"
+        );
+    }
+
+    #[test]
+    fn a_block_that_is_all_one_link_is_a_link_at_item_level() {
+        let mut runs = PageRuns::new(&page(vec![
+            span("click here", 10.0, 690.0, pb::SpanKind::Text),
+            annotation(690.0, "https://example.invalid/y"),
+        ]));
+        let located = runs.locate("click here");
+        assert_eq!(
+            located.hyperlink.as_deref(),
+            Some("https://example.invalid/y")
+        );
+        assert_eq!(located.spans.len(), 1);
+    }
+
+    #[test]
+    fn two_annotations_in_one_block_stay_two_runs() {
+        let mut runs = PageRuns::new(&page(vec![
+            span("first", 10.0, 700.0, pb::SpanKind::Text),
+            span("second", 10.0, 690.0, pb::SpanKind::Text),
+            annotation(700.0, "https://example.invalid/1"),
+            annotation(690.0, "https://example.invalid/2"),
+        ]));
+        let located = runs.locate("first second");
+        let targets: Vec<&str> = located
+            .spans
+            .iter()
+            .map(|span| span.hyperlink.as_deref().expect("a target"))
+            .collect();
+        assert_eq!(
+            targets,
+            ["https://example.invalid/1", "https://example.invalid/2"]
+        );
     }
 
     #[test]
@@ -252,7 +469,7 @@ mod tests {
             span("https://example.invalid", 10.0, 700.0, pb::SpanKind::Link),
             span("click here", 10.0, 700.0, pb::SpanKind::Text),
         ]));
-        let bbox = runs.locate("click here").expect("the text run");
+        let bbox = runs.locate("click here").bbox.expect("the text run");
         assert!((bbox.b - 700.0).abs() < f64::EPSILON, "{bbox:?}");
     }
 }

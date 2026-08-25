@@ -43,7 +43,7 @@
 //! ([`VERSION`]) as `version`, and the detection confidence from `info` —
 //! the only confidence the pipeline computes — as `confidence`.
 
-use crate::page_runs::PageRuns;
+use crate::page_runs::{Located, PageRuns};
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
 use crate::{COLLECTOR, PARSER, VERSION};
@@ -200,12 +200,15 @@ impl DocumentFold {
     fn push_text(&mut self, text: &str, page_no: u32, level: Option<i32>) -> String {
         let parent = self.current_parent();
         let self_ref = format!("#/texts/{}", self.document.texts.len());
+        let located = self.locate(text, page_no);
         let base = doc::TextItemBase {
             self_ref: self_ref.clone(),
             parent: Some(reference(&parent)),
             content_layer: doc::ContentLayer::Body as i32,
             meta: Some(doc::BaseMeta::default()),
-            prov: self.provenance(text, page_no),
+            prov: provenance(page_no, located.bbox),
+            hyperlink: located.hyperlink,
+            spans: located.spans,
             label: level.map_or(doc::DocItemLabel::Paragraph, |_| {
                 doc::DocItemLabel::SectionHeader
             }) as i32,
@@ -232,29 +235,19 @@ impl DocumentFold {
         self_ref
     }
 
-    /// Where one block of text came from.
+    /// Find one block of text among the page's runs.
     ///
-    /// The page alone is always a claim this fold can make, and it makes
-    /// it: a provenance entry naming only a page is strictly more than the
-    /// nothing that used to be there. The box is added when the page's runs
-    /// arrived and the block's letters were found among them.
-    ///
-    /// Page 0 is the password fallback's whole-document event, which has no
-    /// page to name and therefore no provenance to give.
-    fn provenance(&mut self, text: &str, page_no: u32) -> Vec<doc::ProvenanceItem> {
+    /// Nothing is found when the runs did not arrive, when they belong to
+    /// another page, or when the block's letters are not among them — and
+    /// nothing found means nothing claimed.
+    fn locate(&mut self, text: &str, page_no: u32) -> Located {
         if page_no == 0 {
-            return Vec::new();
+            return Located::default();
         }
-        let bbox = self
-            .runs
+        self.runs
             .as_mut()
             .filter(|runs| runs.page_no() == page_no)
-            .and_then(|runs| runs.locate(text));
-        vec![doc::ProvenanceItem {
-            page_no: i32::try_from(page_no).unwrap_or(i32::MAX),
-            bbox,
-            ..doc::ProvenanceItem::default()
-        }]
+            .map_or_else(Located::default, |runs| runs.locate(text))
     }
 
     /// The ref new content parents to: the innermost open section header,
@@ -367,6 +360,26 @@ fn atx_heading(line: &str) -> Option<(i32, String)> {
         return None;
     }
     Some((i32::try_from(hashes).unwrap_or(i32::MAX), text.to_owned()))
+}
+
+/// Where one block of text came from.
+///
+/// The page alone is always a claim this fold can make, and it makes it: a
+/// provenance entry naming only a page is strictly more than the nothing
+/// that used to be there. The box is added when the block was located among
+/// the page's runs.
+///
+/// Page 0 is the password fallback's whole-document event, which has no
+/// page to name and therefore no provenance to give.
+fn provenance(page_no: u32, bbox: Option<doc::BoundingBox>) -> Vec<doc::ProvenanceItem> {
+    if page_no == 0 {
+        return Vec::new();
+    }
+    vec![doc::ProvenanceItem {
+        page_no: i32::try_from(page_no).unwrap_or(i32::MAX),
+        bbox,
+        ..doc::ProvenanceItem::default()
+    }]
 }
 
 /// A root group with nothing in it yet.

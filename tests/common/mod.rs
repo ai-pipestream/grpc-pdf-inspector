@@ -140,6 +140,75 @@ pub fn image_pdf(pages: u32) -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page PDF whose middle line is the anchor text of a real
+/// `/Link` annotation pointing at `uri`.
+///
+/// The anchor text is deliberately *not* a URL. That is the case the old
+/// pipeline could not see at all: it auto-linked bare URLs it found in the
+/// visible text with a regular expression and never read the annotation
+/// layer, so a link over the word "here" was invisible and a URL nobody
+/// linked became a link.
+#[must_use]
+pub fn link_pdf(anchor: &str, uri: &str) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    // Three lines, well apart, so the extractor keeps them as separate
+    // items and the annotation covers exactly the middle one.
+    let content = format!(
+        "BT /F1 12 Tf 50 700 Td (Some prose before the link) Tj ET\n\
+         BT /F1 12 Tf 50 650 Td ({anchor}) Tj ET\n\
+         BT /F1 12 Tf 50 600 Td (Some prose after the link) Tj ET"
+    );
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+
+    let annotation_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![45.into(), 640.into(), 300.into(), 670.into()],
+        "Border" => vec![0.into(), 0.into(), 0.into()],
+        "A" => dictionary! {
+            "Type" => "Action",
+            "S" => "URI",
+            "URI" => Object::string_literal(uri),
+        },
+    });
+
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+        "Annots" => vec![Object::Reference(annotation_id)],
+    });
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {
