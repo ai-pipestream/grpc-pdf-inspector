@@ -42,7 +42,12 @@ Three reasons appear below and they are not interchangeable:
 | U15 page geometry | `PageGeometry` |
 | U22 internal destinations | `LinkTarget.dest_page_no` / `.dest_name`, `InlineSpan.target`, `Document.anchors` |
 | U23 page labels | `PageGeometry.label` |
-| U24 file identifier | `PdfMetadata.file_id` |
+| U24 file identifier | `PdfMetadata.file_id`, `DocumentOrigin.source_id` |
+| S3 formatting | `TextSpan` flags, `InlineSpan.formatting` / `.font_family` / `.font_size_pt` over the characters they cover |
+| D7 image placements | `SPAN_KIND_IMAGE` runs, `Document.pictures[]` with their boxes |
+| Links over non-text regions | `PictureItem.hyperlink` |
+| U8 / U13 / U16 posture and identity, on the Document plane | `DocumentMeta.format_version` / `.structured` / `.authoring_tool` / `.subject` / `.protection` / `.raw_metadata` |
+| U15 / U23 page geometry and labels, on the Document plane | `PageItem.page_label` / `.media_size` / `.user_unit` |
 | Version constant | derived from the manifest during const evaluation |
 
 ## Not reachable without an upstream change
@@ -92,40 +97,35 @@ Deliberate deferral rather than an upstream ask.
 
 ## Needs a typed home in the Document schema
 
-Each of these is on the event plane, typed and complete. Nothing is
-map-stuffed; the Document simply does not carry it yet.
+Everything this ledger previously listed here landed in the canonical
+schema at gRParse `af1b769` and is wired: `DocumentMeta.format_version`,
+`.structured`, `.authoring_tool`, `.subject`, `.protection` (a `Protection`
+message) and `.raw_metadata`; `DocumentOrigin.source_id`;
+`PageItem.page_label`, `.media_size` and `.user_unit`;
+`PictureItem.hyperlink`.
+
+One row is left, and it is small:
 
 | Datum | Event-plane field | Shape it wants |
 |---|---|---|
-| File-format version | `PdfMetadata.pdf_version` | `DocumentMeta.format_version` (optional string) — every container format has one |
-| Whether the source declares itself tagged | `PdfMetadata.tagged` | `DocumentMeta.structured` (optional bool) — "the source states its own structure", which is what makes `style_name` trustworthy |
-| Stable identifier from inside the file | `PdfMetadata.file_id` | `DocumentOrigin.source_id` (optional string) — `binary_hash` is a transport fact; this is the document's own identity |
-| Encryption posture | `EncryptionInfo` | `DocumentMeta.protection = Protection { bool encrypted; string handler; uint32 key_bits; bool opened_without_password; bool allows_extraction; bool allows_printing; }` — `allows_extraction` is compliance-relevant and the pipeline currently cannot see it is overriding it |
-| Authoring application, as distinct from the producer | `DocumentInfo.creator_tool` | `DocumentMeta.authoring_tool` (optional string) — `generator` holds the producer; the application the document was written in is a different fact |
-| Subject line | `DocumentInfo.subject` | `DocumentMeta.subject` (optional string) |
-| Trapping state | `DocumentInfo.trapped` | `DocumentMeta.extra` is the wrong shape for it; a `Trapped` enum on `DocumentMeta` would be right, though the return is small |
-| The source's own metadata packet | `PdfMetadata.xmp_packet` | `DocumentMeta.raw_metadata` (bytes) — the audit proposed it and the landed schema does not have it |
-| A page's printed number | `PageGeometry.label` | `PageItem.page_label` (optional string) — the number a citation or a "go to page 12" actually means |
-| A page's full extent, as distinct from its visible one | `PageGeometry.media_box` | `PageItem.media_size` (Size) — `PageItem.size` takes the crop box, which is what a reader sees |
-| A page's user-space scale | `PageGeometry.user_unit` | `PageItem.user_unit` (optional double) — without it a box on a scaled page is unqualified |
-| The link layer as a whole | `PdfMetadata.links` | Only anchored links reach the Document, through `InlineSpan`. A link over an image, or one whose rectangle covers no run, has nowhere to go: it wants `PictureItem`-level `hyperlink`, or a document-level annotation list |
+| Trapping state | `DocumentInfo.trapped` | A `Trapped` enum on `DocumentMeta`. `extra` is the wrong shape for a three-valued vocabulary, and the return is small enough that it has not been asked for. |
+| An internal destination over a picture | `LinkTarget.dest_page_no` on an annotation whose rectangle covers only an image | `PictureItem.target` (`FineRef`), mirroring `InlineSpan.target`. `PictureItem` has a hyperlink and no target, so a figure that jumps into the document rather than out of it is dropped. |
 
 ## Deliberate, and cheap to add later
 
-- **S3 formatting.** `TextSpan` carries bold, italic, underline and
-  strikeout per run and `InlineSpan.formatting` is waiting for them. The
-  fold does not write them yet: doing it well means run-level spans over
-  the item's text, which is the same machinery the link runs use, so this
-  is a small follow-up rather than a design question.
+- **Sub- and superscript.** The extractor computes them from font-size
+  ratio plus baseline offset and uses the result only for spacing, so
+  `Formatting.script` has no source. `TextSpan` would need to carry the
+  judgement first.
 - **S4 AcroForm fields.** The extractor concatenates `name: value` into one
   run, so the key/value boundary is already gone by the time this service
   sees it. `Document.form_items[].graph` and the `FieldItem` fields the
   audit proposed need the parser to emit fields structurally first.
-- **D7 / U18 images.** Image runs reach the wire with their placement boxes
-  as `SPAN_KIND_IMAGE`, so `Document.pictures[]` is now a mapping change
-  rather than a capture gap. Colourspace, bit depth, filter chain and
-  `/SMask` are never read by the crate and would need the direct reader
-  this service now has.
+- **U18 image detail.** Pictures are placed, but colourspace, bit depth,
+  the filter chain and `/SMask` are never read by the crate. The direct
+  reader this service now has could read all four off the XObject
+  dictionary; the pixel bytes would need a decoder the default build does
+  not link, and `ImageRef` stays unset until then.
 - **U5 page-count estimate for unparseable files.** A byte-scan estimate
   exists and the failure path returns `INVALID_ARGUMENT` and nothing else.
 - **U7 region-scoped re-asks.** A coordinator holding a box from another
@@ -163,6 +163,10 @@ map-stuffed; the Document simply does not carry it yet.
   the page. A page whose renderer reorders runs — multi-column layouts
   especially — can leave a block unlocated, and an unlocated block gets a
   page-only provenance entry rather than a wrong box.
+- **Where a picture sits.** A picture is placed under whatever heading is
+  open when its page begins, because the image runs are folded before the
+  page's own blocks are read. Its box is exact; its position in the
+  hierarchy is reading order at page granularity.
 - **The furniture report.** It names runs the markdown does not contain, in
   reading order. A run the renderer moved backwards past another reads as
   dropped. The report is approximate on reordering pages and exact on

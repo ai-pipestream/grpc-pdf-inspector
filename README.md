@@ -116,9 +116,17 @@ collector's parse of the same document:
   `PageItem.unit` says those boxes are in points, and `PageItem.size`
   carries the page's own visible box when the metadata pass read one.
 - `source_meta`, `outline`, `attachments` and `anchors` come from the
-  file's own dictionaries. Link annotations become `InlineSpan.hyperlink`
-  over the anchored words, and internal cross-references become
-  `InlineSpan.target` pointing at the page they lead to.
+  file's own dictionaries, down to the format version, the tagged flag,
+  the authoring application, the encryption posture, the XMP packet and
+  the file's own `/ID`. Link annotations become `InlineSpan.hyperlink`
+  over the anchored words, internal cross-references become
+  `InlineSpan.target` pointing at the page they lead to, and a link over a
+  figure becomes that `PictureItem`'s `hyperlink`.
+- Bold, italic, underline and strikeout become `InlineSpan.formatting`
+  over the characters they actually cover, with the face and type size
+  beside them, instead of `**` and `<u>` inside the text.
+- Every image the page drew becomes a `PictureItem` with the box the
+  content stream placed it at.
 - Runs the markdown dropped go into the furniture group under
   `CONTENT_LAYER_FURNITURE` when `report_furniture` is set.
 - Every item's `CollectorSource` is `collector: "pdf"`,
