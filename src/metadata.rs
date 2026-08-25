@@ -209,7 +209,17 @@ impl<'a> Reader<'a> {
     /// declared posture whether or not that posture stopped anything.
     fn encryption(&self) -> pb::EncryptionInfo {
         let Ok(encrypt) = self.doc.get_encrypted() else {
-            return pb::EncryptionInfo::default();
+            // No `/Encrypt` dictionary is not "permits nothing"; it is a
+            // file with no permission bits at all, which permits
+            // everything. Reporting the zero value here would read as a
+            // locked-down document.
+            return pb::EncryptionInfo {
+                encrypted: false,
+                opened_with_empty_password: true,
+                allows_extraction: true,
+                allows_printing: true,
+                ..pb::EncryptionInfo::default()
+            };
         };
         let permissions = encrypt
             .get(b"P")

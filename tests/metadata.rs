@@ -89,6 +89,11 @@ async fn the_documents_own_declarations_are_read() {
 
     let encryption = metadata.encryption.as_ref().expect("an encryption block");
     assert!(!encryption.encrypted, "the fixture is not encrypted");
+    assert!(
+        encryption.allows_extraction && encryption.allows_printing,
+        "no permission bits is no restriction, not every restriction"
+    );
+    assert!(encryption.opened_with_empty_password);
 }
 
 #[tokio::test]
@@ -136,8 +141,17 @@ async fn every_page_reports_its_box_rotation_and_printed_number() {
             page.crop_box.is_some(),
             "a page with no crop box crops to its media box"
         );
-        assert!((page.user_unit - 1.0).abs() < f64::EPSILON);
     }
+
+    // Page 3 is cropped inside its sheet and drawn at twice the scale.
+    let cropped = pages[2].crop_box.as_ref().expect("a crop box");
+    assert!((cropped.width - 540.0).abs() < f64::EPSILON, "{cropped:?}");
+    assert!((cropped.height - 720.0).abs() < f64::EPSILON, "{cropped:?}");
+    assert!((pages[2].user_unit - 2.0).abs() < f64::EPSILON);
+    assert!(
+        (pages[0].user_unit - 1.0).abs() < f64::EPSILON,
+        "a page that says nothing is at the default scale"
+    );
 
     let rotations: Vec<u32> = pages.iter().map(|page| page.rotation).collect();
     assert_eq!(rotations, [0, 90, 0], "the turned page says so");
@@ -181,9 +195,40 @@ async fn the_fold_writes_the_metadata_the_schema_has_homes_for() {
     assert_eq!(meta.authors, ["Ada Lovelace", "Charles Babbage"]);
     assert_eq!(meta.language.as_deref(), Some("en-GB"));
     assert_eq!(meta.generator.as_deref(), Some("A PDF Writer 2.0"));
+    assert_eq!(
+        meta.authoring_tool.as_deref(),
+        Some("An Authoring Application"),
+        "the application it was written in is not the one that produced it"
+    );
+    assert_eq!(meta.subject.as_deref(), Some("Mechanical computation"));
     assert_eq!(meta.keywords, ["engine", "difference", "notes"]);
     assert!(meta.created.is_some(), "the instant is typed");
     assert_eq!(meta.created_raw.as_deref(), Some("D:20240115103000Z"));
+
+    // What the file says about its own format and posture.
+    assert_eq!(meta.format_version.as_deref(), Some("1.7"));
+    assert_eq!(meta.structured, Some(true), "the fixture is tagged");
+    assert_eq!(
+        meta.raw_metadata.as_deref().map(|packet| &packet[..9]),
+        Some(&b"<?xpacket"[..]),
+        "the XMP packet travels verbatim"
+    );
+    let protection = meta.protection.as_ref().expect("a protection block");
+    assert!(!protection.encrypted);
+    assert!(protection.opened_without_password);
+    assert!(protection.allows_extraction && protection.allows_printing);
+
+    // The identity the file carries inside itself, which is the only
+    // identity a byte stream has.
+    assert_eq!(
+        document
+            .origin
+            .as_ref()
+            .expect("an origin")
+            .source_id
+            .as_deref(),
+        Some("deadbeef")
+    );
 
     // The authored outline, which is better evidence of structure than a
     // heading level inferred from type size.
@@ -233,6 +278,28 @@ async fn the_fold_writes_the_metadata_the_schema_has_homes_for() {
     let second = document.pages.get(&2).expect("page 2");
     let size = second.size.as_ref().expect("a measured page");
     assert!((size.width - 612.0).abs() < f64::EPSILON);
+    assert!(
+        second.media_size.is_none(),
+        "the sheet and the visible box are the same here, so only one is said"
+    );
+    assert!(
+        second.user_unit.is_none(),
+        "a scale of 1 is the default and says nothing"
+    );
+
+    // The cropped, rescaled page says both.
+    let third = document.pages.get(&3).expect("page 3");
+    let visible = third.size.as_ref().expect("the visible box");
+    assert!((visible.width - 540.0).abs() < f64::EPSILON, "{visible:?}");
+    let sheet = third.media_size.as_ref().expect("the sheet it sits on");
+    assert!((sheet.width - 612.0).abs() < f64::EPSILON, "{sheet:?}");
+    assert_eq!(third.user_unit, Some(2.0));
+
+    // The pages' own printed numbers: roman front matter, then arabic.
+    let labels: Vec<Option<&str>> = (1..=3)
+        .map(|page_no| document.pages[&page_no].page_label.as_deref())
+        .collect();
+    assert_eq!(labels, [Some("i"), Some("1"), Some("2")]);
     let quality = second.quality.as_ref().expect("the turned page's quality");
     assert_eq!(quality.rotation_degrees, Some(90.0));
     assert!(

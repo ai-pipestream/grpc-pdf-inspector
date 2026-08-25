@@ -212,7 +212,8 @@ pub fn link_pdf(anchor: &str, uri: &str) -> Vec<u8> {
 /// Build a three-page PDF that says as much about itself as a real one
 /// does: a full information dictionary, an XMP packet, a catalog language,
 /// a tagged flag, an outline, an embedded file, a named destination, page
-/// labels, a rotated page, and an internal cross-reference link.
+/// labels, a rotated page, a cropped and rescaled page, and an internal
+/// cross-reference link.
 ///
 /// Every one of these was unread before this wave. The fixture exists so
 /// that "unread" is a test failure rather than a documentation claim.
@@ -246,6 +247,16 @@ pub fn metadata_pdf() -> Vec<u8> {
         // every unqualified coordinate on the page ambiguous.
         if page == 2 {
             page_dict.set("Rotate", 90);
+        }
+        // Page 3 is cropped inside its sheet and drawn at twice the
+        // default scale: the two facts without which a box on it means
+        // nothing.
+        if page == 3 {
+            page_dict.set(
+                "CropBox",
+                vec![36.into(), 36.into(), 576.into(), 756.into()],
+            );
+            page_dict.set("UserUnit", 2);
         }
         page_ids.push(doc.add_object(page_dict));
     }

@@ -255,17 +255,38 @@ impl DocumentFold {
                 created_raw: non_empty(&info.created_raw),
                 modified_raw: non_empty(&info.modified_raw),
                 language: non_empty(&metadata.language),
-                // The document's producer is the software that wrote the
-                // file. The authoring application it was converted from is
-                // on the event plane as `creator_tool`; the schema has one
-                // slot and this is the one that fills it.
+                subject: non_empty(&info.subject),
+                // `generator` is the software that wrote the file and
+                // `authoring_tool` the application the document was written
+                // in. A PDF names both and they are routinely different: a
+                // word processor authored it, a print driver produced it.
                 generator: non_empty(&info.producer),
+                authoring_tool: non_empty(&info.creator_tool),
                 keywords: info.keywords.clone(),
+                format_version: non_empty(&metadata.pdf_version),
+                // Whether the source states its own structure, which is
+                // what makes the roles on `style_name` trustworthy rather
+                // than inferred.
+                structured: Some(metadata.tagged),
+                protection: metadata.encryption.as_ref().map(protection),
+                // The source's own metadata packet, verbatim: no dialect is
+                // imposed on it by copying it.
+                raw_metadata: (!metadata.xmp_packet.is_empty())
+                    .then(|| metadata.xmp_packet.clone()),
                 ..doc::DocumentMeta::default()
             });
             if self.document.name.is_empty() {
                 self.document.name.clone_from(&info.title);
             }
+        }
+
+        // The identity the file carries inside itself. `binary_hash` and
+        // `filename` are transport facts this stream does not have; this is
+        // the document naming itself.
+        if !metadata.file_id.is_empty()
+            && let Some(origin) = self.document.origin.as_mut()
+        {
+            origin.source_id = Some(metadata.file_id.clone());
         }
 
         // The document's own table of contents, which is authored evidence
@@ -320,12 +341,27 @@ impl DocumentFold {
                 ..doc::PageItem::default()
             });
             // The visible box is the page as a reader sees it, which is the
-            // frame every box on this wire is measured against.
+            // frame every box on this wire is measured against. The media
+            // box is the sheet it was imposed on, and is only worth saying
+            // when the two differ.
             if let Some(size) = page.crop_box.as_ref() {
-                item.size = Some(doc::Size {
-                    width: size.width,
-                    height: size.height,
-                });
+                item.size = Some(size_of(size));
+            }
+            if let Some(media) = page.media_box.as_ref().filter(|media| {
+                page.crop_box
+                    .as_ref()
+                    .is_none_or(|crop| size_of(media) != size_of(crop))
+            }) {
+                item.media_size = Some(size_of(media));
+            }
+            // The page's own printed number, which is what a citation or a
+            // "go to page 12" actually means when the document numbers its
+            // front matter in roman.
+            item.page_label = non_empty(&page.label);
+            // A scale multiplier of 1 is the default and says nothing; any
+            // other value is what makes this page's boxes interpretable.
+            if (page.user_unit - 1.0).abs() > f64::EPSILON {
+                item.user_unit = Some(page.user_unit);
             }
             if page.rotation != 0 {
                 item.quality = Some(doc::PageQuality {
@@ -994,6 +1030,31 @@ fn group(self_ref: &str, layer: doc::ContentLayer) -> doc::GroupItem {
         self_ref: self_ref.to_owned(),
         content_layer: layer as i32,
         ..doc::GroupItem::default()
+    }
+}
+
+/// One wire rectangle's extent as a schema size.
+fn size_of(rect: &pb::Rect) -> doc::Size {
+    doc::Size {
+        width: rect.width,
+        height: rect.height,
+    }
+}
+
+/// The document's declared protection.
+///
+/// A file can be readable with the empty password and still declare that
+/// extraction is not permitted. That is a fact about the file, and a
+/// pipeline overriding it should at least be able to see it is doing so.
+fn protection(encryption: &pb::EncryptionInfo) -> doc::Protection {
+    doc::Protection {
+        encrypted: encryption.encrypted,
+        handler: non_empty(&encryption.filter),
+        key_bits: (encryption.key_bits > 0)
+            .then(|| i32::try_from(encryption.key_bits).unwrap_or(i32::MAX)),
+        opened_without_password: encryption.opened_with_empty_password,
+        allows_extraction: encryption.allows_extraction,
+        allows_printing: encryption.allows_printing,
     }
 }
 

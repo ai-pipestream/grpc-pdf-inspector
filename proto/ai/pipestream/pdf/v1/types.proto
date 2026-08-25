@@ -701,13 +701,15 @@ message EncryptionInfo {
   // Key length in bits (`/Length`), 40 when the file omits it.
   uint32 key_bits = 5;
 
-  // Whether the document opened without a password being supplied.
+  // Whether the document opened without a password being supplied. True
+  // for a file that is not encrypted at all.
   bool opened_with_empty_password = 6;
 
-  // Whether the permission bits allow text extraction.
+  // Whether the permission bits allow text extraction. True when the file
+  // has no `/Encrypt` dictionary: no permission bits means no restriction.
   bool allows_extraction = 7;
 
-  // Whether they allow printing.
+  // Whether they allow printing, on the same terms.
   bool allows_printing = 8;
 }
 

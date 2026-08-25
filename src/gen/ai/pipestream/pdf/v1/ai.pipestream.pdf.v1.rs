@@ -430,13 +430,15 @@ pub struct EncryptionInfo {
     /// Key length in bits (`/Length`), 40 when the file omits it.
     #[prost(uint32, tag="5")]
     pub key_bits: u32,
-    /// Whether the document opened without a password being supplied.
+    /// Whether the document opened without a password being supplied. True
+    /// for a file that is not encrypted at all.
     #[prost(bool, tag="6")]
     pub opened_with_empty_password: bool,
-    /// Whether the permission bits allow text extraction.
+    /// Whether the permission bits allow text extraction. True when the file
+    /// has no `/Encrypt` dictionary: no permission bits means no restriction.
     #[prost(bool, tag="7")]
     pub allows_extraction: bool,
-    /// Whether they allow printing.
+    /// Whether they allow printing, on the same terms.
     #[prost(bool, tag="8")]
     pub allows_printing: bool,
 }
