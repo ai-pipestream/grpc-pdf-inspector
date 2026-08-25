@@ -69,11 +69,129 @@ message PdfOptions {
   // markdown is retained.
   //
   // The event stream stays the primary, lossless wire; the Document is a
-  // coarse structural projection of it — paragraphs and ATX headings parsed
-  // back out of the page markdown, pages named but not measured — built so
-  // a coordinator can merge it additively with another collector's parse of
-  // the same document.
+  // structural projection of it, built so a coordinator can merge it
+  // additively with another collector's parse of the same document.
+  //
+  // The fold behind it consumes every event this parse produces, including
+  // the ones the flags below keep off the wire: setting `emit_document`
+  // alone still yields a Document with provenance boxes on its items,
+  // because the spans that carry them were folded on their way past.
   bool emit_document = 4;
+
+  // Also stream the positioned text runs each page's markdown was rendered
+  // from, as one `spans` event per page immediately before that page's
+  // `page` event. Default false.
+  //
+  // The runs are what the extractor actually saw: text, box, font, size,
+  // the bold/italic/underline/strikeout flags, the marked-content id, and
+  // the link target for a link annotation. Markdown is a rendering of
+  // them, so this is the lossless half of a FULL stream and the only place
+  // a coordinate appears on this wire.
+  bool emit_spans = 5;
+}
+
+// Rect is an axis-aligned rectangle in PDF user space.
+//
+// The unit is the PDF point (1/72 inch) and the origin is the page's
+// bottom-left corner, with y increasing upwards — the space the file
+// itself is written in, unrotated and unscaled. A consumer that wants
+// top-left coordinates subtracts from the page box, which arrives on
+// `PageGeometry`.
+message Rect {
+  // Distance from the page's left edge to the rectangle's left edge.
+  double x = 1;
+
+  // Distance from the page's bottom edge to the rectangle's bottom edge.
+  // For a text run this is the baseline, not the descender.
+  double y = 2;
+
+  // Extent along x. Never negative.
+  double width = 3;
+
+  // Extent along y. Never negative.
+  double height = 4;
+}
+
+// SpanKind names what a positioned run actually is.
+//
+// The extractor emits more than glyphs: an image XObject contributes its
+// placement box, a link annotation contributes its rectangle and target,
+// and an AcroForm field contributes its value.
+enum SpanKind {
+  // Never sent. Present because proto3 requires a zero value.
+  SPAN_KIND_UNSPECIFIED = 0;
+
+  // Glyphs drawn by a text-showing operator.
+  SPAN_KIND_TEXT = 1;
+
+  // An image XObject's placement box. `text` is a placeholder, not
+  // content.
+  SPAN_KIND_IMAGE = 2;
+
+  // A link annotation's rectangle. `link_uri` carries its target.
+  SPAN_KIND_LINK = 3;
+
+  // An AcroForm field's value.
+  SPAN_KIND_FORM_FIELD = 4;
+}
+
+// TextSpan is one positioned run as the extractor saw it, before markdown.
+message TextSpan {
+  // The run's text. For an image span this is a placeholder.
+  string text = 1;
+
+  // Where the run sits on its page.
+  Rect bbox = 2;
+
+  // The `/BaseFont` family name, subset prefix included
+  // ("ABCDEF+CMMI10"). Empty for runs that no show operator produced.
+  string font_family = 3;
+
+  // The page-resource tag the show operator selected ("F2"). Its namespace
+  // is the enclosing page's resources, so the same tag on another page may
+  // name a different face; within one page it separates font programs that
+  // share a family name.
+  string font_tag = 4;
+
+  // Type size in points, 0 for runs that no show operator produced.
+  float font_size = 5;
+
+  // Whether the face is bold.
+  bool bold = 6;
+
+  // Whether the face is italic.
+  bool italic = 7;
+
+  // Whether a rule is drawn under the baseline. PDF has no underline flag,
+  // so this is geometric.
+  bool underline = 8;
+
+  // Whether a rule crosses the glyphs at mid x-height. Geometric, as
+  // above.
+  bool strikeout = 9;
+
+  // The marked-content id from the page's content stream, when the run
+  // sits inside a BDC/BMC pair. This is the join key to the tagged
+  // structure tree.
+  optional int64 mcid = 10;
+
+  // What kind of run this is.
+  SpanKind kind = 11;
+
+  // For SPAN_KIND_LINK, the annotation's target. Empty otherwise.
+  string link_uri = 12;
+}
+
+// PageSpans carries one page's positioned runs, in extraction order.
+//
+// Sent immediately before that page's `page` event, so a consumer that
+// wants both sees the runs first and the rendering they produced second.
+message PageSpans {
+  // The 1-indexed page these runs came from.
+  uint32 page_no = 1;
+
+  // The runs, in the order the extractor produced them.
+  repeated TextSpan spans = 2;
 }
 
 // PdfType is the routing answer: how the pages' content is stored.
@@ -191,6 +309,19 @@ message PageMarkdown {
 
   // The page's text layer as markdown. Empty when the page needs OCR.
   string markdown = 2;
+
+  // True when this page's own text layer is unreliable, as judged by the
+  // pass that read it rather than by the sampling detection on `info`.
+  //
+  // The two can disagree, and the disagreement is the point: detection
+  // samples pages and answers about the document, while this answers about
+  // this page after its glyphs were actually decoded. A page that decoded
+  // to mojibake shows up here even when the document as a whole looked
+  // fine.
+  bool needs_ocr = 3;
+
+  // Why, when the cause is known. UNSPECIFIED when `needs_ocr` is false.
+  OcrReason ocr_reason = 4;
 }
 
 // ParseWarningCode names a condition that did not stop the parse.
@@ -239,6 +370,14 @@ message ParseStatus {
 
   // Wall-clock milliseconds for the whole call, classification included.
   uint64 processing_time_ms = 5;
+
+  // Per-page OCR reasons from the pass that read the text layer, as
+  // distinct from `PdfInfo.ocr_reasons`, which comes from the sampling
+  // detection. Populated in ANALYZE and FULL.
+  //
+  // `has_encoding_issues` above is these reasons collapsed to one boolean;
+  // it stays for callers that only want the routing bit.
+  repeated PageOcrReasons extraction_ocr_reasons = 6;
 }
 
 // ServerLimits reports the ceilings a server actually enforces.

@@ -24,9 +24,11 @@
 pub mod document_fold;
 pub mod limits;
 pub mod metrics;
+pub mod page_runs;
 pub mod parse;
 pub mod proto;
 pub mod service;
+pub mod spans;
 
 pub use limits::Limits;
 pub use metrics::Metrics;

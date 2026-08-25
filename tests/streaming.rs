@@ -118,6 +118,9 @@ async fn info_arrives_before_extraction_runs() {
             pb::parse_pdf_response::Event::Document(_) => {
                 panic!("a `document` without `emit_document`")
             }
+            pb::parse_pdf_response::Event::Spans(_) => {
+                panic!("a `spans` event without `emit_spans`")
+            }
         }
     }
     assert!(matches!(

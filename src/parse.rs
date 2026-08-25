@@ -14,30 +14,50 @@
 //! out as that page's markdown comes back. `tests/streaming.rs` holds the
 //! test that fails if someone turns this back into a batch.
 //!
-//! # Two library passes, on purpose
+//! # Three library passes in FULL, on purpose
 //!
-//! Detection (`process_pdf_mem_with_options` in detect-only mode) and
-//! per-page extraction (`extract_pages_markdown_mem`) are separate calls,
-//! so the document is parsed twice. That is the price of emitting `info`
-//! before extraction starts, and it is cheap: detection reads content
-//! streams, not glyphs.
+//! Detection (`process_pdf_mem_with_options` in detect-only mode) runs
+//! first and alone, because `info` is the product's front door and it has
+//! to go out before anything expensive starts. It is cheap: it reads
+//! content streams, not glyphs.
+//!
+//! FULL then runs two more. The analysis pass
+//! (`process_pdf_mem_with_options` in analyze mode) is what computes layout
+//! complexity and the per-page text-quality verdicts, and the library
+//! exposes no way to compute either from items a caller already holds — the
+//! column detector and the quality module are both crate-private. The
+//! extraction pass is `extract_text_with_positions_mem_pages`, whose items
+//! this module renders to markdown itself with
+//! [`to_markdown_from_items_with_rects_and_page_count`].
+//!
+//! That last choice is the one worth defending, because the obvious call is
+//! `extract_pages_markdown_mem` and this used to make it. It takes no
+//! options — it hardcodes `MarkdownOptions::default()` — and it throws the
+//! items away, and the items are where every coordinate, every font, every
+//! marked-content id and the entire link layer live. Rendering from items
+//! keeps all of that in hand and costs the analysis pass to keep the layout
+//! answer honest. The trade is deliberate: the wire gained geometry and
+//! links, and one more read of the file is what they cost.
+//!
+//! [`to_markdown_from_items_with_rects_and_page_count`]: pdf_inspector::to_markdown_from_items_with_rects_and_page_count
 //!
 //! # Page indexing
 //!
-//! The wire is 1-indexed everywhere, as PDF viewers are. The library is
-//! not: `pages_needing_ocr` and `PdfOptions::pages` are 1-indexed but
-//! `extract_pages_markdown_mem` takes and returns 0-indexed pages. All
+//! The wire is 1-indexed everywhere, as PDF viewers are, and so are the
+//! positioned items (`TextItem::page`) and `PdfOptions::pages`. Any
 //! conversion happens here, at the library boundary, and nowhere else.
 
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-use pdf_inspector::{PdfOptions, PdfType, ProcessMode};
+use pdf_inspector::{MarkdownOptions, PdfOptions, PdfType, ProcessMode};
 use tokio::sync::mpsc;
 use tonic::Status;
 
 use crate::document_fold::DocumentFold;
 use crate::metrics::Metrics;
 use crate::proto::v1 as pb;
+use crate::spans;
 
 /// How the call ended.
 #[derive(Debug)]
@@ -109,6 +129,54 @@ impl Sink {
     }
 }
 
+/// The two consumers of one parse's events.
+///
+/// The wire is one; the Document fold is the other, when the caller asked
+/// for a Document. Every event goes to the fold, including the classes the
+/// caller kept off the wire — the Document is a projection of what this
+/// parse *found*, not of what the caller chose to be sent, and a
+/// coordinator that wants boxes on its items should not have to pay for the
+/// span events as well.
+struct Events<'a> {
+    /// The outbound half of the response stream.
+    sink: &'a Sink,
+    /// The fold, when `options.emit_document` was set.
+    fold: Option<DocumentFold>,
+}
+
+impl<'a> Events<'a> {
+    /// A router for one call.
+    fn new(sink: &'a Sink, emit_document: bool) -> Self {
+        Self {
+            sink,
+            fold: emit_document.then(DocumentFold::new),
+        }
+    }
+
+    /// Put an event on the wire, and through the fold on its way.
+    fn send(&mut self, event: pb::parse_pdf_response::Event) -> Result<(), Abort> {
+        self.route(event, true)
+    }
+
+    /// Fold an event, and put it on the wire only when `on_wire`.
+    fn route(&mut self, event: pb::parse_pdf_response::Event, on_wire: bool) -> Result<(), Abort> {
+        if let Some(fold) = self.fold.as_mut() {
+            fold.consume(&event);
+        }
+        if on_wire {
+            self.sink.send(event)
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Whether an optional event class has any consumer, and is therefore
+    /// worth building.
+    const fn wanted(&self, on_wire: bool) -> bool {
+        on_wire || self.fold.is_some()
+    }
+}
+
 /// Classify `bytes` and stream the events the mode calls for into `sink`.
 ///
 /// Synchronous on purpose: extraction is CPU-bound and parallelizes with
@@ -159,15 +227,9 @@ fn parse(
     // a Document, every event is folded on its way out and the folded
     // Document goes out after the last `page`, before the `status` trailer.
     // With the flag off no fold is built and the path is what it was.
-    let mut fold = options.emit_document.then(DocumentFold::new);
-    let mut emit = |event: pb::parse_pdf_response::Event| -> Result<(), Abort> {
-        if let Some(fold) = fold.as_mut() {
-            fold.consume(&event);
-        }
-        sink.send(event)
-    };
+    let mut events = Events::new(sink, options.emit_document);
 
-    emit(pb::parse_pdf_response::Event::Info(pb::PdfInfo {
+    events.send(pb::parse_pdf_response::Event::Info(pb::PdfInfo {
         pdf_type: pdf_type(detected.pdf_type).into(),
         confidence: detected.confidence,
         page_count: detected.page_count,
@@ -192,6 +254,7 @@ fn parse(
     let mut pages_extracted = 0u32;
     let mut layout = None;
     let mut has_encoding_issues = false;
+    let mut extraction_ocr_reasons = Vec::new();
 
     // What happens after `info` depends on the mode and on what detection
     // found. Scanned and image-based documents have no text layer at all, so
@@ -201,18 +264,12 @@ fn parse(
         pb::ProcessMode::DetectOnly | pb::ProcessMode::Unspecified => {}
         _ if !text_bearing => {}
         pb::ProcessMode::Analyze => {
-            let mut analyze = PdfOptions::new().mode(ProcessMode::Analyze);
-            // An empty filter means "all pages" on the wire but "no pages"
-            // to the library, so it is only set when the caller named pages.
-            if !options.pages.is_empty() {
-                analyze = analyze.pages(options.pages.iter().copied());
-            }
-            if !options.password.is_empty() {
-                analyze = analyze.password(options.password.clone());
-            }
-            let analyzed = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, analyze))?;
+            let analyzed = guarded(|| {
+                pdf_inspector::process_pdf_mem_with_options(bytes, analyze_options(options))
+            })?;
             layout = Some(layout_proto(&analyzed.layout));
             has_encoding_issues = analyzed.has_encoding_issues;
+            extraction_ocr_reasons = ocr_reasons_proto(&analyzed.ocr_reasons_by_page);
         }
         pb::ProcessMode::Full if !options.password.is_empty() => {
             // The per-page extraction API takes no password, so an encrypted
@@ -226,9 +283,14 @@ fn parse(
             let processed = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, full))?;
             if let Some(markdown) = processed.markdown.filter(|md| !md.is_empty()) {
                 let markdown_bytes = markdown.len() as u64;
-                emit(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+                events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
                     page_no: 0,
                     markdown,
+                    // Whole-document extraction reports its OCR verdicts by
+                    // page, and this event is not a page; the trailer's
+                    // `extraction_ocr_reasons` carries them instead.
+                    needs_ocr: false,
+                    ocr_reason: pb::OcrReason::Unspecified.into(),
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -241,19 +303,71 @@ fn parse(
             });
             layout = Some(layout_proto(&processed.layout));
             has_encoding_issues = processed.has_encoding_issues;
+            extraction_ocr_reasons = ocr_reasons_proto(&processed.ocr_reasons_by_page);
         }
         pb::ProcessMode::Full => {
-            // 1-indexed wire pages to the extractor's 0-indexed selection.
-            let selected: Vec<u32> = options.pages.iter().map(|page| page - 1).collect();
-            let selection = (!selected.is_empty()).then_some(selected);
-            let extracted =
-                guarded(|| pdf_inspector::extract_pages_markdown_mem(bytes, selection.as_deref()))?;
-            for page in extracted.pages {
-                let markdown_bytes = page.markdown.len() as u64;
-                // 0-indexed library page back to the 1-indexed wire page.
-                emit(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
-                    page_no: page.page + 1,
-                    markdown: page.markdown,
+            // The analysis pass. Layout complexity and the per-page
+            // text-quality verdicts are computed inside the library from
+            // machinery it does not expose (the column detector and the
+            // text-quality module are both crate-private), so they cannot be
+            // recovered from the items the extraction pass returns. Asking
+            // for them costs a read of the file and is the price of the
+            // markdown pass below giving up the answers it used to come
+            // with.
+            let analyzed = guarded(|| {
+                pdf_inspector::process_pdf_mem_with_options(bytes, analyze_options(options))
+            })?;
+            layout = Some(layout_proto(&analyzed.layout));
+            has_encoding_issues = analyzed.has_encoding_issues;
+            extraction_ocr_reasons = ocr_reasons_proto(&analyzed.ocr_reasons_by_page);
+            let verdicts = page_verdicts(&analyzed);
+
+            // The extraction pass. Positioned items, not markdown: the
+            // markdown is rendered from them here so that the items — the
+            // boxes, the fonts, the marked-content ids, the link
+            // annotations — stay in hand instead of being rendered away
+            // inside the library.
+            let filter: Option<HashSet<u32>> =
+                (!options.pages.is_empty()).then(|| options.pages.iter().copied().collect());
+            let items = guarded(|| {
+                pdf_inspector::extractor::extract_text_with_positions_mem_pages(
+                    bytes,
+                    filter.as_ref(),
+                )
+            })?;
+            let mut by_page = spans::by_page(items);
+
+            for page_no in requested_pages(options, detected.page_count) {
+                let page_items = by_page.remove(&page_no).unwrap_or_default();
+
+                // The runs go out before the rendering they produced, so a
+                // consumer reading both never has to buffer one to
+                // interpret the other.
+                if events.wanted(options.emit_spans) {
+                    let spans = spans::page_spans(page_no, &page_items);
+                    events.route(
+                        pb::parse_pdf_response::Event::Spans(spans),
+                        options.emit_spans,
+                    )?;
+                }
+
+                let markdown = pdf_inspector::to_markdown_from_items_with_rects_and_page_count(
+                    page_items,
+                    MarkdownOptions::default(),
+                    &[],
+                    detected.page_count,
+                );
+                let markdown = markdown.trim().to_owned();
+                let markdown_bytes = markdown.len() as u64;
+                let (needs_ocr, reason) = verdicts
+                    .get(&page_no)
+                    .copied()
+                    .unwrap_or((false, pb::OcrReason::Unspecified));
+                events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+                    page_no,
+                    markdown,
+                    needs_ocr,
+                    ocr_reason: reason.into(),
                 }))?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -261,24 +375,13 @@ fn parse(
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted += 1;
             }
-            layout = Some(pb::LayoutComplexity {
-                is_complex: extracted.is_complex,
-                pages_with_tables: extracted.pages_with_tables,
-                pages_with_columns: extracted.pages_with_columns,
-            });
-            has_encoding_issues = extracted.ocr_reasons_by_page.iter().any(|page| {
-                page.reasons
-                    .iter()
-                    .any(|reason| reason == pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT)
-            });
         }
     }
 
     // The fold has seen every content event now, so its Document goes out
     // here — after the last `page`, before the `status` trailer that closes
-    // the stream. (`emit`'s borrow of the fold ended at its last call, so
-    // the fold is free to be taken.)
-    if let Some(fold) = fold.as_mut() {
+    // the stream.
+    if let Some(fold) = events.fold.as_mut() {
         sink.send(pb::parse_pdf_response::Event::Document(fold.take()))?;
     }
     sink.send(pb::parse_pdf_response::Event::Status(pb::ParseStatus {
@@ -287,8 +390,85 @@ fn parse(
         layout,
         has_encoding_issues,
         processing_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        extraction_ocr_reasons,
     }))?;
     Ok(())
+}
+
+/// The 1-indexed pages a call asks for, in the order it asked for them.
+///
+/// An empty filter means every page. A page past the end of the document is
+/// dropped rather than answered with an empty event: the caller asked about
+/// something that does not exist, and inventing a page for it would be a
+/// worse answer than saying nothing.
+fn requested_pages(options: &pb::PdfOptions, page_count: u32) -> Vec<u32> {
+    if options.pages.is_empty() {
+        (1..=page_count).collect()
+    } else {
+        options
+            .pages
+            .iter()
+            .copied()
+            .filter(|page| *page <= page_count)
+            .collect()
+    }
+}
+
+/// The library options for the analysis pass, honouring the call's page
+/// filter and password.
+fn analyze_options(options: &pb::PdfOptions) -> PdfOptions {
+    let mut analyze = PdfOptions::new().mode(ProcessMode::Analyze);
+    // An empty filter means "all pages" on the wire but "no pages" to the
+    // library, so it is only set when the caller named pages.
+    if !options.pages.is_empty() {
+        analyze = analyze.pages(options.pages.iter().copied());
+    }
+    if !options.password.is_empty() {
+        analyze = analyze.password(options.password.clone());
+    }
+    analyze
+}
+
+/// Per-page OCR verdicts from an analysis result, keyed by 1-indexed page.
+///
+/// A page can carry several reasons; the first is the one a per-page event
+/// can hold, and the whole list still travels on the trailer.
+fn page_verdicts(
+    analyzed: &pdf_inspector::PdfProcessResult,
+) -> HashMap<u32, (bool, pb::OcrReason)> {
+    // A page the analysis gave a reason for is a page it judged unusable,
+    // whether or not it also made the OCR list, so both sources set the
+    // verdict and only the reason distinguishes them.
+    let mut verdicts: HashMap<u32, (bool, pb::OcrReason)> = analyzed
+        .ocr_reasons_by_page
+        .iter()
+        .filter_map(|page| {
+            page.reasons
+                .first()
+                .map(|reason| (page.page, (true, ocr_reason(reason))))
+        })
+        .collect();
+    for page in &analyzed.pages_needing_ocr {
+        verdicts
+            .entry(*page)
+            .or_insert((true, pb::OcrReason::Unspecified));
+    }
+    verdicts
+}
+
+/// Map the library's per-page OCR reasons onto the wire message.
+fn ocr_reasons_proto(pages: &[pdf_inspector::PageOcrReasons]) -> Vec<pb::PageOcrReasons> {
+    pages
+        .iter()
+        .map(|page| pb::PageOcrReasons {
+            page: page.page,
+            reasons: page
+                .reasons
+                .iter()
+                .map(|reason| ocr_reason(reason).into())
+                .collect(),
+        })
+        .collect()
 }
 
 /// Call a fallible parser entry point with a panic guard.

@@ -294,6 +294,20 @@ pub fn shape(events: &[pb::parse_pdf_response::Event]) -> Vec<&'static str> {
             pb::parse_pdf_response::Event::Page(_) => "page",
             pb::parse_pdf_response::Event::Status(_) => "status",
             pb::parse_pdf_response::Event::Document(_) => "document",
+            pb::parse_pdf_response::Event::Spans(_) => "spans",
+        })
+        .collect()
+}
+
+/// Every `spans` event, in the order received. Only when
+/// `options.emit_spans` was set.
+#[must_use]
+pub fn spans(events: &[pb::parse_pdf_response::Event]) -> Vec<&pb::PageSpans> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            pb::parse_pdf_response::Event::Spans(spans) => Some(spans),
+            _ => None,
         })
         .collect()
 }

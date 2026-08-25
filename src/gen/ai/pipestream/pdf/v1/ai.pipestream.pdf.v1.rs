@@ -30,12 +30,110 @@ pub struct PdfOptions {
     /// markdown is retained.
     ///
     /// The event stream stays the primary, lossless wire; the Document is a
-    /// coarse structural projection of it — paragraphs and ATX headings parsed
-    /// back out of the page markdown, pages named but not measured — built so
-    /// a coordinator can merge it additively with another collector's parse of
-    /// the same document.
+    /// structural projection of it, built so a coordinator can merge it
+    /// additively with another collector's parse of the same document.
+    ///
+    /// The fold behind it consumes every event this parse produces, including
+    /// the ones the flags below keep off the wire: setting `emit_document`
+    /// alone still yields a Document with provenance boxes on its items,
+    /// because the spans that carry them were folded on their way past.
     #[prost(bool, tag="4")]
     pub emit_document: bool,
+    /// Also stream the positioned text runs each page's markdown was rendered
+    /// from, as one `spans` event per page immediately before that page's
+    /// `page` event. Default false.
+    ///
+    /// The runs are what the extractor actually saw: text, box, font, size,
+    /// the bold/italic/underline/strikeout flags, the marked-content id, and
+    /// the link target for a link annotation. Markdown is a rendering of
+    /// them, so this is the lossless half of a FULL stream and the only place
+    /// a coordinate appears on this wire.
+    #[prost(bool, tag="5")]
+    pub emit_spans: bool,
+}
+/// Rect is an axis-aligned rectangle in PDF user space.
+///
+/// The unit is the PDF point (1/72 inch) and the origin is the page's
+/// bottom-left corner, with y increasing upwards — the space the file
+/// itself is written in, unrotated and unscaled. A consumer that wants
+/// top-left coordinates subtracts from the page box, which arrives on
+/// `PageGeometry`.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct Rect {
+    /// Distance from the page's left edge to the rectangle's left edge.
+    #[prost(double, tag="1")]
+    pub x: f64,
+    /// Distance from the page's bottom edge to the rectangle's bottom edge.
+    /// For a text run this is the baseline, not the descender.
+    #[prost(double, tag="2")]
+    pub y: f64,
+    /// Extent along x. Never negative.
+    #[prost(double, tag="3")]
+    pub width: f64,
+    /// Extent along y. Never negative.
+    #[prost(double, tag="4")]
+    pub height: f64,
+}
+/// TextSpan is one positioned run as the extractor saw it, before markdown.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TextSpan {
+    /// The run's text. For an image span this is a placeholder.
+    #[prost(string, tag="1")]
+    pub text: ::prost::alloc::string::String,
+    /// Where the run sits on its page.
+    #[prost(message, optional, tag="2")]
+    pub bbox: ::core::option::Option<Rect>,
+    /// The `/BaseFont` family name, subset prefix included
+    /// ("ABCDEF+CMMI10"). Empty for runs that no show operator produced.
+    #[prost(string, tag="3")]
+    pub font_family: ::prost::alloc::string::String,
+    /// The page-resource tag the show operator selected ("F2"). Its namespace
+    /// is the enclosing page's resources, so the same tag on another page may
+    /// name a different face; within one page it separates font programs that
+    /// share a family name.
+    #[prost(string, tag="4")]
+    pub font_tag: ::prost::alloc::string::String,
+    /// Type size in points, 0 for runs that no show operator produced.
+    #[prost(float, tag="5")]
+    pub font_size: f32,
+    /// Whether the face is bold.
+    #[prost(bool, tag="6")]
+    pub bold: bool,
+    /// Whether the face is italic.
+    #[prost(bool, tag="7")]
+    pub italic: bool,
+    /// Whether a rule is drawn under the baseline. PDF has no underline flag,
+    /// so this is geometric.
+    #[prost(bool, tag="8")]
+    pub underline: bool,
+    /// Whether a rule crosses the glyphs at mid x-height. Geometric, as
+    /// above.
+    #[prost(bool, tag="9")]
+    pub strikeout: bool,
+    /// The marked-content id from the page's content stream, when the run
+    /// sits inside a BDC/BMC pair. This is the join key to the tagged
+    /// structure tree.
+    #[prost(int64, optional, tag="10")]
+    pub mcid: ::core::option::Option<i64>,
+    /// What kind of run this is.
+    #[prost(enumeration="SpanKind", tag="11")]
+    pub kind: i32,
+    /// For SPAN_KIND_LINK, the annotation's target. Empty otherwise.
+    #[prost(string, tag="12")]
+    pub link_uri: ::prost::alloc::string::String,
+}
+/// PageSpans carries one page's positioned runs, in extraction order.
+///
+/// Sent immediately before that page's `page` event, so a consumer that
+/// wants both sees the runs first and the rendering they produced second.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PageSpans {
+    /// The 1-indexed page these runs came from.
+    #[prost(uint32, tag="1")]
+    pub page_no: u32,
+    /// The runs, in the order the extractor produced them.
+    #[prost(message, repeated, tag="2")]
+    pub spans: ::prost::alloc::vec::Vec<TextSpan>,
 }
 /// PageOcrReasons lists the OCR reasons for one page.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -113,6 +211,19 @@ pub struct PageMarkdown {
     /// The page's text layer as markdown. Empty when the page needs OCR.
     #[prost(string, tag="2")]
     pub markdown: ::prost::alloc::string::String,
+    /// True when this page's own text layer is unreliable, as judged by the
+    /// pass that read it rather than by the sampling detection on `info`.
+    ///
+    /// The two can disagree, and the disagreement is the point: detection
+    /// samples pages and answers about the document, while this answers about
+    /// this page after its glyphs were actually decoded. A page that decoded
+    /// to mojibake shows up here even when the document as a whole looked
+    /// fine.
+    #[prost(bool, tag="3")]
+    pub needs_ocr: bool,
+    /// Why, when the cause is known. UNSPECIFIED when `needs_ocr` is false.
+    #[prost(enumeration="OcrReason", tag="4")]
+    pub ocr_reason: i32,
 }
 /// ParseWarning is one non-fatal observation, carried on ParseStatus.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -152,6 +263,14 @@ pub struct ParseStatus {
     /// Wall-clock milliseconds for the whole call, classification included.
     #[prost(uint64, tag="5")]
     pub processing_time_ms: u64,
+    /// Per-page OCR reasons from the pass that read the text layer, as
+    /// distinct from `PdfInfo.ocr_reasons`, which comes from the sampling
+    /// detection. Populated in ANALYZE and FULL.
+    ///
+    /// `has_encoding_issues` above is these reasons collapsed to one boolean;
+    /// it stays for callers that only want the routing bit.
+    #[prost(message, repeated, tag="6")]
+    pub extraction_ocr_reasons: ::prost::alloc::vec::Vec<PageOcrReasons>,
 }
 /// ServerLimits reports the ceilings a server actually enforces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -211,6 +330,52 @@ impl ProcessMode {
             "PROCESS_MODE_DETECT_ONLY" => Some(Self::DetectOnly),
             "PROCESS_MODE_ANALYZE" => Some(Self::Analyze),
             "PROCESS_MODE_FULL" => Some(Self::Full),
+            _ => None,
+        }
+    }
+}
+/// SpanKind names what a positioned run actually is.
+///
+/// The extractor emits more than glyphs: an image XObject contributes its
+/// placement box, a link annotation contributes its rectangle and target,
+/// and an AcroForm field contributes its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum SpanKind {
+    /// Never sent. Present because proto3 requires a zero value.
+    Unspecified = 0,
+    /// Glyphs drawn by a text-showing operator.
+    Text = 1,
+    /// An image XObject's placement box. `text` is a placeholder, not
+    /// content.
+    Image = 2,
+    /// A link annotation's rectangle. `link_uri` carries its target.
+    Link = 3,
+    /// An AcroForm field's value.
+    FormField = 4,
+}
+impl SpanKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "SPAN_KIND_UNSPECIFIED",
+            Self::Text => "SPAN_KIND_TEXT",
+            Self::Image => "SPAN_KIND_IMAGE",
+            Self::Link => "SPAN_KIND_LINK",
+            Self::FormField => "SPAN_KIND_FORM_FIELD",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "SPAN_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "SPAN_KIND_TEXT" => Some(Self::Text),
+            "SPAN_KIND_IMAGE" => Some(Self::Image),
+            "SPAN_KIND_LINK" => Some(Self::Link),
+            "SPAN_KIND_FORM_FIELD" => Some(Self::FormField),
             _ => None,
         }
     }
@@ -366,7 +531,7 @@ pub struct ParsePdfResponse {
     /// Unknown variants must be ignored rather than treated as failures: this
     /// oneof is the extension point, and a later server may add events an
     /// older client has no name for.
-    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4")]
+    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5")]
     pub event: ::core::option::Option<parse_pdf_response::Event>,
 }
 /// Nested message and enum types in `ParsePdfResponse`.
@@ -402,6 +567,11 @@ pub mod parse_pdf_response {
         /// named but without sizes, no provenance boxes.
         #[prost(message, tag="4")]
         Document(super::super::super::document::v1::Document),
+        /// One page's positioned text runs, immediately before that page's
+        /// `page` event. FULL mode only, and only when
+        /// `PdfOptions.emit_spans` was set.
+        #[prost(message, tag="5")]
+        Spans(super::PageSpans),
     }
 }
 /// GetServiceInfoRequest asks for the server's build and limits. It carries

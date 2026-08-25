@@ -47,8 +47,9 @@ service PdfParseService {
   // has arrived. Streaming begins the moment it is possible to begin,
   // which is why this is `info`-then-pages rather than one big response.
   //
-  // A successful stream is exactly: one `info`, then `page` events in
-  // requested page order (FULL mode, text-bearing documents only), then —
+  // A successful stream is exactly: one `info`, then, per page in
+  // requested page order (FULL mode, text-bearing documents only), an
+  // optional `spans` event followed by that page's `page` event, then —
   // only when `options.emit_document` was set — one `document`, then one
   // `status`. A failed stream ends with a gRPC status and no `status`
   // event:
@@ -116,6 +117,11 @@ message ParsePdfResponse {
     // markdown-derived and coarse: paragraphs and ATX headings only, pages
     // named but without sizes, no provenance boxes.
     ai.pipestream.document.v1.Document document = 4;
+
+    // One page's positioned text runs, immediately before that page's
+    // `page` event. FULL mode only, and only when
+    // `PdfOptions.emit_spans` was set.
+    PageSpans spans = 5;
   }
 }
 

@@ -22,13 +22,17 @@
 //!   already flattened the layout, so there is little more to recover, and
 //!   parsing deeper would pretend to structure the source does not have.
 //! - **Pages are named, not measured.** `pages` carries one `PageItem` per
-//!   page the `info` event reported, with `page_no` set and `size` and
-//!   `image` omitted: the event stream carries no page geometry, and an
-//!   invented size would outlive the honesty of this comment.
-//! - **No provenance boxes.** A `ProvenanceItem` without a bounding box is
-//!   a claim this fold cannot make, so an item's page travels in
-//!   `meta.custom_fields["pdf.page"]` instead, as data rather than as a
-//!   fabricated coordinate.
+//!   page the `info` event reported, with `page_no` and `unit` set and
+//!   `size` and `image` omitted: nothing on the event stream yet carries a
+//!   page box, and an invented size would outlive the honesty of this
+//!   comment. `unit` is set anyway, because the runs' boxes *are* measured
+//!   and a box whose unit a reader has to guess is barely a box.
+//! - **Provenance is typed.** Every item carries a `ProvenanceItem` naming
+//!   its page, and — when the `spans` event for that page located the
+//!   item's text among the positioned runs — the union of those runs'
+//!   boxes as its `bbox`. This used to be a `meta.custom_fields["pdf.page"]`
+//!   number on the side, which is the untyped shape of the same fact;
+//!   `prov[].page_no` is the typed one and costs nothing.
 //! - **A self-contained fragment.** Refs are dense and local (`#/texts/0`),
 //!   every item's `parent` is the section header it sits under (or
 //!   `#/body`), and every parent lists the item in its `children`, so the
@@ -39,11 +43,7 @@
 //! ([`VERSION`]) as `version`, and the detection confidence from `info` —
 //! the only confidence the pipeline computes — as `confidence`.
 
-use std::collections::HashMap;
-
-use prost_types::Value;
-use prost_types::value::Kind;
-
+use crate::page_runs::PageRuns;
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
 use crate::{COLLECTOR, PARSER, VERSION};
@@ -54,6 +54,10 @@ pub const SCHEMA_NAME: &str = "docling_document_v2";
 
 /// Value of `DocumentOrigin.mimetype`.
 pub const MIMETYPE: &str = "application/pdf";
+
+/// Value of `PageItem.unit`: every coordinate this fold writes is in PDF
+/// user-space points, 1/72 inch, measured from the page's bottom-left.
+pub const UNIT: &str = "pt";
 
 /// Self ref of the body group: the parent of everything this fold makes
 /// that is not under a section header.
@@ -80,6 +84,11 @@ pub struct DocumentFold {
     /// self ref content under it names as its parent. Empty means the body
     /// is the parent.
     headings: Vec<(i32, String)>,
+    /// The positioned runs of the page being folded, when the stream
+    /// carried them. They arrive on the `spans` event immediately before
+    /// the `page` event they belong to, and are dropped when the next one
+    /// arrives: a page's boxes are of no use to any other page.
+    runs: Option<PageRuns>,
 }
 
 impl Default for DocumentFold {
@@ -114,6 +123,7 @@ impl DocumentFold {
                 confidence: None,
             },
             headings: Vec::new(),
+            runs: None,
         }
     }
 
@@ -129,6 +139,7 @@ impl DocumentFold {
         use pb::parse_pdf_response::Event;
         match event {
             Event::Info(info) => self.on_info(info),
+            Event::Spans(spans) => self.runs = Some(PageRuns::new(spans)),
             Event::Page(page) => self.on_page(page),
             Event::Status(_) | Event::Document(_) => {}
         }
@@ -137,6 +148,7 @@ impl DocumentFold {
     /// Finish the fragment and take it. The fold is empty afterwards.
     pub fn take(&mut self) -> doc::Document {
         self.headings.clear();
+        self.runs = None;
         std::mem::replace(&mut self.document, Self::new().document)
     }
 
@@ -147,14 +159,17 @@ impl DocumentFold {
         if !info.title.is_empty() {
             self.document.name.clone_from(&info.title);
         }
-        // One PageItem per reported page: the number is known, the geometry
-        // is not, and only what is known is written down.
+        // One PageItem per reported page: the number is known, the size is
+        // not, and only what is known is written down. `unit` is known
+        // regardless — every box this fold writes is in PDF points — and
+        // saying so is what makes those boxes readable.
         for page in 1..=info.page_count {
             let page_no = i32::try_from(page).unwrap_or(i32::MAX);
             self.document.pages.insert(
                 page_no,
                 doc::PageItem {
                     page_no,
+                    unit: Some(UNIT.to_owned()),
                     ..doc::PageItem::default()
                 },
             );
@@ -185,22 +200,12 @@ impl DocumentFold {
     fn push_text(&mut self, text: &str, page_no: u32, level: Option<i32>) -> String {
         let parent = self.current_parent();
         let self_ref = format!("#/texts/{}", self.document.texts.len());
-        let mut fields = HashMap::new();
-        if page_no > 0 {
-            // The page this text was extracted from, as data. `prov` stays
-            // empty: a ProvenanceItem needs a bounding box, and the stream
-            // carries none. `page_no` 0 is the password fallback's
-            // whole-document event, which has no page to name.
-            fields.insert("pdf.page".to_owned(), number(page_no));
-        }
         let base = doc::TextItemBase {
             self_ref: self_ref.clone(),
             parent: Some(reference(&parent)),
             content_layer: doc::ContentLayer::Body as i32,
-            meta: Some(doc::BaseMeta {
-                custom_fields: fields,
-                ..doc::BaseMeta::default()
-            }),
+            meta: Some(doc::BaseMeta::default()),
+            prov: self.provenance(text, page_no),
             label: level.map_or(doc::DocItemLabel::Paragraph, |_| {
                 doc::DocItemLabel::SectionHeader
             }) as i32,
@@ -225,6 +230,31 @@ impl DocumentFold {
         });
         self.link_child(&parent, &self_ref);
         self_ref
+    }
+
+    /// Where one block of text came from.
+    ///
+    /// The page alone is always a claim this fold can make, and it makes
+    /// it: a provenance entry naming only a page is strictly more than the
+    /// nothing that used to be there. The box is added when the page's runs
+    /// arrived and the block's letters were found among them.
+    ///
+    /// Page 0 is the password fallback's whole-document event, which has no
+    /// page to name and therefore no provenance to give.
+    fn provenance(&mut self, text: &str, page_no: u32) -> Vec<doc::ProvenanceItem> {
+        if page_no == 0 {
+            return Vec::new();
+        }
+        let bbox = self
+            .runs
+            .as_mut()
+            .filter(|runs| runs.page_no() == page_no)
+            .and_then(|runs| runs.locate(text));
+        vec![doc::ProvenanceItem {
+            page_no: i32::try_from(page_no).unwrap_or(i32::MAX),
+            bbox,
+            ..doc::ProvenanceItem::default()
+        }]
     }
 
     /// The ref new content parents to: the innermost open section header,
@@ -355,16 +385,6 @@ fn reference(target: &str) -> doc::RefItem {
     }
 }
 
-/// A `google.protobuf.Value` holding a number.
-fn number(value: u32) -> Value {
-    // JSON numbers are doubles, so this is the schema's own precision
-    // limit, not one this fold introduces; page numbers are many orders of
-    // magnitude below 2^53.
-    Value {
-        kind: Some(Kind::NumberValue(f64::from(value))),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -394,6 +414,30 @@ mod tests {
         pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
             page_no,
             markdown: markdown.to_owned(),
+            ..pb::PageMarkdown::default()
+        })
+    }
+
+    /// One page's runs, one run per line of `lines`, stacked down the page
+    /// so a test can tell them apart by their box.
+    fn spans(page_no: u32, lines: &[&str]) -> pb::parse_pdf_response::Event {
+        pb::parse_pdf_response::Event::Spans(pb::PageSpans {
+            page_no,
+            spans: lines
+                .iter()
+                .enumerate()
+                .map(|(index, line)| pb::TextSpan {
+                    text: (*line).to_owned(),
+                    bbox: Some(pb::Rect {
+                        x: 72.0,
+                        y: 700.0 - 20.0 * index as f64,
+                        width: 400.0,
+                        height: 12.0,
+                    }),
+                    kind: pb::SpanKind::Text.into(),
+                    ..pb::TextSpan::default()
+                })
+                .collect(),
         })
     }
 
@@ -565,29 +609,87 @@ mod tests {
     }
 
     #[test]
-    fn items_carry_their_page_as_data_not_provenance() {
+    fn an_items_page_is_provenance_not_a_custom_field() {
         let mut fold = DocumentFold::new();
         fold.consume(&page(2, "text of page two\n"));
         let document = fold.take();
         let base = base_of(&document.texts[0]);
-        assert!(base.prov.is_empty(), "no fabricated bounding boxes");
-        let page = base
-            .meta
-            .as_ref()
-            .and_then(|meta| meta.custom_fields.get("pdf.page"))
-            .and_then(|value| value.kind.as_ref());
-        assert!(matches!(page, Some(Kind::NumberValue(n)) if *n == 2.0));
+        assert_eq!(base.prov.len(), 1, "one provenance entry per item");
+        assert_eq!(base.prov[0].page_no, 2);
+        assert!(
+            base.prov[0].bbox.is_none(),
+            "no runs arrived, so no box is claimed"
+        );
+        let meta = base.meta.as_ref().expect("meta");
+        assert!(
+            meta.custom_fields.is_empty(),
+            "the untyped side channel is gone: {:?}",
+            meta.custom_fields
+        );
     }
 
     #[test]
-    fn the_whole_document_fallback_names_no_page() {
+    fn runs_arriving_before_a_page_put_boxes_on_its_items() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&spans(1, &["A Heading", "some prose here"]));
+        fold.consume(&page(1, "# A Heading\n\nsome prose here\n"));
+        let document = fold.take();
+
+        let heading = base_of(&document.texts[0]);
+        let heading_box = heading.prov[0].bbox.as_ref().expect("the heading's box");
+        assert!(
+            (heading_box.b - 700.0).abs() < f64::EPSILON,
+            "{heading_box:?}"
+        );
+        assert_eq!(
+            heading_box.coord_origin,
+            Some(doc::CoordOrigin::Bottomleft as i32)
+        );
+
+        let prose = base_of(&document.texts[1]);
+        let prose_box = prose.prov[0].bbox.as_ref().expect("the prose box");
+        assert!(
+            (prose_box.b - 680.0).abs() < f64::EPSILON,
+            "each block gets its own run, not the first one: {prose_box:?}"
+        );
+    }
+
+    #[test]
+    fn runs_from_another_page_are_not_borrowed() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&spans(1, &["page one text"]));
+        fold.consume(&page(2, "page one text\n"));
+        let document = fold.take();
+        let base = base_of(&document.texts[0]);
+        assert_eq!(base.prov[0].page_no, 2);
+        assert!(
+            base.prov[0].bbox.is_none(),
+            "a box from page 1 is not evidence about page 2"
+        );
+    }
+
+    #[test]
+    fn every_page_declares_the_unit_its_boxes_are_measured_in() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(2, "", 1.0));
+        let document = fold.take();
+        for item in document.pages.values() {
+            assert_eq!(item.unit.as_deref(), Some(UNIT));
+        }
+    }
+
+    #[test]
+    fn the_whole_document_fallback_claims_no_page() {
         let mut fold = DocumentFold::new();
         // `page_no` 0 is the password fallback's whole-document event.
         fold.consume(&page(0, "all of it\n"));
         let document = fold.take();
         let base = base_of(&document.texts[0]);
-        let meta = base.meta.as_ref().expect("meta");
-        assert!(!meta.custom_fields.contains_key("pdf.page"));
+        assert!(
+            base.prov.is_empty(),
+            "there is no page to name, so nothing is claimed"
+        );
     }
 
     #[test]
