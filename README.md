@@ -48,18 +48,53 @@ begins the moment it is possible:
 ```text
 info      always first: pdf_type, confidence, page_count, title,
           pages_needing_ocr + reasons, detection_time_ms
+metadata  only with options.emit_metadata: what the file says about
+          itself, immediately after info
+structure only with options.emit_structure: one per page, the authored
+          tagged-PDF roles, before that page's other events
+tables    only with options.emit_tables: one per page that has tables,
+          the detected grids with their coordinates
+spans     only with options.emit_spans: one per page, the positioned text
+          runs the markdown was rendered from
 page      FULL mode, text-bearing documents only: one per page,
           1-indexed, in requested page order
 document  only when options.emit_document is set: the whole parse folded
           into one ai.pipestream.document.v1.Document, after the last
           page, before status
 status    trailer: pages_extracted, warnings, layout complexity,
-          has_encoding_issues, total processing_time_ms
+          has_encoding_issues, per-page extraction OCR reasons, total
+          processing_time_ms
 ```
 
 Modes (`options.mode`): `DETECT_ONLY` (classification only, the ~10–50ms
 routing answer), `ANALYZE` (classification + layout/encoding analysis, no
 markdown), `FULL` (classification + per-page markdown; the default).
+
+Every event class above `page` is off by default and costs nothing when
+off. `emit_metadata` and `emit_structure` each cost one more read of the
+file; `emit_spans` and `emit_tables` cost only the bandwidth of sending
+what the extraction pass already produced. `report_furniture` reports the
+runs a page drew that its markdown does not contain — the headers, footers
+and folio numbers the strippers remove, which used to vanish silently.
+
+### What the events carry beyond markdown
+
+- **`spans`** — every positioned run: text, box in PDF points, font family
+  and resource tag, size, bold/italic/underline/strikeout, the
+  marked-content id, and the target of a link annotation. This is the
+  lossless half of a FULL stream and the only place a coordinate appears.
+- **`structure`** — the roles a tagged document gives its own content
+  (`H1`–`H6`, `P`, `L`, `LI`, `Table`, `Figure`, `Caption`, `Code`, …),
+  resolved through `/RoleMap` and joined to the runs by marked-content id.
+  An authored heading beats a heading level guessed from type size.
+- **`tables`** — the detected grids: column and row positions in page
+  points, the cells, and whether the detector read data or a table of
+  contents.
+- **`metadata`** — the information dictionary in full, the XMP packet, the
+  file-format version, the catalog language, the tagged flag, the file
+  identifier, the encryption posture, the outline, embedded file
+  attachments, per-page boxes, rotation and page labels, named
+  destinations, and every link annotation with its destination resolved.
 
 ### The optional Document projection
 
@@ -71,18 +106,26 @@ primary, lossless wire; the Document is a coarse, self-contained
 projection of it that a coordinator can merge additively with another
 collector's parse of the same document:
 
-- ATX headings (`#`–`####`) become `SectionHeaderItem`s with their level,
-  blank-line-separated blocks become paragraph `TextItem`s. Lists and
-  emphasis stay as markdown source in `text`.
-- `pages` carries one `PageItem` per page `info` reported — `page_no`
-  only; the stream has no page geometry, so `size` and `image` are
-  omitted rather than fabricated. Likewise items carry no `prov` boxes;
-  the page of each item is in `meta.custom_fields["pdf.page"]`.
+- Headings come from the document's own tagging when it is tagged, and
+  from the markdown's ATX levels when it is not. Lists become `ListItem`s
+  inside a list `GroupItem`, fenced blocks become `CodeItem`s, and a
+  detected table becomes a `TableItem` with typed cells rather than pipe
+  characters inside a paragraph.
+- Every item carries a `ProvenanceItem` naming its page, with a bounding
+  box whenever the page's runs could be located behind the item's text.
+  `PageItem.unit` says those boxes are in points, and `PageItem.size`
+  carries the page's own visible box when the metadata pass read one.
+- `source_meta`, `outline`, `attachments` and `anchors` come from the
+  file's own dictionaries. Link annotations become `InlineSpan.hyperlink`
+  over the anchored words, and internal cross-references become
+  `InlineSpan.target` pointing at the page they lead to.
+- Runs the markdown dropped go into the furniture group under
+  `CONTENT_LAYER_FURNITURE` when `report_furniture` is set.
 - Every item's `CollectorSource` is `collector: "pdf"`,
   `model: "pdf-inspector <crate version>"`, `version: <this build's
   version>`, `confidence: <the detection confidence from info>`.
-- Item refs are dense and local (`#/texts/0`), with headings as parents
-  docling-style, so refs renumber mechanically on merge.
+- Item refs are dense and local (`#/texts/0`), with headings as parents,
+  so refs renumber mechanically on merge.
 - Default off costs nothing: no fold is built and no markdown is
   retained.
 

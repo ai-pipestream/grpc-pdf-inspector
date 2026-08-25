@@ -60,8 +60,8 @@ use crate::proto::v1 as pb;
 use crate::structure;
 use crate::{COLLECTOR, PARSER, VERSION};
 
-/// Value of `Document.schema_name`: the upstream docling schema this plane
-/// tracks.
+/// Value of `Document.schema_name`: the identifier of the upstream schema
+/// dialect this plane tracks, spelled as that dialect spells it.
 pub const SCHEMA_NAME: &str = "docling_document_v2";
 
 /// Value of `DocumentOrigin.mimetype`.

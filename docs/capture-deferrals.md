@@ -1,0 +1,175 @@
+# Capture deferrals
+
+What the capture audit found, what this wave wired, and what is still not
+captured — with the reason, so the next person does not re-derive it.
+
+Three reasons appear below and they are not interchangeable:
+
+- **Not reachable** — the data exists inside the parser crate and no public
+  API returns it. Fixing this means an upstream change, not a change here.
+- **Needs a typed home** — the data reaches the event plane, fully typed,
+  but the Document schema has no field for it. It is not flattened into a
+  string map; per the fleet's typing rule, data whose shape is known gets a
+  typed field or it waits for one.
+- **Deliberate** — reachable and homed, and still not done, because the
+  cost is not worth the return yet.
+
+## Landed
+
+| Audit row | Where it lands now |
+|---|---|
+| S1 page as an untyped custom field | `ProvenanceItem.page_no`, always |
+| S2 / D17 link annotations | `InlineSpan.hyperlink` over the anchored words, plus item-level `hyperlink` when a block is entirely one link |
+| S10 whole-stream verdict on the Document plane | `PageItem.quality` per page |
+| D1 / D2 per-page OCR verdicts | `PageMarkdown.needs_ocr` / `.ocr_reason`, `ParseStatus.extraction_ocr_reasons` |
+| D6 / D22 stripped furniture | `PageMarkdown.furniture`, and the furniture group under `CONTENT_LAYER_FURNITURE` |
+| D8 per-run geometry | `TextSpan.bbox`, and `ProvenanceItem.bbox` on every located item |
+| D9 page dimensions | `PageGeometry.media_box` / `.crop_box`, `PageItem.size` |
+| D10 font identity and size | `TextSpan.font_family` / `.font_tag` / `.font_size` |
+| D11 marked-content ids | `TextSpan.mcid` |
+| D12 / U2 tagged roles | `StructureRole`, `PageStructure`, `TextItemBase.style_name`, authored heading depth |
+| D16 table-of-contents classification | `TableKind.CONTENTS`, `DOC_ITEM_LABEL_DOCUMENT_INDEX` |
+| D19 page rotation | `PageGeometry.rotation`, `PageQuality.rotation_degrees` (read from `/Rotate`, not inferred) |
+| D21 text-quality evidence | `PageMarkdown.replacement_runs`, `PageQuality.replacement_runs` |
+| S5 / U3 tier 1 tables | `TableRegion`, `Document.tables[]` with typed cells and per-cell boxes |
+| S6 lists | `ListItem.enumerated` / `.marker` inside a `GROUP_LABEL_LIST` group |
+| S7 code blocks | `CodeItem` with `code_language_raw` |
+| U6 markdown policy | reachable now that the service renders from items rather than calling the options-less entry point |
+| U8 / U9 / U16 information dictionary, XMP, version, language | `DocumentInfo`, `PdfMetadata.xmp_packet` / `.pdf_version` / `.language`, `Document.source_meta` |
+| U10 outline | `PdfMetadata.outline`, `Document.outline` |
+| U12 embedded files | `PdfMetadata.embedded_files`, `Document.attachments` |
+| U13 encryption posture | `EncryptionInfo` |
+| U15 page geometry | `PageGeometry` |
+| U22 internal destinations | `LinkTarget.dest_page_no` / `.dest_name`, `InlineSpan.target`, `Document.anchors` |
+| U23 page labels | `PageGeometry.label` |
+| U24 file identifier | `PdfMetadata.file_id` |
+| Version constant | derived from the manifest during const evaluation |
+
+## Not reachable without an upstream change
+
+**D18 — invisible text (render mode 3).** The content-stream walker
+recognises invisible text and takes a parameter controlling whether to keep
+it, but every public entry point passes `false`, and the
+`skipped_invisible` flag it returns is discarded by the caller inside the
+crate. So an OCR-under-image text layer or a hidden watermark cannot be
+emitted under `CONTENT_LAYER_INVISIBLE`, and cannot even be reported as
+having existed. **Ask:** make `include_invisible` an option on
+`extract_text_with_positions_mem_pages`, or return the flag.
+
+**D21 — the garble score itself.** `PageQuality.garble_score` stays unset.
+The letter-frequency correlation that distinguishes substitution-cipher
+garble from natural text lives in a private module, and only the derived
+boolean escapes. Replacement-character runs are counted here instead,
+because they can be counted exactly; putting a differently-defined number
+under the name `garble_score` would be worse than leaving it empty.
+**Ask:** make the text-quality analysis public, or return its score
+per page.
+
+**D13 — vector rectangles and line segments.** `PdfRect` and `PdfLine` are
+public types, but the memory-based accessor that returns them is
+`pub(crate)`. Without them the rect- and line-driven table detectors are
+unreachable and only the heuristic detector over items can run, so a table
+drawn with real rules is detected no better than a borderless one.
+**Ask:** a public `extract_text_with_positions_and_rects_mem`.
+
+**Layout complexity from items.** `pages_with_columns` cannot be recomputed
+from items a caller holds: the column detector is `pub(crate)`. That is why
+FULL mode runs a separate analysis pass rather than deriving the layout
+verdict from the runs it already has. Making the detector public would
+remove a whole read of the file from every FULL call. **Ask:** a public
+layout analyser over `&[TextItem]`.
+
+**D20 — detector page statistics.** Text-operator counts, image counts and
+area, distinct-character counts, path-operator counts and font-capability
+flags are computed and collapsed into one of four reason strings. Several
+are already marked dead inside the crate.
+
+**U4 — `pages_sampled` / `pages_with_text` / `ocr_recommended`.** These are
+on `PdfTypeResult`, which `process_pdf_mem_with_options` does not return.
+Reaching them means a second detection call; `pages_sampled` in particular
+would say how much of the document the confidence figure is based on.
+Deliberate deferral rather than an upstream ask.
+
+## Needs a typed home in the Document schema
+
+Each of these is on the event plane, typed and complete. Nothing is
+map-stuffed; the Document simply does not carry it yet.
+
+| Datum | Event-plane field | Shape it wants |
+|---|---|---|
+| File-format version | `PdfMetadata.pdf_version` | `DocumentMeta.format_version` (optional string) — every container format has one |
+| Whether the source declares itself tagged | `PdfMetadata.tagged` | `DocumentMeta.structured` (optional bool) — "the source states its own structure", which is what makes `style_name` trustworthy |
+| Stable identifier from inside the file | `PdfMetadata.file_id` | `DocumentOrigin.source_id` (optional string) — `binary_hash` is a transport fact; this is the document's own identity |
+| Encryption posture | `EncryptionInfo` | `DocumentMeta.protection = Protection { bool encrypted; string handler; uint32 key_bits; bool opened_without_password; bool allows_extraction; bool allows_printing; }` — `allows_extraction` is compliance-relevant and the pipeline currently cannot see it is overriding it |
+| Authoring application, as distinct from the producer | `DocumentInfo.creator_tool` | `DocumentMeta.authoring_tool` (optional string) — `generator` holds the producer; the application the document was written in is a different fact |
+| Subject line | `DocumentInfo.subject` | `DocumentMeta.subject` (optional string) |
+| Trapping state | `DocumentInfo.trapped` | `DocumentMeta.extra` is the wrong shape for it; a `Trapped` enum on `DocumentMeta` would be right, though the return is small |
+| The source's own metadata packet | `PdfMetadata.xmp_packet` | `DocumentMeta.raw_metadata` (bytes) — the audit proposed it and the landed schema does not have it |
+| A page's printed number | `PageGeometry.label` | `PageItem.page_label` (optional string) — the number a citation or a "go to page 12" actually means |
+| A page's full extent, as distinct from its visible one | `PageGeometry.media_box` | `PageItem.media_size` (Size) — `PageItem.size` takes the crop box, which is what a reader sees |
+| A page's user-space scale | `PageGeometry.user_unit` | `PageItem.user_unit` (optional double) — without it a box on a scaled page is unqualified |
+| The link layer as a whole | `PdfMetadata.links` | Only anchored links reach the Document, through `InlineSpan`. A link over an image, or one whose rectangle covers no run, has nowhere to go: it wants `PictureItem`-level `hyperlink`, or a document-level annotation list |
+
+## Deliberate, and cheap to add later
+
+- **S3 formatting.** `TextSpan` carries bold, italic, underline and
+  strikeout per run and `InlineSpan.formatting` is waiting for them. The
+  fold does not write them yet: doing it well means run-level spans over
+  the item's text, which is the same machinery the link runs use, so this
+  is a small follow-up rather than a design question.
+- **S4 AcroForm fields.** The extractor concatenates `name: value` into one
+  run, so the key/value boundary is already gone by the time this service
+  sees it. `Document.form_items[].graph` and the `FieldItem` fields the
+  audit proposed need the parser to emit fields structurally first.
+- **D7 / U18 images.** Image runs reach the wire with their placement boxes
+  as `SPAN_KIND_IMAGE`, so `Document.pictures[]` is now a mapping change
+  rather than a capture gap. Colourspace, bit depth, filter chain and
+  `/SMask` are never read by the crate and would need the direct reader
+  this service now has.
+- **U5 page-count estimate for unparseable files.** A byte-scan estimate
+  exists and the failure path returns `INVALID_ARGUMENT` and nothing else.
+- **U7 region-scoped re-asks.** A coordinator holding a box from another
+  collector could ask this one for that region's text. It needs a new RPC,
+  not a new field.
+- **U11 non-link annotations.** Sticky notes, highlights and reviewer
+  comments are skipped by the annotation walk. The reader here already
+  walks `/Annots`; adding the other subtypes is mechanical, and the
+  Document's `FineRef comments` is the natural anchor.
+- **U14 / U17 revision chain and signatures.** Both say the file was edited
+  or signed after the fact. Neither is read.
+- **U19 font inventory.** Which faces are embedded and which are not
+  explains the garbled text this service reports as a count.
+- **U21 optional content groups.** Text is extracted as if every layer were
+  on, so a hidden draft or redaction layer enters the output silently. A
+  `has_optional_content` flag is the cheap honesty fix.
+- **U25 artifact-marked content.** `/Artifact` is never checked, which is
+  why furniture detection is a repetition heuristic rather than a lookup.
+  Reading it would make the furniture layer exact.
+- **U27 inline images.** `BI`/`ID`/`EI` are skipped by the operator
+  scanner.
+
+## Known approximations
+
+- **Table headers.** The detector reports no header row. The first row of a
+  data table is marked `column_header` because that is the convention the
+  crate's own markdown renderer follows when it prints the grid; a table of
+  contents gets no header row at all.
+- **Row and column spans.** Every cell is 1x1. Spans need the vector-grid
+  route (`detect_vector_grid_in_region_mem` feeding
+  `extract_tables_with_structure_cells_mem`), which is a larger job and is
+  only available for border-drawn tables.
+- **Locating a block among its runs.** The fold matches a block of markdown
+  to the runs behind it by comparing letters and digits, forwards through
+  the page. A page whose renderer reorders runs — multi-column layouts
+  especially — can leave a block unlocated, and an unlocated block gets a
+  page-only provenance entry rather than a wrong box.
+- **The furniture report.** It names runs the markdown does not contain, in
+  reading order. A run the renderer moved backwards past another reads as
+  dropped. The report is approximate on reordering pages and exact on
+  ordinary ones.
+- **Per-page rendering and document-wide stripping.** Markdown is rendered
+  one page at a time, which is what keeps the stream a stream. The
+  cross-page repetition classifier behind the header and footer stripper
+  has no cross-page evidence in that mode, so it fires less than it would
+  on a whole-document render. Less silent deletion, and the same
+  `report_furniture` names whatever still goes.
