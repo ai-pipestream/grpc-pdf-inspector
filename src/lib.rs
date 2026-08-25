@@ -30,6 +30,7 @@ pub mod parse;
 pub mod proto;
 pub mod service;
 pub mod spans;
+pub mod structure;
 
 pub use limits::Limits;
 pub use metrics::Metrics;

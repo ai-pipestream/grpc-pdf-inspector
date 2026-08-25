@@ -28,6 +28,14 @@
 //! regular expression looking for URLs in the visible text, which finds a
 //! bare URL nobody linked and misses a link whose anchor text is a word.
 //!
+//! The authored roles ride along on the same index. A tagged document
+//! states what each marked-content region is, and every run carries the id
+//! that names its region, so once a block is matched to its runs the
+//! document's own word for it — `H2`, `LI`, `Code`, `Caption` — is in hand.
+//! That word beats the number of `#` characters the markdown renderer
+//! printed, because the renderer was guessing from type size and the
+//! document was not.
+//!
 //! Internal links are anchored the same way and land on
 //! `InlineSpan.target` instead, pointing at the page item the destination
 //! resolves to. They reach this module from the metadata pass rather than
@@ -52,6 +60,9 @@ pub struct PageRuns {
     /// For each run, the target of the link annotation covering it, when
     /// one does.
     links: Vec<Option<Anchor>>,
+    /// For each run, the role its marked-content region was tagged with,
+    /// when the document is tagged and the run sits in one.
+    roles: Vec<Option<(pb::StructureRole, String)>>,
     /// How far into `letters` the fold has already matched. Blocks are
     /// folded in reading order, so a search normally succeeds at the
     /// cursor and never revisits the page.
@@ -66,7 +77,11 @@ impl PageRuns {
     /// that the markdown renderer does not emit, so letting it into the
     /// page's letters would shift every match after it.
     #[must_use]
-    pub fn new(spans: &pb::PageSpans, internal: &[pb::LinkTarget]) -> Self {
+    pub fn new(
+        spans: &pb::PageSpans,
+        internal: &[pb::LinkTarget],
+        structure: Option<&pb::PageStructure>,
+    ) -> Self {
         let mut letters = Vec::new();
         let mut owners = Vec::new();
         let mut boxes = Vec::with_capacity(spans.spans.len());
@@ -83,12 +98,14 @@ impl PageRuns {
             }
         }
         let links = anchor_targets(spans, internal, &boxes);
+        let roles = tagged_roles(spans, structure);
         Self {
             page_no: spans.page_no,
             letters,
             owners,
             boxes,
             links,
+            roles,
             cursor: 0,
         }
     }
@@ -152,7 +169,30 @@ impl PageRuns {
             bbox: self.union(at, end),
             spans,
             hyperlink,
+            role: self.role(at, end),
         }
+    }
+
+    /// The role the document gave the runs behind `letters[at..end]`.
+    ///
+    /// A block normally sits in one marked-content region and so has one
+    /// role. When it straddles several, the one that covers the most
+    /// letters wins, because that is the one the block mostly is.
+    fn role(&self, at: usize, end: usize) -> Option<(pb::StructureRole, String)> {
+        let mut tally: Vec<(&(pb::StructureRole, String), usize)> = Vec::new();
+        for &owner in &self.owners[at..end] {
+            let Some(role) = self.roles.get(owner).and_then(Option::as_ref) else {
+                continue;
+            };
+            match tally.iter_mut().find(|(known, _)| *known == role) {
+                Some((_, count)) => *count += 1,
+                None => tally.push((role, 1)),
+            }
+        }
+        tally
+            .into_iter()
+            .max_by_key(|(_, count)| *count)
+            .map(|(role, _)| role.clone())
     }
 
     /// The link runs inside `letters[at..end]`, as character ranges into
@@ -209,6 +249,34 @@ pub struct Located {
     pub spans: Vec<doc::InlineSpan>,
     /// The link covering the whole block, when one does.
     pub hyperlink: Option<String>,
+    /// The role the document gave the block, and the name it used, when the
+    /// document is tagged.
+    pub role: Option<(pb::StructureRole, String)>,
+}
+
+/// For each run, the role of the marked-content region it sits in.
+fn tagged_roles(
+    spans: &pb::PageSpans,
+    structure: Option<&pb::PageStructure>,
+) -> Vec<Option<(pb::StructureRole, String)>> {
+    let Some(structure) = structure else {
+        return vec![None; spans.spans.len()];
+    };
+    spans
+        .spans
+        .iter()
+        .map(|span| {
+            let mcid = span.mcid?;
+            let element = structure
+                .elements
+                .iter()
+                .find(|element| element.mcid == mcid)?;
+            Some((
+                pb::StructureRole::try_from(element.role).unwrap_or(pb::StructureRole::Unspecified),
+                element.role_raw.clone(),
+            ))
+        })
+        .collect()
 }
 
 /// Where a link annotation leads.
@@ -386,7 +454,7 @@ mod tests {
     /// One page's runs indexed with no internal links, which is every case
     /// but the one test that supplies them.
     fn index(spans: pb::PageSpans) -> PageRuns {
-        PageRuns::new(&spans, &[])
+        PageRuns::new(&spans, &[], None)
     }
 
     #[test]
@@ -541,7 +609,7 @@ mod tests {
             dest_page_no: 7,
             ..pb::LinkTarget::default()
         }];
-        let mut runs = PageRuns::new(&spans, &internal);
+        let mut runs = PageRuns::new(&spans, &internal, None);
         let located = runs.locate("see chapter two");
         assert_eq!(located.spans.len(), 1);
         let target = located.spans[0].target.as_ref().expect("a target");

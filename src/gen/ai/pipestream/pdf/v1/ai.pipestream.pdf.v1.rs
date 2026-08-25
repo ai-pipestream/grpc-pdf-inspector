@@ -62,6 +62,18 @@ pub struct PdfOptions {
     /// why it is opt-in.
     #[prost(bool, tag="6")]
     pub emit_metadata: bool,
+    /// Also read the document's tagged structure tree and stream one
+    /// `structure` event per page, before that page's other events. Default
+    /// false.
+    ///
+    /// These are the roles the document's author declared — H1 through H6, P,
+    /// L, LI, Table, Figure, Caption, Code, Formula, TOC — joined to the
+    /// positioned runs by marked-content id. They are what the markdown
+    /// pipeline was guessing at from type size, and a document that declares
+    /// them is a document that does not have to be guessed at. It costs one
+    /// read of the file.
+    #[prost(bool, tag="7")]
+    pub emit_structure: bool,
 }
 /// Rect is an axis-aligned rectangle in PDF user space.
 ///
@@ -236,6 +248,35 @@ pub struct PageMarkdown {
     /// Why, when the cause is known. UNSPECIFIED when `needs_ocr` is false.
     #[prost(enumeration="OcrReason", tag="4")]
     pub ocr_reason: i32,
+}
+/// StructureElement is one marked-content region and the role its author
+/// gave it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StructureElement {
+    /// The marked-content id, which is the join key to `TextSpan.mcid`.
+    #[prost(int64, tag="1")]
+    pub mcid: i64,
+    /// The standard role, or UNSPECIFIED for a custom tag.
+    #[prost(enumeration="StructureRole", tag="2")]
+    pub role: i32,
+    /// The tag's own name, verbatim, exactly as the role map resolved it.
+    /// Always set, so a consumer never has to reconstruct it from the enum.
+    #[prost(string, tag="3")]
+    pub role_raw: ::prost::alloc::string::String,
+}
+/// PageStructure carries one page's authored roles.
+///
+/// Sent before that page's `spans` and `page` events, and only when
+/// `PdfOptions.emit_structure` was set. A document that is not tagged
+/// produces no elements, which is itself the answer.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PageStructure {
+    /// The 1-indexed page these roles describe.
+    #[prost(uint32, tag="1")]
+    pub page_no: u32,
+    /// The roles, sorted by marked-content id.
+    #[prost(message, repeated, tag="2")]
+    pub elements: ::prost::alloc::vec::Vec<StructureElement>,
 }
 /// DocumentInfo is the document's information dictionary, field by field.
 ///
@@ -722,6 +763,235 @@ impl OcrReason {
         }
     }
 }
+/// StructureRole is one standard structure type from a tagged PDF.
+///
+/// These are the roles the document's author declared, resolved through its
+/// /RoleMap, not roles inferred from how the page looks. A document that
+/// declares them is telling the truth about its own structure, which is
+/// better evidence than a heading level guessed from type size.
+///
+/// A custom tag with no standard mapping arrives as UNSPECIFIED with its
+/// name in `role_raw`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum StructureRole {
+    /// The tag has no standard mapping. `role_raw` carries its name.
+    Unspecified = 0,
+    /// The whole document. (`Document`).
+    Document = 1,
+    /// A large division of the document. (`Part`).
+    Part = 2,
+    /// A self-contained article. (`Art`).
+    Art = 3,
+    /// A section: a container of related content. (`Sect`).
+    Sect = 4,
+    /// A generic block container with no semantics of its own. (`Div`).
+    Div = 5,
+    /// A quotation set off from the surrounding text. (`BlockQuote`).
+    BlockQuote = 6,
+    /// A caption describing a figure or a table. (`Caption`).
+    Caption = 7,
+    /// A table of contents. (`TOC`).
+    Toc = 8,
+    /// One entry of a table of contents. (`TOCI`).
+    Toci = 9,
+    /// An index of the document's terms. (`Index`).
+    Index = 10,
+    /// A grouping with no structural meaning. (`NonStruct`).
+    NonStruct = 11,
+    /// Content private to the producing application. (`Private`).
+    Private = 12,
+    /// A heading whose depth the document does not state. (`H`).
+    H = 13,
+    /// A first-level heading. (`H1`).
+    H1 = 14,
+    /// A second-level heading. (`H2`).
+    H2 = 15,
+    /// A third-level heading. (`H3`).
+    H3 = 16,
+    /// A fourth-level heading. (`H4`).
+    H4 = 17,
+    /// A fifth-level heading. (`H5`).
+    H5 = 18,
+    /// A sixth-level heading. (`H6`).
+    H6 = 19,
+    /// A paragraph. (`P`).
+    P = 20,
+    /// A list. (`L`).
+    L = 21,
+    /// One item of a list. (`LI`).
+    Li = 22,
+    /// A list item's bullet or number. (`Lbl`).
+    Lbl = 23,
+    /// A list item's content. (`LBody`).
+    Lbody = 24,
+    /// A table. (`Table`).
+    Table = 25,
+    /// A table row. (`TR`).
+    Tr = 26,
+    /// A table header cell. (`TH`).
+    Th = 27,
+    /// A table data cell. (`TD`).
+    Td = 28,
+    /// A table's header row group. (`THead`).
+    Thead = 29,
+    /// A table's body row group. (`TBody`).
+    Tbody = 30,
+    /// A table's footer row group. (`TFoot`).
+    Tfoot = 31,
+    /// An inline run with no semantics of its own. (`Span`).
+    Span = 32,
+    /// An inline quotation. (`Quote`).
+    Quote = 33,
+    /// A footnote or endnote. (`Note`).
+    Note = 34,
+    /// A reference to elsewhere in the document. (`Reference`).
+    Reference = 35,
+    /// One entry of a bibliography. (`BibEntry`).
+    BibEntry = 36,
+    /// Program text. (`Code`).
+    Code = 37,
+    /// A hyperlink's content. (`Link`).
+    Link = 38,
+    /// An annotation's content. (`Annot`).
+    Annot = 39,
+    /// An illustration. (`Figure`).
+    Figure = 40,
+    /// A mathematical formula. (`Formula`).
+    Formula = 41,
+    /// A form field's content. (`Form`).
+    Form = 42,
+    /// A ruby annotation, the East Asian pronunciation gloss. (`Ruby`).
+    Ruby = 43,
+    /// A ruby annotation's base text. (`RB`).
+    Rb = 44,
+    /// A ruby annotation's gloss text. (`RT`).
+    Rt = 45,
+    /// A ruby annotation's punctuation, for readers with no ruby support. (`RP`).
+    Rp = 46,
+    /// A warichu, the East Asian inline note set in two half-size lines. (`Warichu`).
+    Warichu = 47,
+    /// A warichu's text. (`WT`).
+    Wt = 48,
+    /// A warichu's punctuation. (`WP`).
+    Wp = 49,
+}
+impl StructureRole {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "STRUCTURE_ROLE_UNSPECIFIED",
+            Self::Document => "STRUCTURE_ROLE_DOCUMENT",
+            Self::Part => "STRUCTURE_ROLE_PART",
+            Self::Art => "STRUCTURE_ROLE_ART",
+            Self::Sect => "STRUCTURE_ROLE_SECT",
+            Self::Div => "STRUCTURE_ROLE_DIV",
+            Self::BlockQuote => "STRUCTURE_ROLE_BLOCK_QUOTE",
+            Self::Caption => "STRUCTURE_ROLE_CAPTION",
+            Self::Toc => "STRUCTURE_ROLE_TOC",
+            Self::Toci => "STRUCTURE_ROLE_TOCI",
+            Self::Index => "STRUCTURE_ROLE_INDEX",
+            Self::NonStruct => "STRUCTURE_ROLE_NON_STRUCT",
+            Self::Private => "STRUCTURE_ROLE_PRIVATE",
+            Self::H => "STRUCTURE_ROLE_H",
+            Self::H1 => "STRUCTURE_ROLE_H1",
+            Self::H2 => "STRUCTURE_ROLE_H2",
+            Self::H3 => "STRUCTURE_ROLE_H3",
+            Self::H4 => "STRUCTURE_ROLE_H4",
+            Self::H5 => "STRUCTURE_ROLE_H5",
+            Self::H6 => "STRUCTURE_ROLE_H6",
+            Self::P => "STRUCTURE_ROLE_P",
+            Self::L => "STRUCTURE_ROLE_L",
+            Self::Li => "STRUCTURE_ROLE_LI",
+            Self::Lbl => "STRUCTURE_ROLE_LBL",
+            Self::Lbody => "STRUCTURE_ROLE_LBODY",
+            Self::Table => "STRUCTURE_ROLE_TABLE",
+            Self::Tr => "STRUCTURE_ROLE_TR",
+            Self::Th => "STRUCTURE_ROLE_TH",
+            Self::Td => "STRUCTURE_ROLE_TD",
+            Self::Thead => "STRUCTURE_ROLE_THEAD",
+            Self::Tbody => "STRUCTURE_ROLE_TBODY",
+            Self::Tfoot => "STRUCTURE_ROLE_TFOOT",
+            Self::Span => "STRUCTURE_ROLE_SPAN",
+            Self::Quote => "STRUCTURE_ROLE_QUOTE",
+            Self::Note => "STRUCTURE_ROLE_NOTE",
+            Self::Reference => "STRUCTURE_ROLE_REFERENCE",
+            Self::BibEntry => "STRUCTURE_ROLE_BIB_ENTRY",
+            Self::Code => "STRUCTURE_ROLE_CODE",
+            Self::Link => "STRUCTURE_ROLE_LINK",
+            Self::Annot => "STRUCTURE_ROLE_ANNOT",
+            Self::Figure => "STRUCTURE_ROLE_FIGURE",
+            Self::Formula => "STRUCTURE_ROLE_FORMULA",
+            Self::Form => "STRUCTURE_ROLE_FORM",
+            Self::Ruby => "STRUCTURE_ROLE_RUBY",
+            Self::Rb => "STRUCTURE_ROLE_RB",
+            Self::Rt => "STRUCTURE_ROLE_RT",
+            Self::Rp => "STRUCTURE_ROLE_RP",
+            Self::Warichu => "STRUCTURE_ROLE_WARICHU",
+            Self::Wt => "STRUCTURE_ROLE_WT",
+            Self::Wp => "STRUCTURE_ROLE_WP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "STRUCTURE_ROLE_UNSPECIFIED" => Some(Self::Unspecified),
+            "STRUCTURE_ROLE_DOCUMENT" => Some(Self::Document),
+            "STRUCTURE_ROLE_PART" => Some(Self::Part),
+            "STRUCTURE_ROLE_ART" => Some(Self::Art),
+            "STRUCTURE_ROLE_SECT" => Some(Self::Sect),
+            "STRUCTURE_ROLE_DIV" => Some(Self::Div),
+            "STRUCTURE_ROLE_BLOCK_QUOTE" => Some(Self::BlockQuote),
+            "STRUCTURE_ROLE_CAPTION" => Some(Self::Caption),
+            "STRUCTURE_ROLE_TOC" => Some(Self::Toc),
+            "STRUCTURE_ROLE_TOCI" => Some(Self::Toci),
+            "STRUCTURE_ROLE_INDEX" => Some(Self::Index),
+            "STRUCTURE_ROLE_NON_STRUCT" => Some(Self::NonStruct),
+            "STRUCTURE_ROLE_PRIVATE" => Some(Self::Private),
+            "STRUCTURE_ROLE_H" => Some(Self::H),
+            "STRUCTURE_ROLE_H1" => Some(Self::H1),
+            "STRUCTURE_ROLE_H2" => Some(Self::H2),
+            "STRUCTURE_ROLE_H3" => Some(Self::H3),
+            "STRUCTURE_ROLE_H4" => Some(Self::H4),
+            "STRUCTURE_ROLE_H5" => Some(Self::H5),
+            "STRUCTURE_ROLE_H6" => Some(Self::H6),
+            "STRUCTURE_ROLE_P" => Some(Self::P),
+            "STRUCTURE_ROLE_L" => Some(Self::L),
+            "STRUCTURE_ROLE_LI" => Some(Self::Li),
+            "STRUCTURE_ROLE_LBL" => Some(Self::Lbl),
+            "STRUCTURE_ROLE_LBODY" => Some(Self::Lbody),
+            "STRUCTURE_ROLE_TABLE" => Some(Self::Table),
+            "STRUCTURE_ROLE_TR" => Some(Self::Tr),
+            "STRUCTURE_ROLE_TH" => Some(Self::Th),
+            "STRUCTURE_ROLE_TD" => Some(Self::Td),
+            "STRUCTURE_ROLE_THEAD" => Some(Self::Thead),
+            "STRUCTURE_ROLE_TBODY" => Some(Self::Tbody),
+            "STRUCTURE_ROLE_TFOOT" => Some(Self::Tfoot),
+            "STRUCTURE_ROLE_SPAN" => Some(Self::Span),
+            "STRUCTURE_ROLE_QUOTE" => Some(Self::Quote),
+            "STRUCTURE_ROLE_NOTE" => Some(Self::Note),
+            "STRUCTURE_ROLE_REFERENCE" => Some(Self::Reference),
+            "STRUCTURE_ROLE_BIB_ENTRY" => Some(Self::BibEntry),
+            "STRUCTURE_ROLE_CODE" => Some(Self::Code),
+            "STRUCTURE_ROLE_LINK" => Some(Self::Link),
+            "STRUCTURE_ROLE_ANNOT" => Some(Self::Annot),
+            "STRUCTURE_ROLE_FIGURE" => Some(Self::Figure),
+            "STRUCTURE_ROLE_FORMULA" => Some(Self::Formula),
+            "STRUCTURE_ROLE_FORM" => Some(Self::Form),
+            "STRUCTURE_ROLE_RUBY" => Some(Self::Ruby),
+            "STRUCTURE_ROLE_RB" => Some(Self::Rb),
+            "STRUCTURE_ROLE_RT" => Some(Self::Rt),
+            "STRUCTURE_ROLE_RP" => Some(Self::Rp),
+            "STRUCTURE_ROLE_WARICHU" => Some(Self::Warichu),
+            "STRUCTURE_ROLE_WT" => Some(Self::Wt),
+            "STRUCTURE_ROLE_WP" => Some(Self::Wp),
+            _ => None,
+        }
+    }
+}
 /// ParseWarningCode names a condition that did not stop the parse.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
@@ -789,7 +1059,7 @@ pub struct ParsePdfResponse {
     /// Unknown variants must be ignored rather than treated as failures: this
     /// oneof is the extension point, and a later server may add events an
     /// older client has no name for.
-    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5, 6")]
+    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5, 6, 7")]
     pub event: ::core::option::Option<parse_pdf_response::Event>,
 }
 /// Nested message and enum types in `ParsePdfResponse`.
@@ -833,6 +1103,11 @@ pub mod parse_pdf_response {
         /// `info`. Only when `PdfOptions.emit_metadata` was set.
         #[prost(message, tag="6")]
         Metadata(super::PdfMetadata),
+        /// One page's authored structure roles, before that page's `spans` and
+        /// `page` events. FULL mode only, and only when
+        /// `PdfOptions.emit_structure` was set.
+        #[prost(message, tag="7")]
+        Structure(super::PageStructure),
     }
 }
 /// GetServiceInfoRequest asks for the server's build and limits. It carries

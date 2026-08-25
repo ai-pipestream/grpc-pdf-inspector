@@ -49,10 +49,10 @@ service PdfParseService {
   //
   // A successful stream is exactly: one `info`, an optional `metadata`,
   // then — per page, in requested page order, in FULL mode and for
-  // text-bearing documents only — an optional `spans` event followed by
-  // that page's `page` event, then, only when `options.emit_document` was
-  // set, one `document`, then one `status`. A failed stream ends with a
-  // gRPC status and no `status` event:
+  // text-bearing documents only — an optional `structure` event, an
+  // optional `spans` event, and that page's `page` event; then, only when
+  // `options.emit_document` was set, one `document`; then one `status`.
+  // A failed stream ends with a gRPC status and no `status` event:
   //
   //   RESOURCE_EXHAUSTED  the upload exceeded its byte cap
   //   INVALID_ARGUMENT    not a PDF, truncated or malformed, encrypted
@@ -125,6 +125,11 @@ message ParsePdfResponse {
     // Everything the file says about itself, sent once immediately after
     // `info`. Only when `PdfOptions.emit_metadata` was set.
     PdfMetadata metadata = 6;
+
+    // One page's authored structure roles, before that page's `spans` and
+    // `page` events. FULL mode only, and only when
+    // `PdfOptions.emit_structure` was set.
+    PageStructure structure = 7;
   }
 }
 

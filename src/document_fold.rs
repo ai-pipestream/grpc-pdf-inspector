@@ -53,6 +53,7 @@ use std::collections::HashMap;
 use crate::page_runs::{Located, PageRuns, page_ref};
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
+use crate::structure;
 use crate::{COLLECTOR, PARSER, VERSION};
 
 /// Value of `Document.schema_name`: the upstream docling schema this plane
@@ -105,6 +106,10 @@ pub struct DocumentFold {
     /// `metadata` event. The extractor reads external targets only, so
     /// these are the whole of the fold's knowledge of cross-references.
     internal_links: HashMap<u32, Vec<pb::LinkTarget>>,
+    /// The authored roles of the page being folded, when the document is
+    /// tagged and the stream carried them. Held like `runs`: the
+    /// `structure` event arrives before the page it describes.
+    structure: Option<pb::PageStructure>,
 }
 
 impl Default for DocumentFold {
@@ -147,6 +152,7 @@ impl DocumentFold {
             headings: Vec::new(),
             runs: None,
             internal_links: HashMap::new(),
+            structure: None,
         }
     }
 
@@ -163,12 +169,17 @@ impl DocumentFold {
         match event {
             Event::Info(info) => self.on_info(info),
             Event::Metadata(metadata) => self.on_metadata(metadata),
+            Event::Structure(structure) => self.structure = Some(structure.clone()),
             Event::Spans(spans) => {
                 let internal = self
                     .internal_links
                     .get(&spans.page_no)
                     .map_or(&[][..], Vec::as_slice);
-                self.runs = Some(PageRuns::new(spans, internal));
+                let structure = self
+                    .structure
+                    .as_ref()
+                    .filter(|structure| structure.page_no == spans.page_no);
+                self.runs = Some(PageRuns::new(spans, internal, structure));
             }
             Event::Page(page) => self.on_page(page),
             Event::Status(_) | Event::Document(_) => {}
@@ -179,6 +190,7 @@ impl DocumentFold {
     pub fn take(&mut self) -> doc::Document {
         self.headings.clear();
         self.runs = None;
+        self.structure = None;
         self.internal_links.clear();
         std::mem::replace(&mut self.document, Self::new().document)
     }
@@ -313,28 +325,43 @@ impl DocumentFold {
     /// Fold one page's markdown into text items.
     fn on_page(&mut self, page: &pb::PageMarkdown) {
         for block in blocks(&page.markdown) {
-            match block {
-                Block::Heading { level, text } => {
-                    // A header opens a level on the ladder before it is
-                    // placed, so it is parented to the header enclosing it
-                    // rather than to the one it closes.
-                    self.close_headings(level);
-                    let self_ref = self.push_text(&text, page.page_no, Some(level));
-                    self.headings.push((level, self_ref));
-                }
-                Block::Paragraph(text) => {
-                    self.push_text(&text, page.page_no, None);
-                }
+            let (guessed, text) = match block {
+                Block::Heading { level, text } => (Some(level), text),
+                Block::Paragraph(text) => (None, text),
+            };
+            let located = self.locate(&text, page.page_no);
+            // The document's own word for the block beats the markdown
+            // renderer's guess at it. The renderer inferred heading depth
+            // from type size; a tagged document states it.
+            let authored = located
+                .role
+                .as_ref()
+                .and_then(|(role, _)| structure::heading_level(*role));
+            let level = authored.or(guessed);
+            if let Some(level) = level {
+                // A header opens a level on the ladder before it is placed,
+                // so it is parented to the header enclosing it rather than
+                // to the one it closes.
+                self.close_headings(level);
+            }
+            let self_ref = self.push_text(&text, page.page_no, level, located);
+            if let Some(level) = level {
+                self.headings.push((level, self_ref));
             }
         }
     }
 
     /// Append one text item — a paragraph, or a section header when `level`
     /// is set — and return its self ref.
-    fn push_text(&mut self, text: &str, page_no: u32, level: Option<i32>) -> String {
+    fn push_text(
+        &mut self,
+        text: &str,
+        page_no: u32,
+        level: Option<i32>,
+        located: Located,
+    ) -> String {
         let parent = self.current_parent();
         let self_ref = format!("#/texts/{}", self.document.texts.len());
-        let located = self.locate(text, page_no);
         let base = doc::TextItemBase {
             self_ref: self_ref.clone(),
             parent: Some(reference(&parent)),
@@ -343,6 +370,10 @@ impl DocumentFold {
             prov: provenance(page_no, located.bbox),
             hyperlink: located.hyperlink,
             spans: located.spans,
+            // The source's own name for the item, verbatim. A consumer that
+            // knows the tagged-PDF vocabulary reads more out of "BlockQuote"
+            // or "Caption" than any label this fold could map it onto.
+            style_name: located.role.map(|(_, name)| name),
             label: level.map_or(doc::DocItemLabel::Paragraph, |_| {
                 doc::DocItemLabel::SectionHeader
             }) as i32,

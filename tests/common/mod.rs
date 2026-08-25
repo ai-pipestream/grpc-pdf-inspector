@@ -407,6 +407,89 @@ pub fn metadata_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page tagged PDF whose first line is declared an `H3` and
+/// whose body is declared a `P`, both drawn at the same size.
+///
+/// Same size is the point. Heading depth in the markdown pipeline is
+/// inferred by comparing type sizes, so it cannot reach three here; the
+/// document's own structure tree can, and says so. A level-3 section header
+/// in the fold therefore came from the tagging and from nowhere else.
+#[must_use]
+pub fn tagged_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let page_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let content = b"/P <</MCID 0>> BDC BT /F1 11 Tf 50 700 Td (An Authored Heading) Tj ET EMC\n\
+                    /P <</MCID 1>> BDC BT /F1 11 Tf 50 670 Td \
+                    (Ordinary body prose follows it, running on at some length so that) Tj \
+                    0 -14 Td (nothing about its shape on the page suggests a heading to a) Tj \
+                    0 -14 Td (pipeline that has only type sizes to go on. ) Tj ET EMC"
+        .to_vec();
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+
+    let struct_root_id = doc.new_object_id();
+    let heading_id = doc.add_object(dictionary! {
+        "Type" => "StructElem",
+        "S" => "H3",
+        "P" => struct_root_id,
+        "Pg" => page_id,
+        "K" => 0,
+    });
+    let paragraph_id = doc.add_object(dictionary! {
+        "Type" => "StructElem",
+        "S" => "P",
+        "P" => struct_root_id,
+        "Pg" => page_id,
+        "K" => 1,
+    });
+    doc.objects.insert(
+        struct_root_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "StructTreeRoot",
+            "K" => vec![Object::Reference(heading_id), Object::Reference(paragraph_id)],
+        }),
+    );
+
+    doc.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+            "StructParents" => 0,
+        }),
+    );
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "MarkInfo" => dictionary! { "Marked" => true },
+        "StructTreeRoot" => struct_root_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {
@@ -563,6 +646,7 @@ pub fn shape(events: &[pb::parse_pdf_response::Event]) -> Vec<&'static str> {
             pb::parse_pdf_response::Event::Document(_) => "document",
             pb::parse_pdf_response::Event::Spans(_) => "spans",
             pb::parse_pdf_response::Event::Metadata(_) => "metadata",
+            pb::parse_pdf_response::Event::Structure(_) => "structure",
         })
         .collect()
 }
@@ -575,6 +659,19 @@ pub fn spans(events: &[pb::parse_pdf_response::Event]) -> Vec<&pb::PageSpans> {
         .iter()
         .filter_map(|event| match event {
             pb::parse_pdf_response::Event::Spans(spans) => Some(spans),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `structure` event, in the order received. Only when
+/// `options.emit_structure` was set.
+#[must_use]
+pub fn structure(events: &[pb::parse_pdf_response::Event]) -> Vec<&pb::PageStructure> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            pb::parse_pdf_response::Event::Structure(structure) => Some(structure),
             _ => None,
         })
         .collect()

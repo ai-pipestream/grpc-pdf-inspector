@@ -124,6 +124,9 @@ async fn info_arrives_before_extraction_runs() {
             pb::parse_pdf_response::Event::Metadata(_) => {
                 panic!("a `metadata` event without `emit_metadata`")
             }
+            pb::parse_pdf_response::Event::Structure(_) => {
+                panic!("a `structure` event without `emit_structure`")
+            }
         }
     }
     assert!(matches!(

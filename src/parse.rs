@@ -47,7 +47,7 @@
 //! positioned items (`TextItem::page`) and `PdfOptions::pages`. Any
 //! conversion happens here, at the library boundary, and nowhere else.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use pdf_inspector::{MarkdownOptions, PdfOptions, PdfType, ProcessMode};
@@ -58,6 +58,7 @@ use crate::document_fold::DocumentFold;
 use crate::metrics::Metrics;
 use crate::proto::v1 as pb;
 use crate::spans;
+use crate::structure;
 
 /// How the call ended.
 #[derive(Debug)]
@@ -370,8 +371,32 @@ fn parse(
             })?;
             let mut by_page = spans::by_page(items);
 
+            // The document's own structure tree, when anyone wants it.
+            // Untagged documents return an empty list, which is the honest
+            // answer rather than a failure.
+            let mut structure = if events.wanted(options.emit_structure) {
+                let selected: Option<Vec<u32>> =
+                    (!options.pages.is_empty()).then(|| options.pages.clone());
+                let elements = guarded(|| {
+                    pdf_inspector::extract_structure_elements_mem(bytes, selected.as_deref())
+                })?;
+                structure::by_page(elements)
+            } else {
+                BTreeMap::new()
+            };
+
             for page_no in requested_pages(options, detected.page_count) {
                 let page_items = by_page.remove(&page_no).unwrap_or_default();
+
+                // The roles go out before the runs they describe, so a
+                // consumer reading the whole stream never has to look
+                // ahead.
+                if let Some(roles) = structure.remove(&page_no) {
+                    events.route(
+                        pb::parse_pdf_response::Event::Structure(roles),
+                        options.emit_structure,
+                    )?;
+                }
 
                 // The runs go out before the rendering they produced, so a
                 // consumer reading both never has to buffer one to
