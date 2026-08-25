@@ -118,6 +118,15 @@ pub struct Document {
     /// Message envelope for mail sources.
     #[prost(message, optional, tag="24")]
     pub email: ::core::option::Option<EmailMeta>,
+    /// Named page styles the source declares; pages point at them by name.
+    #[prost(message, repeated, tag="25")]
+    pub page_styles: ::prost::alloc::vec::Vec<PageStyle>,
+    /// Named and database ranges a spreadsheet declares.
+    #[prost(message, repeated, tag="26")]
+    pub named_ranges: ::prost::alloc::vec::Vec<NamedRange>,
+    /// Pivot table definitions a spreadsheet declares.
+    #[prost(message, repeated, tag="27")]
+    pub pivots: ::prost::alloc::vec::Vec<PivotSpec>,
 }
 /// DocumentOrigin contains metadata about the source document file.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -159,6 +168,10 @@ pub struct GroupItem {
     /// Raw label fallback for forward-compatibility with newer label vocabularies.
     #[prost(string, optional, tag="8")]
     pub label_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Sheet attributes when this group is a spreadsheet sheet (extension
+    /// beyond the upstream dialect).
+    #[prost(message, optional, tag="9")]
+    pub sheet: ::core::option::Option<SheetMeta>,
 }
 /// RefItem is a JSON Pointer reference to another item in the document.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -248,6 +261,10 @@ pub struct CollectorSource {
     pub raw_score: ::core::option::Option<f64>,
     #[prost(string, optional, tag="6")]
     pub raw_score_kind: ::core::option::Option<::prost::alloc::string::String>,
+    /// How many samples the score aggregates, so a three-token mean and a
+    /// three-thousand-token mean stay distinguishable.
+    #[prost(uint64, optional, tag="7")]
+    pub raw_score_samples: ::core::option::Option<u64>,
 }
 /// SourceType is a union of possible source descriptors.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -282,6 +299,10 @@ pub struct BaseMeta {
     pub keywords: ::core::option::Option<KeywordsMetaField>,
     #[prost(message, optional, tag="5")]
     pub topics: ::core::option::Option<TopicsMetaField>,
+    /// Alternate readings a generative engine offered for spans of this item;
+    /// extension beyond the upstream dialect.
+    #[prost(message, optional, tag="6")]
+    pub alternatives: ::core::option::Option<AlternativesMetaField>,
     #[prost(map="string, message", tag="100")]
     pub custom_fields: ::std::collections::HashMap<::prost::alloc::string::String, ::prost_types::Value>,
 }
@@ -370,6 +391,25 @@ pub struct Formatting {
     /// Raw script string (fallback for unknown enum values).
     #[prost(string, optional, tag="6")]
     pub script_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Styles beyond the upstream dialect's set; its renderers ignore them.
+    #[prost(bool, tag="7")]
+    pub monospace: bool,
+    #[prost(bool, tag="8")]
+    pub small_caps: bool,
+    #[prost(bool, tag="9")]
+    pub math: bool,
+    #[prost(bool, tag="10")]
+    pub mark: bool,
+    #[prost(bool, tag="11")]
+    pub small: bool,
+    #[prost(bool, tag="12")]
+    pub insertion: bool,
+    #[prost(bool, tag="13")]
+    pub abbreviation: bool,
+    #[prost(bool, tag="14")]
+    pub quote: bool,
+    #[prost(bool, tag="15")]
+    pub overline: bool,
 }
 /// BaseTextItem is a union type representing any text-based item in the document.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -443,6 +483,20 @@ pub struct TextItemBase {
     /// paragraph style), verbatim; extension beyond the upstream dialect.
     #[prost(string, optional, tag="17")]
     pub style_name: ::core::option::Option<::prost::alloc::string::String>,
+    /// Comment identity when this item IS a comment (extension beyond the
+    /// upstream dialect).
+    #[prost(message, optional, tag="18")]
+    pub comment_meta: ::core::option::Option<CommentMeta>,
+    /// Identity of the drawing shape this item came from, for presentation
+    /// and drawing sources.
+    #[prost(message, optional, tag="19")]
+    pub shape: ::core::option::Option<ShapeMeta>,
+    /// Note attribution when this item is a footnote or endnote.
+    #[prost(message, optional, tag="20")]
+    pub footnote_meta: ::core::option::Option<FootnoteMeta>,
+    /// Index attribution when this item heads a generated index.
+    #[prost(message, optional, tag="21")]
+    pub index_meta: ::core::option::Option<IndexMeta>,
 }
 /// TitleItem represents a document title or major heading.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -642,8 +696,10 @@ pub struct MiscAnnotation {
 pub struct PictureClassificationClass {
     #[prost(string, tag="1")]
     pub class_name: ::prost::alloc::string::String,
-    #[prost(double, tag="2")]
-    pub confidence: f64,
+    /// Presence-tracked: an engine that reports no probability leaves this
+    /// unset instead of claiming zero.
+    #[prost(double, optional, tag="2")]
+    pub confidence: ::core::option::Option<f64>,
 }
 /// PictureClassificationData contains classification results for a picture.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -882,6 +938,10 @@ pub struct PictureItem {
     /// Raw label fallback for forward-compatibility with newer label vocabularies.
     #[prost(string, optional, tag="15")]
     pub label_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Identity of the drawing shape this picture came from (extension beyond
+    /// the upstream dialect).
+    #[prost(message, optional, tag="16")]
+    pub shape: ::core::option::Option<ShapeMeta>,
 }
 /// PictureMeta contains rich metadata for pictures, including AI analysis.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -906,6 +966,14 @@ pub struct PictureMeta {
     pub keywords: ::core::option::Option<KeywordsMetaField>,
     #[prost(message, optional, tag="10")]
     pub topics: ::core::option::Option<TopicsMetaField>,
+    /// Alternate readings a generative engine offered; extension beyond the
+    /// upstream dialect.
+    #[prost(message, optional, tag="11")]
+    pub alternatives: ::core::option::Option<AlternativesMetaField>,
+    /// The source's accessibility title, kept beside the description so one
+    /// slot never has to hold two source strings.
+    #[prost(string, optional, tag="12")]
+    pub accessibility_title: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(map="string, message", tag="100")]
     pub custom_fields: ::std::collections::HashMap<::prost::alloc::string::String, ::prost_types::Value>,
 }
@@ -999,6 +1067,10 @@ pub struct FloatingMeta {
     pub keywords: ::core::option::Option<KeywordsMetaField>,
     #[prost(message, optional, tag="6")]
     pub topics: ::core::option::Option<TopicsMetaField>,
+    /// Alternate readings a generative engine offered; extension beyond the
+    /// upstream dialect.
+    #[prost(message, optional, tag="7")]
+    pub alternatives: ::core::option::Option<AlternativesMetaField>,
     #[prost(map="string, message", tag="100")]
     pub custom_fields: ::std::collections::HashMap<::prost::alloc::string::String, ::prost_types::Value>,
 }
@@ -1111,6 +1183,12 @@ pub struct TableCell {
     /// beyond the upstream dialect).
     #[prost(message, repeated, tag="15")]
     pub spans: ::prost::alloc::vec::Vec<InlineSpan>,
+    /// Per-cell alignment when the source declares it (extension beyond the
+    /// upstream dialect).
+    #[prost(enumeration="Alignment", optional, tag="16")]
+    pub align: ::core::option::Option<i32>,
+    #[prost(enumeration="VerticalAlignment", optional, tag="17")]
+    pub valign: ::core::option::Option<i32>,
 }
 /// KeyValueItem represents a key-value pair extracted from forms.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1277,6 +1355,10 @@ pub struct PageItem {
     /// Extraction diagnostics for the page, when the producer measures them.
     #[prost(message, optional, tag="5")]
     pub quality: ::core::option::Option<PageQuality>,
+    /// The named page style this page uses, resolving into
+    /// Document.page_styles.
+    #[prost(string, optional, tag="6")]
+    pub style_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// PageQuality carries a page's extraction diagnostics as the measurements
 /// they are, not booleans.
@@ -1375,6 +1457,26 @@ pub struct InlineSpan {
     /// from authored text.
     #[prost(string, optional, tag="9")]
     pub field_code: ::core::option::Option<::prost::alloc::string::String>,
+    /// What the span's target is, when the source distinguishes.
+    #[prost(enumeration="ReferenceKind", optional, tag="10")]
+    pub reference_kind: ::core::option::Option<i32>,
+    /// The reference key exactly as the source wrote it, kept even when no
+    /// declared anchor resolves it.
+    #[prost(string, optional, tag="11")]
+    pub reference: ::core::option::Option<::prost::alloc::string::String>,
+    /// The link's title attribute, when the source states one.
+    #[prost(string, optional, tag="12")]
+    pub link_title: ::core::option::Option<::prost::alloc::string::String>,
+    /// The span's raw payload where the rendered text is a projection (an
+    /// abbreviation's expansion, inline math in its source syntax).
+    #[prost(string, optional, tag="13")]
+    pub raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source's named character style for the run.
+    #[prost(string, optional, tag="14")]
+    pub style_name: ::core::option::Option<::prost::alloc::string::String>,
+    /// Highlight color as #rrggbb, when the source states one.
+    #[prost(string, optional, tag="15")]
+    pub highlight_color: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// DocumentMeta carries the metadata the source declares about itself.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1405,10 +1507,120 @@ pub struct DocumentMeta {
     pub created_raw: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="10")]
     pub modified_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// Source-scoped identifiers (a DOI, a PMID, an ISSN), each typed.
+    #[prost(message, repeated, tag="11")]
+    pub identifiers: ::prost::alloc::vec::Vec<Identifier>,
+    /// Classification codes the source carries (CPC, IPC, subject schemes).
+    #[prost(message, repeated, tag="12")]
+    pub classifications: ::prost::alloc::vec::Vec<Classification>,
+    #[prost(message, optional, tag="13")]
+    pub license: ::core::option::Option<LicenseMeta>,
+    #[prost(message, repeated, tag="14")]
+    pub funding: ::prost::alloc::vec::Vec<FundingAward>,
+    /// Namespace bindings and schema locations an XML source declares.
+    #[prost(message, repeated, tag="15")]
+    pub namespaces: ::prost::alloc::vec::Vec<NamespaceBinding>,
+    #[prost(message, repeated, tag="16")]
+    pub schema_locations: ::prost::alloc::vec::Vec<SchemaLocation>,
+    /// Civil twins for sources that state a date without an instant (a
+    /// publication year and month); the Timestamp fields stay unset then.
+    #[prost(message, optional, tag="17")]
+    pub created_civil: ::core::option::Option<CivilDateTime>,
+    #[prost(message, optional, tag="18")]
+    pub modified_civil: ::core::option::Option<CivilDateTime>,
+    #[prost(string, optional, tag="19")]
+    pub subject: ::core::option::Option<::prost::alloc::string::String>,
+    /// Who last modified the document, as the source records it.
+    #[prost(string, optional, tag="20")]
+    pub modified_by: ::core::option::Option<::prost::alloc::string::String>,
+    /// The last print, when the source tracks it.
+    #[prost(message, optional, tag="21")]
+    pub printed: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, optional, tag="22")]
+    pub printed_raw: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="23")]
+    pub printer: ::core::option::Option<::prost::alloc::string::String>,
+    /// The template the document was created from.
+    #[prost(string, optional, tag="24")]
+    pub template: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int32, optional, tag="25")]
+    pub editing_cycles: ::core::option::Option<i32>,
+    #[prost(int64, optional, tag="26")]
+    pub editing_duration_seconds: ::core::option::Option<i64>,
+    #[prost(message, optional, tag="27")]
+    pub statistics: ::core::option::Option<DocumentStatistics>,
+    /// Typed user-defined properties, each in the shape the source stored.
+    #[prost(message, repeated, tag="28")]
+    pub user_properties: ::prost::alloc::vec::Vec<UserProperty>,
     /// Source metadata that is genuinely open vocabulary. Data whose shape the
     /// fleet knows gets a typed field, never an entry here.
     #[prost(map="string, string", tag="100")]
     pub extra: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+}
+/// Identifier is one source-scoped identifier.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Identifier {
+    /// The identifier scheme (doi, pmid, issn, publisher-id).
+    #[prost(string, tag="1")]
+    pub kind: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub value: ::prost::alloc::string::String,
+    /// The scope the source attaches (electronic vs print ISSN).
+    #[prost(string, optional, tag="3")]
+    pub scope: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Classification is one classification code the source declares.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Classification {
+    #[prost(string, tag="1")]
+    pub scheme: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub code: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="3")]
+    pub edition: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub office: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// LicenseMeta carries the source's own license and copyright statement.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LicenseMeta {
+    #[prost(string, optional, tag="1")]
+    pub type_uri: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="2")]
+    pub statement: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="3")]
+    pub copyright_statement: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int32, optional, tag="4")]
+    pub copyright_year: ::core::option::Option<i32>,
+    #[prost(string, optional, tag="5")]
+    pub copyright_holder: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// FundingAward is one funding statement the source records.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FundingAward {
+    #[prost(string, optional, tag="1")]
+    pub funder: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="2")]
+    pub award_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="3")]
+    pub statement: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// NamespaceBinding is one prefix-to-URI binding an XML source declares.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NamespaceBinding {
+    #[prost(string, tag="1")]
+    pub prefix: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub uri: ::prost::alloc::string::String,
+}
+/// SchemaLocation is one namespace-to-location pair from a schema
+/// declaration.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SchemaLocation {
+    #[prost(string, tag="1")]
+    pub namespace: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub location: ::prost::alloc::string::String,
 }
 /// CellValue is a table cell's typed value; the cell's `text` stays the
 /// display string.
@@ -1467,8 +1679,10 @@ pub struct CivilDateTime {
 /// (spreadsheet types, fixed-record layouts).
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TableColumnSchema {
-    #[prost(string, tag="1")]
-    pub name: ::prost::alloc::string::String,
+    /// Presence-tracked: a column that carries only geometry declares no name
+    /// rather than a blank one.
+    #[prost(string, optional, tag="1")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
     /// The source's own type name (copybook usage, cell type, SQL type).
     #[prost(string, optional, tag="2")]
     pub declared_type: ::core::option::Option<::prost::alloc::string::String>,
@@ -1487,9 +1701,15 @@ pub struct TableColumnSchema {
     #[prost(int32, optional, tag="7")]
     pub occurs_index: ::core::option::Option<i32>,
     /// The column's display width in the page unit, when the source declares
-    /// one.
+    /// one; width_raw keeps spellings that are not page units (20%, 5cm).
     #[prost(double, optional, tag="9")]
     pub width: ::core::option::Option<f64>,
+    #[prost(string, optional, tag="10")]
+    pub width_raw: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(enumeration="Alignment", optional, tag="11")]
+    pub align: ::core::option::Option<i32>,
+    #[prost(enumeration="VerticalAlignment", optional, tag="12")]
+    pub valign: ::core::option::Option<i32>,
     /// Named value conditions declared on the column (copybook level-88).
     #[prost(message, repeated, tag="8")]
     pub conditions: ::prost::alloc::vec::Vec<ValueCondition>,
@@ -1511,6 +1731,12 @@ pub struct SubDocumentRef {
     /// The item that mentions or anchors the payload, when one does.
     #[prost(string, optional, tag="5")]
     pub item_ref: ::core::option::Option<::prost::alloc::string::String>,
+    /// Embedded-object identity: the container's class id and its own word
+    /// for what the object is.
+    #[prost(string, optional, tag="6")]
+    pub class_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="7")]
+    pub kind: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// WebMeta carries retrieval provenance for crawled sources.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1684,6 +1910,216 @@ pub struct EmailMeta {
     pub sent: ::core::option::Option<::prost_types::Timestamp>,
     #[prost(string, optional, tag="11")]
     pub sent_raw: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Hypothesis is one alternate reading a generative engine offered.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct Hypothesis {
+    #[prost(string, tag="1")]
+    pub text: ::prost::alloc::string::String,
+    /// The engine's unrescaled score for this reading, with its kind named.
+    #[prost(double, optional, tag="2")]
+    pub raw_score: ::core::option::Option<f64>,
+    #[prost(string, optional, tag="3")]
+    pub raw_score_kind: ::core::option::Option<::prost::alloc::string::String>,
+    /// Code points into the owning item's text, when the alternative applies
+    /// to a span rather than the whole item.
+    #[prost(message, optional, tag="4")]
+    pub range: ::core::option::Option<IntSpan>,
+}
+/// AlternativesMetaField carries the alternate readings an engine offered.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct AlternativesMetaField {
+    #[prost(message, repeated, tag="1")]
+    pub hypotheses: ::prost::alloc::vec::Vec<Hypothesis>,
+    #[prost(string, optional, tag="2")]
+    pub created_by: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// CommentMeta is the identity and thread position of a comment item.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CommentMeta {
+    #[prost(string, optional, tag="1")]
+    pub author: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="2")]
+    pub initials: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag="3")]
+    pub timestamp: ::core::option::Option<::prost_types::Timestamp>,
+    #[prost(string, optional, tag="4")]
+    pub timestamp_raw: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag="5")]
+    pub resolved: bool,
+    /// The comment this one replies to.
+    #[prost(message, optional, tag="6")]
+    pub parent: ::core::option::Option<FineRef>,
+    /// The text the comment anchors to, verbatim.
+    #[prost(string, optional, tag="7")]
+    pub anchored_text: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// ShapeMeta is the identity of the drawing shape an item came from.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ShapeMeta {
+    /// The source's shape service or type name.
+    #[prost(string, optional, tag="1")]
+    pub shape_type: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="2")]
+    pub name: ::core::option::Option<::prost::alloc::string::String>,
+    /// Text-frame chaining, by frame name.
+    #[prost(string, optional, tag="3")]
+    pub chain_next: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="4")]
+    pub chain_prev: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int32, optional, tag="5")]
+    pub z_order: ::core::option::Option<i32>,
+    #[prost(double, optional, tag="6")]
+    pub rotation_degrees: ::core::option::Option<f64>,
+}
+/// FootnoteMeta attributes a footnote or endnote item.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct FootnoteMeta {
+    /// The note's label as rendered (a number, a symbol).
+    #[prost(string, optional, tag="1")]
+    pub label: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag="2")]
+    pub endnote: bool,
+    /// The span in the body where the note's mark sits.
+    #[prost(message, optional, tag="3")]
+    pub mark: ::core::option::Option<FineRef>,
+}
+/// IndexMeta attributes a generated index item.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct IndexMeta {
+    /// The source's index service or kind name.
+    #[prost(string, optional, tag="1")]
+    pub service: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="2")]
+    pub title: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// DocumentStatistics carries the source's own document statistics.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DocumentStatistics {
+    #[prost(int64, optional, tag="1")]
+    pub pages: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag="2")]
+    pub words: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag="3")]
+    pub characters: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag="4")]
+    pub paragraphs: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag="5")]
+    pub tables: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag="6")]
+    pub images: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag="7")]
+    pub objects: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag="8")]
+    pub cells: ::core::option::Option<i64>,
+    #[prost(int64, optional, tag="9")]
+    pub sheets: ::core::option::Option<i64>,
+}
+/// UserProperty is one user-defined document property in the shape the
+/// source stored it.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UserProperty {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(oneof="user_property::Value", tags="2, 3, 4, 5, 6")]
+    pub value: ::core::option::Option<user_property::Value>,
+}
+/// Nested message and enum types in `UserProperty`.
+pub mod user_property {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Value {
+        #[prost(string, tag="2")]
+        Text(::prost::alloc::string::String),
+        #[prost(double, tag="3")]
+        Number(f64),
+        #[prost(bool, tag="4")]
+        Boolean(bool),
+        #[prost(message, tag="5")]
+        Instant(::prost_types::Timestamp),
+        #[prost(message, tag="6")]
+        Date(super::CivilDateTime),
+    }
+}
+/// Margins are the four page margins in the page unit.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct Margins {
+    #[prost(double, tag="1")]
+    pub left: f64,
+    #[prost(double, tag="2")]
+    pub top: f64,
+    #[prost(double, tag="3")]
+    pub right: f64,
+    #[prost(double, tag="4")]
+    pub bottom: f64,
+}
+/// PageStyle is one named page style the source declares.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PageStyle {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub size: ::core::option::Option<Size>,
+    #[prost(message, optional, tag="3")]
+    pub margins: ::core::option::Option<Margins>,
+    #[prost(int32, optional, tag="4")]
+    pub columns: ::core::option::Option<i32>,
+    /// The style's variant: shared, first, left, right.
+    #[prost(string, optional, tag="5")]
+    pub variant: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// GridSpan is a rectangular sheet range.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct GridSpan {
+    #[prost(message, optional, tag="1")]
+    pub start: ::core::option::Option<GridCell>,
+    #[prost(message, optional, tag="2")]
+    pub end: ::core::option::Option<GridCell>,
+}
+/// NamedRange is one named or database range a spreadsheet declares.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NamedRange {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub range: ::core::option::Option<GridSpan>,
+    #[prost(bool, tag="3")]
+    pub has_headers: bool,
+    #[prost(bool, tag="4")]
+    pub has_totals: bool,
+    /// named or database.
+    #[prost(string, optional, tag="5")]
+    pub kind: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// PivotSpec is one pivot table definition.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct PivotSpec {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub source: ::core::option::Option<GridSpan>,
+    #[prost(message, optional, tag="3")]
+    pub output: ::core::option::Option<GridSpan>,
+    #[prost(string, repeated, tag="4")]
+    pub row_fields: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag="5")]
+    pub column_fields: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag="6")]
+    pub data_fields: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, repeated, tag="7")]
+    pub page_fields: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// SheetMeta carries a spreadsheet sheet's own attributes.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct SheetMeta {
+    #[prost(int32, optional, tag="1")]
+    pub index: ::core::option::Option<i32>,
+    #[prost(bool, tag="2")]
+    pub visible: bool,
+    /// Tab color as #rrggbb.
+    #[prost(string, optional, tag="3")]
+    pub tab_color: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag="4")]
+    pub print_areas: ::prost::alloc::vec::Vec<GridSpan>,
 }
 /// RecordLayoutMeta describes the fixed-record layout a table was decoded
 /// with.
@@ -3062,6 +3498,123 @@ impl GraphLinkLabel {
             "GRAPH_LINK_LABEL_TO_KEY" => Some(Self::ToKey),
             "GRAPH_LINK_LABEL_TO_PARENT" => Some(Self::ToParent),
             "GRAPH_LINK_LABEL_TO_CHILD" => Some(Self::ToChild),
+            _ => None,
+        }
+    }
+}
+/// ReferenceKind names what an inline reference points at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum ReferenceKind {
+    Unspecified = 0,
+    Citation = 1,
+    Footnote = 2,
+    Claim = 3,
+    Section = 4,
+    CrossRef = 5,
+    Figure = 6,
+    Table = 7,
+    Equation = 8,
+}
+impl ReferenceKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REFERENCE_KIND_UNSPECIFIED",
+            Self::Citation => "REFERENCE_KIND_CITATION",
+            Self::Footnote => "REFERENCE_KIND_FOOTNOTE",
+            Self::Claim => "REFERENCE_KIND_CLAIM",
+            Self::Section => "REFERENCE_KIND_SECTION",
+            Self::CrossRef => "REFERENCE_KIND_CROSS_REF",
+            Self::Figure => "REFERENCE_KIND_FIGURE",
+            Self::Table => "REFERENCE_KIND_TABLE",
+            Self::Equation => "REFERENCE_KIND_EQUATION",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REFERENCE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "REFERENCE_KIND_CITATION" => Some(Self::Citation),
+            "REFERENCE_KIND_FOOTNOTE" => Some(Self::Footnote),
+            "REFERENCE_KIND_CLAIM" => Some(Self::Claim),
+            "REFERENCE_KIND_SECTION" => Some(Self::Section),
+            "REFERENCE_KIND_CROSS_REF" => Some(Self::CrossRef),
+            "REFERENCE_KIND_FIGURE" => Some(Self::Figure),
+            "REFERENCE_KIND_TABLE" => Some(Self::Table),
+            "REFERENCE_KIND_EQUATION" => Some(Self::Equation),
+            _ => None,
+        }
+    }
+}
+/// Alignment is a horizontal alignment a source declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Alignment {
+    Unspecified = 0,
+    Left = 1,
+    Center = 2,
+    Right = 3,
+    Justify = 4,
+}
+impl Alignment {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "ALIGNMENT_UNSPECIFIED",
+            Self::Left => "ALIGNMENT_LEFT",
+            Self::Center => "ALIGNMENT_CENTER",
+            Self::Right => "ALIGNMENT_RIGHT",
+            Self::Justify => "ALIGNMENT_JUSTIFY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "ALIGNMENT_UNSPECIFIED" => Some(Self::Unspecified),
+            "ALIGNMENT_LEFT" => Some(Self::Left),
+            "ALIGNMENT_CENTER" => Some(Self::Center),
+            "ALIGNMENT_RIGHT" => Some(Self::Right),
+            "ALIGNMENT_JUSTIFY" => Some(Self::Justify),
+            _ => None,
+        }
+    }
+}
+/// VerticalAlignment is a vertical alignment a source declares.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum VerticalAlignment {
+    Unspecified = 0,
+    Top = 1,
+    Middle = 2,
+    Bottom = 3,
+}
+impl VerticalAlignment {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "VERTICAL_ALIGNMENT_UNSPECIFIED",
+            Self::Top => "VERTICAL_ALIGNMENT_TOP",
+            Self::Middle => "VERTICAL_ALIGNMENT_MIDDLE",
+            Self::Bottom => "VERTICAL_ALIGNMENT_BOTTOM",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "VERTICAL_ALIGNMENT_UNSPECIFIED" => Some(Self::Unspecified),
+            "VERTICAL_ALIGNMENT_TOP" => Some(Self::Top),
+            "VERTICAL_ALIGNMENT_MIDDLE" => Some(Self::Middle),
+            "VERTICAL_ALIGNMENT_BOTTOM" => Some(Self::Bottom),
             _ => None,
         }
     }

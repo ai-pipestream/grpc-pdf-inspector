@@ -160,6 +160,7 @@ impl DocumentFold {
                 // signal behind it to report.
                 raw_score: None,
                 raw_score_kind: None,
+                raw_score_samples: None,
             },
             headings: Vec::new(),
             runs: None,
@@ -292,6 +293,10 @@ impl DocumentFold {
                 media_type: file.media_type.clone(),
                 size_bytes: file.size_bytes,
                 item_ref: None,
+                // A PDF attachment is a file, not an embedded object with a
+                // container class behind it.
+                class_id: None,
+                kind: None,
             })
             .collect();
 
