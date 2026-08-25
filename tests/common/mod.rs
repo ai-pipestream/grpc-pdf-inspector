@@ -678,6 +678,87 @@ pub fn styled_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page PDF carrying an article of text, an image below it,
+/// and a `/Link` annotation covering the image's region.
+///
+/// The text is what keeps the document classifying as text-based, so
+/// extraction runs at all. The image is what the markdown renderer
+/// discards by default, and the annotation over it is a link with no
+/// anchor text — the case that has nowhere to go except onto the picture.
+#[must_use]
+pub fn illustrated_pdf(uri: &str) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut image = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 8,
+            "Height" => 8,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8,
+        },
+        vec![0x80; 64],
+    );
+    image.set_plain_content(vec![0x80; 64]);
+    let image_id = doc.add_object(image);
+
+    let mut content = String::from("q 120 0 0 80 72 120 cm /Im1 Do Q\n");
+    for line in 0..24 {
+        let y = 700 - 16 * line;
+        content.push_str(&format!(
+            "BT /F1 11 Tf 72 {y} Td (Body line {line} of the article, long enough that the page reads as prose rather than as a picture.) Tj ET\n"
+        ));
+    }
+
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let annotation_id = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![72.into(), 120.into(), 192.into(), 200.into()],
+        "A" => dictionary! {
+            "Type" => "Action",
+            "S" => "URI",
+            "URI" => Object::string_literal(uri),
+        },
+    });
+
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+            "XObject" => dictionary! { "Im1" => image_id },
+        },
+        "Contents" => content_id,
+        "Annots" => vec![Object::Reference(annotation_id)],
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {

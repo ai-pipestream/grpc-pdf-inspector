@@ -26,6 +26,10 @@
 //!   `page_no` and `unit` always set and `size` set from the page's own
 //!   visible box when the `metadata` event carried one. Nothing is
 //!   invented: a page whose box was never read has no size.
+//! - **Pictures are placed.** Every image the page drew becomes a
+//!   `PictureItem` with the box the content stream put it at, and a link
+//!   annotation over that box becomes its `hyperlink`. Its bytes are not
+//!   decoded, so `image` stays unset.
 //! - **Furniture is reported, not deleted.** Repeated headers, footers and
 //!   folio numbers are stripped from the body by default and used to
 //!   vanish. When the stream reports them they go into the furniture group
@@ -388,6 +392,7 @@ impl DocumentFold {
         for line in &page.furniture {
             self.push_furniture(line, page.page_no);
         }
+        self.push_pictures(page.page_no);
         for block in blocks(&page.markdown) {
             match block {
                 Block::Table(text) => self.on_table(&text, page.page_no),
@@ -465,6 +470,43 @@ impl DocumentFold {
         quality.replacement_runs = Some(i32::try_from(page.replacement_runs).unwrap_or(i32::MAX));
         if page.needs_ocr {
             quality.ocr_recommended = Some(true);
+        }
+    }
+
+    /// Append one `PictureItem` per image the page drew.
+    ///
+    /// The extractor emits a run for every image XObject with the box the
+    /// content stream placed it at, and the markdown renderer discards
+    /// them, so `Document.pictures` used to be structurally empty. They go
+    /// in ahead of the page's text: a picture is placed by the content
+    /// stream, and the fold's reading order for a page starts where the
+    /// page starts.
+    fn push_pictures(&mut self, page_no: u32) {
+        let pictures = self
+            .runs
+            .as_ref()
+            .filter(|runs| runs.page_no() == page_no)
+            .map(PageRuns::pictures)
+            .unwrap_or_default();
+        for picture in pictures {
+            let parent = self.current_parent();
+            let self_ref = format!("#/pictures/{}", self.document.pictures.len());
+            self.document.pictures.push(doc::PictureItem {
+                self_ref: self_ref.clone(),
+                parent: Some(reference(&parent)),
+                content_layer: doc::ContentLayer::Body as i32,
+                label: doc::DocItemLabel::Picture as i32,
+                prov: provenance(page_no, Some(picture.bbox)),
+                // A link annotation over the picture's region. The bytes of
+                // the image are not decoded here, so `image` stays unset
+                // rather than describing something this pass did not read.
+                hyperlink: picture.hyperlink,
+                source: vec![doc::SourceType {
+                    source: Some(doc::source_type::Source::Collector(self.source.clone())),
+                }],
+                ..doc::PictureItem::default()
+            });
+            self.link_child(&parent, &self_ref);
         }
     }
 
@@ -1169,6 +1211,10 @@ mod tests {
             assert_eq!(table.self_ref, format!("#/tables/{index}"));
             refs.push(table.self_ref.clone());
         }
+        for (index, picture) in document.pictures.iter().enumerate() {
+            assert_eq!(picture.self_ref, format!("#/pictures/{index}"));
+            refs.push(picture.self_ref.clone());
+        }
 
         // Every parent resolves, and lists the item as its child.
         let parents: Vec<(String, String)> = document
@@ -1185,6 +1231,12 @@ mod tests {
                 (
                     table.self_ref.clone(),
                     table.parent.as_ref().expect("a parent").r#ref.clone(),
+                )
+            }))
+            .chain(document.pictures.iter().map(|picture| {
+                (
+                    picture.self_ref.clone(),
+                    picture.parent.as_ref().expect("a parent").r#ref.clone(),
                 )
             }))
             .collect();

@@ -43,6 +43,13 @@
 //! table of contents, a cross-reference and a footnote jump are invisible
 //! to it.
 //!
+//! Image placements ride it too. The content-stream walker emits a run for
+//! every image XObject with the box the current transformation matrix put
+//! it at, and the markdown renderer discards them by default, so
+//! `Document.pictures` was structurally always empty. A run that is an
+//! image is a picture with a box, and a link annotation over that box is
+//! that picture's link.
+//!
 //! Emphasis rides the same machinery. Bold, italic, underline and strikeout
 //! are per-run facts that markdown flattens into `**`, `*`, `<u>` and `<s>`
 //! inside a paragraph's text; grouped by run and reported as spans they are
@@ -71,6 +78,8 @@ pub struct PageRuns {
     /// For each run, the role its marked-content region was tagged with,
     /// when the document is tagged and the run sits in one.
     roles: Vec<Option<(pb::StructureRole, String)>>,
+    /// Which runs are image placements, in page order.
+    images: Vec<usize>,
     /// How far into `letters` the fold has already matched. Blocks are
     /// folded in reading order, so a search normally succeeds at the
     /// cursor and never revisits the page.
@@ -107,6 +116,13 @@ impl PageRuns {
         }
         let styles = styles(spans, &anchor_targets(spans, internal, &boxes));
         let roles = tagged_roles(spans, structure);
+        let images = spans
+            .spans
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| pb::SpanKind::try_from(span.kind) == Ok(pb::SpanKind::Image))
+            .map(|(index, _)| index)
+            .collect();
         Self {
             page_no: spans.page_no,
             letters,
@@ -114,6 +130,7 @@ impl PageRuns {
             boxes,
             styles,
             roles,
+            images,
             cursor: 0,
         }
     }
@@ -122,6 +139,28 @@ impl PageRuns {
     #[must_use]
     pub const fn page_no(&self) -> u32 {
         self.page_no
+    }
+
+    /// The image placements on this page, in the order the page draws
+    /// them.
+    #[must_use]
+    pub fn pictures(&self) -> Vec<Picture> {
+        self.images
+            .iter()
+            .map(|&index| Picture {
+                bbox: self.boxes[index].clone(),
+                hyperlink: match self
+                    .styles
+                    .get(index)
+                    .and_then(|style| style.anchor.as_ref())
+                {
+                    Some(Anchor::External(uri)) => Some(uri.clone()),
+                    // An internal destination over a picture has nowhere to
+                    // go: PictureItem carries a hyperlink and no target.
+                    _ => None,
+                },
+            })
+            .collect()
     }
 
     /// The box enclosing the runs that produced `text`, when they can be
@@ -259,6 +298,15 @@ impl PageRuns {
         }
         hull
     }
+}
+
+/// One image placement on a page.
+#[derive(Debug)]
+pub struct Picture {
+    /// Where the image was drawn.
+    pub bbox: doc::BoundingBox,
+    /// A link annotation covering it, when one does.
+    pub hyperlink: Option<String>,
 }
 
 /// One block of text, located among the runs that produced it.
@@ -450,7 +498,9 @@ fn anchor_targets(
         .iter()
         .zip(boxes)
         .map(|(span, run)| {
-            if !contributes_text(span) {
+            // An annotation does not anchor itself; anything else the page
+            // drew inside its rectangle does, text and images alike.
+            if pb::SpanKind::try_from(span.kind) == Ok(pb::SpanKind::Link) {
                 return None;
             }
             let x = f64::midpoint(run.l, run.r);
@@ -775,6 +825,56 @@ mod tests {
             "an internal jump is not a URL"
         );
         assert!(located.hyperlink.is_none());
+    }
+
+    #[test]
+    fn an_image_run_becomes_a_picture_with_its_box() {
+        let mut image = span("[Image: Im1]", 72.0, 120.0, pb::SpanKind::Image);
+        image.bbox = Some(pb::Rect {
+            x: 72.0,
+            y: 120.0,
+            width: 120.0,
+            height: 80.0,
+        });
+        let runs = index(page(vec![
+            span("prose beside it", 10.0, 700.0, pb::SpanKind::Text),
+            image,
+        ]));
+        let pictures = runs.pictures();
+        assert_eq!(pictures.len(), 1, "one image, one picture");
+        assert!((pictures[0].bbox.l - 72.0).abs() < f64::EPSILON);
+        assert!((pictures[0].bbox.t - 200.0).abs() < f64::EPSILON);
+        assert!(pictures[0].hyperlink.is_none(), "nothing links to it");
+    }
+
+    #[test]
+    fn a_link_over_a_picture_lands_on_the_picture() {
+        let mut image = span("[Image: Im1]", 72.0, 120.0, pb::SpanKind::Image);
+        image.bbox = Some(pb::Rect {
+            x: 72.0,
+            y: 120.0,
+            width: 120.0,
+            height: 80.0,
+        });
+        let mut annotation = span("uri", 72.0, 120.0, pb::SpanKind::Link);
+        annotation.bbox = Some(pb::Rect {
+            x: 70.0,
+            y: 118.0,
+            width: 124.0,
+            height: 84.0,
+        });
+        annotation.link_uri = "https://example.invalid/figure".to_owned();
+        let runs = index(page(vec![image, annotation]));
+        assert_eq!(
+            runs.pictures()[0].hyperlink.as_deref(),
+            Some("https://example.invalid/figure")
+        );
+    }
+
+    #[test]
+    fn a_page_that_draws_nothing_has_no_pictures() {
+        let runs = index(page(vec![span("prose", 10.0, 700.0, pb::SpanKind::Text)]));
+        assert!(runs.pictures().is_empty());
     }
 
     #[test]
