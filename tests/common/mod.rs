@@ -209,6 +209,204 @@ pub fn link_pdf(anchor: &str, uri: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build a three-page PDF that says as much about itself as a real one
+/// does: a full information dictionary, an XMP packet, a catalog language,
+/// a tagged flag, an outline, an embedded file, a named destination, page
+/// labels, a rotated page, and an internal cross-reference link.
+///
+/// Every one of these was unread before this wave. The fixture exists so
+/// that "unread" is a test failure rather than a documentation claim.
+#[must_use]
+pub fn metadata_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.7");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut page_ids = Vec::new();
+    for page in 1..=3u32 {
+        let content = format!(
+            "BT /F1 12 Tf 50 700 Td (Body of page {page}) Tj ET\n\
+             BT /F1 12 Tf 50 650 Td (see the appendix) Tj ET"
+        );
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let mut page_dict = dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        };
+        // Page 2 is turned a quarter turn, which is the case that makes
+        // every unqualified coordinate on the page ambiguous.
+        if page == 2 {
+            page_dict.set("Rotate", 90);
+        }
+        page_ids.push(doc.add_object(page_dict));
+    }
+
+    // An internal cross-reference on page 1, pointing at page 3. The
+    // extractor reads /A /URI and nothing else, so this is invisible to it.
+    let internal_link = doc.add_object(dictionary! {
+        "Type" => "Annot",
+        "Subtype" => "Link",
+        "Rect" => vec![45.into(), 640.into(), 300.into(), 670.into()],
+        "Dest" => vec![Object::Reference(page_ids[2]), "Fit".into()],
+    });
+    if let Ok(page) = doc.get_dictionary_mut(page_ids[0]) {
+        page.set("Annots", vec![Object::Reference(internal_link)]);
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => page_ids.iter().copied().map(Object::Reference).collect::<Vec<_>>(),
+            "Count" => 3,
+        }),
+    );
+
+    // The outline: two chapters, the second nesting one section.
+    let outlines_id = doc.new_object_id();
+    let section_id = doc.new_object_id();
+    let chapter_two_id = doc.new_object_id();
+    let chapter_one_id = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("Chapter One"),
+        "Parent" => outlines_id,
+        "Next" => chapter_two_id,
+        "Dest" => vec![Object::Reference(page_ids[0]), "Fit".into()],
+    });
+    doc.objects.insert(
+        chapter_two_id,
+        Object::Dictionary(dictionary! {
+            "Title" => Object::string_literal("Chapter Two"),
+            "Parent" => outlines_id,
+            "Prev" => chapter_one_id,
+            "First" => section_id,
+            "Last" => section_id,
+            "Dest" => vec![Object::Reference(page_ids[1]), "Fit".into()],
+        }),
+    );
+    doc.objects.insert(
+        section_id,
+        Object::Dictionary(dictionary! {
+            "Title" => Object::string_literal("A Section"),
+            "Parent" => chapter_two_id,
+            "Dest" => vec![Object::Reference(page_ids[2]), "Fit".into()],
+        }),
+    );
+    doc.objects.insert(
+        outlines_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Outlines",
+            "First" => chapter_one_id,
+            "Last" => chapter_two_id,
+            "Count" => 3,
+        }),
+    );
+
+    // One embedded file, declared with its media type and size.
+    let payload = b"first,second\n1,2\n".to_vec();
+    let mut embedded = Stream::new(
+        dictionary! {
+            "Type" => "EmbeddedFile",
+            "Subtype" => "text/csv",
+            "Params" => dictionary! { "Size" => payload.len() as i64 },
+        },
+        payload.clone(),
+    );
+    embedded.set_plain_content(payload);
+    let embedded_id = doc.add_object(embedded);
+    let filespec_id = doc.add_object(dictionary! {
+        "Type" => "Filespec",
+        "F" => Object::string_literal("data.csv"),
+        "UF" => Object::string_literal("data.csv"),
+        "Desc" => Object::string_literal("The numbers behind the table"),
+        "EF" => dictionary! { "F" => embedded_id },
+    });
+
+    // A named destination other parts of the file can point at.
+    let named_dest_id = doc.add_object(Object::Array(vec![
+        Object::Reference(page_ids[2]),
+        "Fit".into(),
+    ]));
+
+    let names_id = doc.add_object(dictionary! {
+        "EmbeddedFiles" => dictionary! {
+            "Names" => vec![Object::string_literal("data.csv"), Object::Reference(filespec_id)],
+        },
+        "Dests" => dictionary! {
+            "Names" => vec![Object::string_literal("appendix"), Object::Reference(named_dest_id)],
+        },
+    });
+
+    // Roman front matter, then arabic numbering restarting at 1.
+    let page_labels_id = doc.add_object(dictionary! {
+        "Nums" => vec![
+            0.into(),
+            Object::Dictionary(dictionary! { "S" => "r" }),
+            1.into(),
+            Object::Dictionary(dictionary! { "S" => "D", "St" => 1 }),
+        ],
+    });
+
+    let xmp = br#"<?xpacket begin="" id="W5M0MpCehiHzreSzNTczkc9d"?><x:xmpmeta xmlns:x="adobe:ns:meta/"/><?xpacket end="r"?>"#.to_vec();
+    let mut xmp_stream = Stream::new(
+        dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+        xmp.clone(),
+    );
+    xmp_stream.set_plain_content(xmp);
+    let xmp_id = doc.add_object(xmp_stream);
+
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+        "Lang" => Object::string_literal("en-GB"),
+        "MarkInfo" => dictionary! { "Marked" => true },
+        "Metadata" => xmp_id,
+        "Outlines" => outlines_id,
+        "Names" => names_id,
+        "PageLabels" => page_labels_id,
+    });
+
+    let info_id = doc.add_object(dictionary! {
+        "Title" => Object::string_literal("The Analytical Engine"),
+        "Author" => Object::string_literal("Ada Lovelace; Charles Babbage"),
+        "Subject" => Object::string_literal("Mechanical computation"),
+        "Keywords" => Object::string_literal("engine, difference, notes"),
+        "Creator" => Object::string_literal("An Authoring Application"),
+        "Producer" => Object::string_literal("A PDF Writer 2.0"),
+        "CreationDate" => Object::string_literal("D:20240115103000Z"),
+        "ModDate" => Object::string_literal("D:20240220181500+02'00'"),
+        "Trapped" => "False",
+    });
+
+    doc.trailer.set("Root", catalog_id);
+    doc.trailer.set("Info", info_id);
+    doc.trailer.set(
+        "ID",
+        vec![
+            Object::String(
+                vec![0xde, 0xad, 0xbe, 0xef],
+                lopdf::StringFormat::Hexadecimal,
+            ),
+            Object::String(
+                vec![0xde, 0xad, 0xbe, 0xef],
+                lopdf::StringFormat::Hexadecimal,
+            ),
+        ],
+    );
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {
@@ -364,6 +562,7 @@ pub fn shape(events: &[pb::parse_pdf_response::Event]) -> Vec<&'static str> {
             pb::parse_pdf_response::Event::Status(_) => "status",
             pb::parse_pdf_response::Event::Document(_) => "document",
             pb::parse_pdf_response::Event::Spans(_) => "spans",
+            pb::parse_pdf_response::Event::Metadata(_) => "metadata",
         })
         .collect()
 }
@@ -379,6 +578,18 @@ pub fn spans(events: &[pb::parse_pdf_response::Event]) -> Vec<&pb::PageSpans> {
             _ => None,
         })
         .collect()
+}
+
+/// The one `metadata` event, which the caller must have asked for.
+#[must_use]
+pub fn metadata(events: &[pb::parse_pdf_response::Event]) -> &pb::PdfMetadata {
+    events
+        .iter()
+        .find_map(|event| match event {
+            pb::parse_pdf_response::Event::Metadata(metadata) => Some(metadata),
+            _ => None,
+        })
+        .expect("a metadata event")
 }
 
 /// Every `document` event, in the order received. At most one, and only

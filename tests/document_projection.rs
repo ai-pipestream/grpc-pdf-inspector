@@ -48,7 +48,7 @@ async fn emit_document_adds_one_document_between_pages_and_status() {
     );
     let document = documents[0];
 
-    // One PageItem per page, named but not measured.
+    // One PageItem per page, measured from the file's own page boxes.
     assert_eq!(document.pages.len(), 3, "one PageItem per page");
     for page_no in 1..=3 {
         let item = document
@@ -56,7 +56,10 @@ async fn emit_document_adds_one_document_between_pages_and_status() {
             .get(&page_no)
             .unwrap_or_else(|| panic!("page {page_no} is named"));
         assert_eq!(item.page_no, page_no);
-        assert!(item.size.is_none(), "no fabricated page geometry");
+        let size = item.size.as_ref().expect("the page's visible box");
+        assert!((size.width - 612.0).abs() < f64::EPSILON, "{size:?}");
+        assert!((size.height - 792.0).abs() < f64::EPSILON, "{size:?}");
+        assert_eq!(item.unit.as_deref(), Some("pt"));
     }
 
     // The pages' markdown became text items, and every item carries the

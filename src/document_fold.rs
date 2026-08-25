@@ -21,12 +21,17 @@
 //!   stay as their markdown source in `text`; the extraction markdown has
 //!   already flattened the layout, so there is little more to recover, and
 //!   parsing deeper would pretend to structure the source does not have.
-//! - **Pages are named, not measured.** `pages` carries one `PageItem` per
-//!   page the `info` event reported, with `page_no` and `unit` set and
-//!   `size` and `image` omitted: nothing on the event stream yet carries a
-//!   page box, and an invented size would outlive the honesty of this
-//!   comment. `unit` is set anyway, because the runs' boxes *are* measured
-//!   and a box whose unit a reader has to guess is barely a box.
+//! - **Pages are measured when the file was asked about itself.** `pages`
+//!   carries one `PageItem` per page the `info` event reported, with
+//!   `page_no` and `unit` always set and `size` set from the page's own
+//!   visible box when the `metadata` event carried one. Nothing is
+//!   invented: a page whose box was never read has no size.
+//! - **Metadata is the file's own.** `source_meta`, `outline`,
+//!   `attachments` and `anchors` come from the document's dictionaries
+//!   rather than from its text — an authored outline is better evidence of
+//!   structure than heading levels guessed from type size, and a PDF
+//!   carrying a spreadsheet inside it used to be invisible to the whole
+//!   pipeline.
 //! - **Provenance is typed.** Every item carries a `ProvenanceItem` naming
 //!   its page, and — when the `spans` event for that page located the
 //!   item's text among the positioned runs — the union of those runs'
@@ -43,7 +48,9 @@
 //! ([`VERSION`]) as `version`, and the detection confidence from `info` —
 //! the only confidence the pipeline computes — as `confidence`.
 
-use crate::page_runs::{Located, PageRuns};
+use std::collections::HashMap;
+
+use crate::page_runs::{Located, PageRuns, page_ref};
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
 use crate::{COLLECTOR, PARSER, VERSION};
@@ -54,6 +61,11 @@ pub const SCHEMA_NAME: &str = "docling_document_v2";
 
 /// Value of `DocumentOrigin.mimetype`.
 pub const MIMETYPE: &str = "application/pdf";
+
+/// Prefix of a `SubDocumentRef.id` naming a file the PDF carries inside
+/// itself, so a coordinator can tell one apart from a payload another
+/// collector registered.
+pub const ATTACHMENT_SCHEME: &str = "pdf-embedded-file:";
 
 /// Value of `PageItem.unit`: every coordinate this fold writes is in PDF
 /// user-space points, 1/72 inch, measured from the page's bottom-left.
@@ -89,6 +101,10 @@ pub struct DocumentFold {
     /// the `page` event they belong to, and are dropped when the next one
     /// arrives: a page's boxes are of no use to any other page.
     runs: Option<PageRuns>,
+    /// Internal link annotations by the page they are drawn on, from the
+    /// `metadata` event. The extractor reads external targets only, so
+    /// these are the whole of the fold's knowledge of cross-references.
+    internal_links: HashMap<u32, Vec<pb::LinkTarget>>,
 }
 
 impl Default for DocumentFold {
@@ -130,6 +146,7 @@ impl DocumentFold {
             },
             headings: Vec::new(),
             runs: None,
+            internal_links: HashMap::new(),
         }
     }
 
@@ -145,7 +162,14 @@ impl DocumentFold {
         use pb::parse_pdf_response::Event;
         match event {
             Event::Info(info) => self.on_info(info),
-            Event::Spans(spans) => self.runs = Some(PageRuns::new(spans)),
+            Event::Metadata(metadata) => self.on_metadata(metadata),
+            Event::Spans(spans) => {
+                let internal = self
+                    .internal_links
+                    .get(&spans.page_no)
+                    .map_or(&[][..], Vec::as_slice);
+                self.runs = Some(PageRuns::new(spans, internal));
+            }
             Event::Page(page) => self.on_page(page),
             Event::Status(_) | Event::Document(_) => {}
         }
@@ -155,6 +179,7 @@ impl DocumentFold {
     pub fn take(&mut self) -> doc::Document {
         self.headings.clear();
         self.runs = None;
+        self.internal_links.clear();
         std::mem::replace(&mut self.document, Self::new().document)
     }
 
@@ -179,6 +204,109 @@ impl DocumentFold {
                     ..doc::PageItem::default()
                 },
             );
+        }
+    }
+
+    /// `metadata` is what the file says about itself: the fold writes the
+    /// parts of it the schema has homes for.
+    ///
+    /// What has no home yet stays on the event plane, which is typed and
+    /// complete, rather than being flattened into a string map here. That
+    /// list is short and is documented in `docs/capture-deferrals.md`.
+    fn on_metadata(&mut self, metadata: &pb::PdfMetadata) {
+        if let Some(info) = metadata.info.as_ref() {
+            self.document.source_meta = Some(doc::DocumentMeta {
+                title: non_empty(&info.title),
+                authors: info.authors.clone(),
+                created: info.created,
+                modified: info.modified,
+                created_raw: non_empty(&info.created_raw),
+                modified_raw: non_empty(&info.modified_raw),
+                language: non_empty(&metadata.language),
+                // The document's producer is the software that wrote the
+                // file. The authoring application it was converted from is
+                // on the event plane as `creator_tool`; the schema has one
+                // slot and this is the one that fills it.
+                generator: non_empty(&info.producer),
+                keywords: info.keywords.clone(),
+                ..doc::DocumentMeta::default()
+            });
+            if self.document.name.is_empty() {
+                self.document.name.clone_from(&info.title);
+            }
+        }
+
+        // The document's own table of contents, which is authored evidence
+        // rather than heading levels guessed from type size.
+        self.document.outline = metadata
+            .outline
+            .iter()
+            .map(|entry| doc::OutlineEntry {
+                title: entry.title.clone(),
+                level: i32::try_from(entry.level).unwrap_or(i32::MAX),
+                page_no: (entry.page_no > 0)
+                    .then(|| i32::try_from(entry.page_no).unwrap_or(i32::MAX)),
+                target: (entry.page_no > 0).then(|| fine_ref(page_ref(entry.page_no))),
+            })
+            .collect();
+
+        // A PDF is a container, and what it contains was invisible to the
+        // whole pipeline.
+        self.document.attachments = metadata
+            .embedded_files
+            .iter()
+            .map(|file| doc::SubDocumentRef {
+                id: format!("{ATTACHMENT_SCHEME}{}", file.name),
+                name: file.name.clone(),
+                media_type: file.media_type.clone(),
+                size_bytes: file.size_bytes,
+                item_ref: None,
+            })
+            .collect();
+
+        // Named destinations are the positions the file's own
+        // cross-references point at.
+        self.document.anchors = metadata
+            .destinations
+            .iter()
+            .filter(|destination| destination.page_no > 0)
+            .map(|destination| doc::NamedAnchor {
+                name: destination.name.clone(),
+                target: Some(fine_ref(page_ref(destination.page_no))),
+            })
+            .collect();
+
+        for page in &metadata.pages {
+            let page_no = i32::try_from(page.page_no).unwrap_or(i32::MAX);
+            let item = self.document.pages.entry(page_no).or_insert(doc::PageItem {
+                page_no,
+                unit: Some(UNIT.to_owned()),
+                ..doc::PageItem::default()
+            });
+            // The visible box is the page as a reader sees it, which is the
+            // frame every box on this wire is measured against.
+            if let Some(size) = page.crop_box.as_ref() {
+                item.size = Some(doc::Size {
+                    width: size.width,
+                    height: size.height,
+                });
+            }
+            if page.rotation != 0 {
+                item.quality = Some(doc::PageQuality {
+                    rotation_degrees: Some(f64::from(page.rotation)),
+                    ..doc::PageQuality::default()
+                });
+            }
+        }
+
+        self.internal_links.clear();
+        for link in &metadata.links {
+            if link.uri.is_empty() && link.dest_page_no > 0 {
+                self.internal_links
+                    .entry(link.page_no)
+                    .or_default()
+                    .push(link.clone());
+            }
         }
     }
 
@@ -394,6 +522,19 @@ fn group(self_ref: &str, layer: doc::ContentLayer) -> doc::GroupItem {
         self_ref: self_ref.to_owned(),
         content_layer: layer as i32,
         ..doc::GroupItem::default()
+    }
+}
+
+/// A value, unless it is empty.
+fn non_empty(value: &str) -> Option<String> {
+    (!value.is_empty()).then(|| value.to_owned())
+}
+
+/// A JSON-Pointer reference with no character range.
+fn fine_ref(target: String) -> doc::FineRef {
+    doc::FineRef {
+        r#ref: target,
+        range: None,
     }
 }
 

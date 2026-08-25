@@ -23,6 +23,7 @@
 
 pub mod document_fold;
 pub mod limits;
+pub mod metadata;
 pub mod metrics;
 pub mod page_runs;
 pub mod parse;

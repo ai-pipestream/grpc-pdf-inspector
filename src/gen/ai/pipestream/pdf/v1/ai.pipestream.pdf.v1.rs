@@ -50,6 +50,18 @@ pub struct PdfOptions {
     /// a coordinate appears on this wire.
     #[prost(bool, tag="5")]
     pub emit_spans: bool,
+    /// Also read the document's own dictionaries and stream them as one
+    /// `metadata` event, immediately after `info`. Default false.
+    ///
+    /// This is everything the file says about itself rather than about its
+    /// text: the information dictionary, the XMP packet, the file-format
+    /// version, the catalog language, the tagged flag, the encryption
+    /// posture, the outline, embedded file attachments, per-page boxes and
+    /// rotation, page labels, named destinations, and the link annotations
+    /// with their targets resolved. It costs one read of the file, which is
+    /// why it is opt-in.
+    #[prost(bool, tag="6")]
+    pub emit_metadata: bool,
 }
 /// Rect is an axis-aligned rectangle in PDF user space.
 ///
@@ -224,6 +236,246 @@ pub struct PageMarkdown {
     /// Why, when the cause is known. UNSPECIFIED when `needs_ocr` is false.
     #[prost(enumeration="OcrReason", tag="4")]
     pub ocr_reason: i32,
+}
+/// DocumentInfo is the document's information dictionary, field by field.
+///
+/// Every value here is what the file says about itself. None of it is
+/// verified: a producer writes its own name, and a date is whatever string
+/// the writing application put there.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DocumentInfo {
+    /// The document's title, empty when it declares none.
+    #[prost(string, tag="1")]
+    pub title: ::prost::alloc::string::String,
+    /// Authors, split on the usual separators when the single `/Author`
+    /// string lists several. A file that names one author yields one entry.
+    #[prost(string, repeated, tag="2")]
+    pub authors: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The subject line.
+    #[prost(string, tag="3")]
+    pub subject: ::prost::alloc::string::String,
+    /// Keywords, split from the single `/Keywords` string.
+    #[prost(string, repeated, tag="4")]
+    pub keywords: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The application that authored the original document.
+    #[prost(string, tag="5")]
+    pub creator_tool: ::prost::alloc::string::String,
+    /// The application that converted it to PDF.
+    #[prost(string, tag="6")]
+    pub producer: ::prost::alloc::string::String,
+    /// When the document was created, as the file states it. Absent when the
+    /// file states nothing or states something unparseable — `created_raw`
+    /// still carries the string in that case.
+    #[prost(message, optional, tag="7")]
+    pub created: ::core::option::Option<::prost_types::Timestamp>,
+    /// When the document was last modified, on the same terms.
+    #[prost(message, optional, tag="8")]
+    pub modified: ::core::option::Option<::prost_types::Timestamp>,
+    /// The creation date exactly as written, PDF `D:` form included.
+    #[prost(string, tag="9")]
+    pub created_raw: ::prost::alloc::string::String,
+    /// The modification date exactly as written.
+    #[prost(string, tag="10")]
+    pub modified_raw: ::prost::alloc::string::String,
+    /// The `/Trapped` value: "True", "False" or "Unknown".
+    #[prost(string, tag="11")]
+    pub trapped: ::prost::alloc::string::String,
+}
+/// EncryptionInfo describes how the document is protected, whether or not
+/// the protection stopped this parse.
+///
+/// A PDF can be readable with the empty password and still declare that
+/// extraction is not permitted. That is a fact about the file that a
+/// pipeline overriding it should at least be able to see.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EncryptionInfo {
+    /// Whether the file carries an `/Encrypt` dictionary at all.
+    #[prost(bool, tag="1")]
+    pub encrypted: bool,
+    /// The security handler's name, normally "Standard".
+    #[prost(string, tag="2")]
+    pub filter: ::prost::alloc::string::String,
+    /// Algorithm version (`/V`).
+    #[prost(uint32, tag="3")]
+    pub version: u32,
+    /// Handler revision (`/R`).
+    #[prost(uint32, tag="4")]
+    pub revision: u32,
+    /// Key length in bits (`/Length`), 40 when the file omits it.
+    #[prost(uint32, tag="5")]
+    pub key_bits: u32,
+    /// Whether the document opened without a password being supplied.
+    #[prost(bool, tag="6")]
+    pub opened_with_empty_password: bool,
+    /// Whether the permission bits allow text extraction.
+    #[prost(bool, tag="7")]
+    pub allows_extraction: bool,
+    /// Whether they allow printing.
+    #[prost(bool, tag="8")]
+    pub allows_printing: bool,
+}
+/// OutlineEntry is one bookmark of the document's own outline tree,
+/// flattened into a list that keeps its depth.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct OutlineEntry {
+    /// The bookmark's label.
+    #[prost(string, tag="1")]
+    pub title: ::prost::alloc::string::String,
+    /// Depth, 1 for a top-level bookmark.
+    #[prost(uint32, tag="2")]
+    pub level: u32,
+    /// The 1-indexed page it points at, 0 when the destination does not
+    /// resolve to a page of this document.
+    #[prost(uint32, tag="3")]
+    pub page_no: u32,
+    /// For a bookmark whose action is a URI rather than a destination, that
+    /// URI. Empty otherwise.
+    #[prost(string, tag="4")]
+    pub uri: ::prost::alloc::string::String,
+    /// The named destination it points at, verbatim, when it points at one by
+    /// name.
+    #[prost(string, tag="5")]
+    pub dest_name: ::prost::alloc::string::String,
+}
+/// EmbeddedFile is one file attachment the document carries.
+///
+/// A PDF is a container: it can carry the spreadsheet a table was made
+/// from, or a signed original. Without this the payload is invisible to the
+/// whole pipeline.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EmbeddedFile {
+    /// The attachment's file name, from `/UF` when present and `/F`
+    /// otherwise.
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// The declared media type, empty when the file declares none.
+    #[prost(string, tag="2")]
+    pub media_type: ::prost::alloc::string::String,
+    /// Size in bytes, as the file declares it. 0 when it declares none.
+    #[prost(uint64, tag="3")]
+    pub size_bytes: u64,
+    /// The attachment's description.
+    #[prost(string, tag="4")]
+    pub description: ::prost::alloc::string::String,
+}
+/// PageGeometry is one page's boxes, rotation and printed number.
+///
+/// Without it no coordinate on this wire is interpretable: a box means
+/// nothing until a reader knows where the page's edges are and how far the
+/// page is turned.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PageGeometry {
+    /// The 1-indexed page.
+    #[prost(uint32, tag="1")]
+    pub page_no: u32,
+    /// The page's full extent, inherited down the page tree when the page
+    /// itself declares none.
+    #[prost(message, optional, tag="2")]
+    pub media_box: ::core::option::Option<Rect>,
+    /// The visible extent. Equal to `media_box` when the page declares no
+    /// crop box.
+    #[prost(message, optional, tag="3")]
+    pub crop_box: ::core::option::Option<Rect>,
+    /// Clockwise rotation applied when displaying, in degrees: 0, 90, 180 or
+    /// 270.
+    #[prost(uint32, tag="4")]
+    pub rotation: u32,
+    /// The scale factor for the page's user space, 1.0 unless the page says
+    /// otherwise.
+    #[prost(double, tag="5")]
+    pub user_unit: f64,
+    /// The page's own printed number ("iv", "A-1"), when the document
+    /// declares page labels. Empty otherwise, which means the page's index is
+    /// its number.
+    #[prost(string, tag="6")]
+    pub label: ::prost::alloc::string::String,
+}
+/// LinkTarget is one `/Link` annotation with its destination resolved.
+///
+/// External targets are a URI. Internal ones — a table of contents, a
+/// cross-reference, a footnote jump — name a page, either directly or
+/// through a named destination.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LinkTarget {
+    /// The 1-indexed page the annotation is drawn on.
+    #[prost(uint32, tag="1")]
+    pub page_no: u32,
+    /// Where on that page it is drawn.
+    #[prost(message, optional, tag="2")]
+    pub rect: ::core::option::Option<Rect>,
+    /// The external target, empty for an internal link.
+    #[prost(string, tag="3")]
+    pub uri: ::prost::alloc::string::String,
+    /// The 1-indexed page an internal link leads to, 0 when the destination
+    /// does not resolve.
+    #[prost(uint32, tag="4")]
+    pub dest_page_no: u32,
+    /// The named destination it goes through, verbatim. Empty when the link
+    /// names a page directly.
+    #[prost(string, tag="5")]
+    pub dest_name: ::prost::alloc::string::String,
+}
+/// NamedDestination is one entry of the document's destination name tree:
+/// a name other parts of the file use to point at a place in it.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct NamedDestination {
+    /// The destination's name.
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// The 1-indexed page it names, 0 when it does not resolve.
+    #[prost(uint32, tag="2")]
+    pub page_no: u32,
+}
+/// PdfMetadata is everything the file says about itself.
+///
+/// Sent once, immediately after `info`, and only when
+/// `PdfOptions.emit_metadata` was set. It is read from the document's own
+/// dictionaries rather than from its text, so it is the same in every
+/// mode.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PdfMetadata {
+    /// The information dictionary.
+    #[prost(message, optional, tag="1")]
+    pub info: ::core::option::Option<DocumentInfo>,
+    /// The XMP packet from `/Root /Metadata`, verbatim and undecoded, so no
+    /// dialect is imposed on it here. Empty when the document carries none.
+    #[prost(bytes="vec", tag="2")]
+    pub xmp_packet: ::prost::alloc::vec::Vec<u8>,
+    /// The file-format version from the header, for example "1.7".
+    #[prost(string, tag="3")]
+    pub pdf_version: ::prost::alloc::string::String,
+    /// The document's language from `/Root /Lang`, a BCP 47 tag. Empty when
+    /// it declares none.
+    #[prost(string, tag="4")]
+    pub language: ::prost::alloc::string::String,
+    /// Whether the document declares itself tagged (`/Root /MarkInfo
+    /// /Marked`), which is what makes its structure tree trustworthy.
+    #[prost(bool, tag="5")]
+    pub tagged: bool,
+    /// The first half of the file identifier from the trailer's `/ID`, lower
+    /// case hex. This identifies the document from inside the file, which is
+    /// the only identity a byte stream carries.
+    #[prost(string, tag="6")]
+    pub file_id: ::prost::alloc::string::String,
+    /// How the document is protected.
+    #[prost(message, optional, tag="7")]
+    pub encryption: ::core::option::Option<EncryptionInfo>,
+    /// The document's own outline, depth-first.
+    #[prost(message, repeated, tag="8")]
+    pub outline: ::prost::alloc::vec::Vec<OutlineEntry>,
+    /// File attachments the document carries.
+    #[prost(message, repeated, tag="9")]
+    pub embedded_files: ::prost::alloc::vec::Vec<EmbeddedFile>,
+    /// Per-page boxes, rotation and printed numbers, in page order. Covers
+    /// every page of the document, not only the ones a page filter selected.
+    #[prost(message, repeated, tag="10")]
+    pub pages: ::prost::alloc::vec::Vec<PageGeometry>,
+    /// Every `/Link` annotation, with its destination resolved.
+    #[prost(message, repeated, tag="11")]
+    pub links: ::prost::alloc::vec::Vec<LinkTarget>,
+    /// The document's named destinations.
+    #[prost(message, repeated, tag="12")]
+    pub destinations: ::prost::alloc::vec::Vec<NamedDestination>,
 }
 /// ParseWarning is one non-fatal observation, carried on ParseStatus.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -480,6 +732,10 @@ pub enum ParseWarningCode {
     /// the markdown arrived as one `page` event with `page_no` 0 instead of
     /// one event per page.
     PasswordFallback = 1,
+    /// `emit_metadata` was set but the document's dictionaries could not be
+    /// read, so no `metadata` event was sent. The text extraction is
+    /// unaffected: this reports a gap, not a failure.
+    MetadataUnavailable = 2,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -490,6 +746,7 @@ impl ParseWarningCode {
         match self {
             Self::Unspecified => "PARSE_WARNING_CODE_UNSPECIFIED",
             Self::PasswordFallback => "PARSE_WARNING_CODE_PASSWORD_FALLBACK",
+            Self::MetadataUnavailable => "PARSE_WARNING_CODE_METADATA_UNAVAILABLE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -497,6 +754,7 @@ impl ParseWarningCode {
         match value {
             "PARSE_WARNING_CODE_UNSPECIFIED" => Some(Self::Unspecified),
             "PARSE_WARNING_CODE_PASSWORD_FALLBACK" => Some(Self::PasswordFallback),
+            "PARSE_WARNING_CODE_METADATA_UNAVAILABLE" => Some(Self::MetadataUnavailable),
             _ => None,
         }
     }
@@ -531,7 +789,7 @@ pub struct ParsePdfResponse {
     /// Unknown variants must be ignored rather than treated as failures: this
     /// oneof is the extension point, and a later server may add events an
     /// older client has no name for.
-    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5")]
+    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5, 6")]
     pub event: ::core::option::Option<parse_pdf_response::Event>,
 }
 /// Nested message and enum types in `ParsePdfResponse`.
@@ -563,8 +821,7 @@ pub mod parse_pdf_response {
         /// the fold that builds it consumes exactly this stream. Item refs are
         /// dense and local to this message (`#/texts/0`), so a coordinator can
         /// renumber them into a larger document. The structure is
-        /// markdown-derived and coarse: paragraphs and ATX headings only, pages
-        /// named but without sizes, no provenance boxes.
+        /// markdown-derived and coarse: paragraphs and ATX headings only.
         #[prost(message, tag="4")]
         Document(super::super::super::document::v1::Document),
         /// One page's positioned text runs, immediately before that page's
@@ -572,6 +829,10 @@ pub mod parse_pdf_response {
         /// `PdfOptions.emit_spans` was set.
         #[prost(message, tag="5")]
         Spans(super::PageSpans),
+        /// Everything the file says about itself, sent once immediately after
+        /// `info`. Only when `PdfOptions.emit_metadata` was set.
+        #[prost(message, tag="6")]
+        Metadata(super::PdfMetadata),
     }
 }
 /// GetServiceInfoRequest asks for the server's build and limits. It carries

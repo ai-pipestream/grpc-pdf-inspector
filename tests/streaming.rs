@@ -121,6 +121,9 @@ async fn info_arrives_before_extraction_runs() {
             pb::parse_pdf_response::Event::Spans(_) => {
                 panic!("a `spans` event without `emit_spans`")
             }
+            pb::parse_pdf_response::Event::Metadata(_) => {
+                panic!("a `metadata` event without `emit_metadata`")
+            }
         }
     }
     assert!(matches!(

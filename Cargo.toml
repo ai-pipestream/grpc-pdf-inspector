@@ -17,6 +17,13 @@ publish = false # Server binary; not a library for crates.io.
 # pure Rust (lopdf + rayon), no models, no ONNX. The firecrawl monorepo itself
 # is AGPL and is never touched; this is the published crate only.
 pdf-inspector = "1.17.0"
+# The document's own dictionaries: the information dictionary, the XMP
+# packet, the outline, embedded files, per-page boxes and the link
+# annotations' destinations. pdf-inspector reads none of them and does not
+# re-export the lopdf it parses with, so reading them means parsing the
+# buffer again here. That is what `emit_metadata` costs, and why it is
+# opt-in.
+lopdf = "0.44"
 prost = "0.14.4"
 # `google.protobuf.Value`, which the vendored document schema uses for the
 # `BaseMeta.custom_fields` escape hatch the Document fold writes into.
@@ -29,9 +36,8 @@ tonic-prost = "0.14.6"
 tonic-reflection = "0.14.6"
 
 [dev-dependencies]
-# Tests author every PDF fixture in memory with the same PDF library
-# pdf-inspector reads with; nothing binary is committed.
-lopdf = "0.44"
+# Tests author every PDF fixture in memory with the same library the
+# metadata pass reads with; nothing binary is committed.
 tokio-stream = { version = "0.1.19", features = ["net"] }
 
 [lints.rust]

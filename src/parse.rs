@@ -251,6 +251,39 @@ fn parse(
     }))?;
 
     let mut warnings = Vec::new();
+
+    // What the file says about itself, read from its own dictionaries by a
+    // second reader. It goes out immediately after `info` so that a
+    // consumer knows the page boxes, the rotation and the link
+    // destinations before any content arrives, and so the fold can measure
+    // its pages instead of only naming them.
+    if events.wanted(options.emit_metadata) {
+        let password = (!options.password.is_empty()).then_some(options.password.as_str());
+        // Not `guarded`: a metadata dictionary this reader cannot make
+        // sense of is a gap in the metadata, not a failed parse. The text
+        // extraction runs off its own reader and is unaffected.
+        let metadata = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::metadata::read(bytes, password)
+        }))
+        .ok()
+        .flatten();
+        match metadata {
+            Some(metadata) => {
+                events.route(
+                    pb::parse_pdf_response::Event::Metadata(metadata),
+                    options.emit_metadata,
+                )?;
+            }
+            None if options.emit_metadata => warnings.push(pb::ParseWarning {
+                code: pb::ParseWarningCode::MetadataUnavailable.into(),
+                message: "the document's own dictionaries could not be read, so no \
+                          metadata event was sent; the text extraction is unaffected"
+                    .to_owned(),
+            }),
+            None => {}
+        }
+    }
+
     let mut pages_extracted = 0u32;
     let mut layout = None;
     let mut has_encoding_issues = false;

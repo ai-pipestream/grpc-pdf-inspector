@@ -27,6 +27,13 @@
 //! `InlineSpan.hyperlink` over the words someone actually linked and a
 //! regular expression looking for URLs in the visible text, which finds a
 //! bare URL nobody linked and misses a link whose anchor text is a word.
+//!
+//! Internal links are anchored the same way and land on
+//! `InlineSpan.target` instead, pointing at the page item the destination
+//! resolves to. They reach this module from the metadata pass rather than
+//! from the runs: the extractor reads `/A /URI` and nothing else, so a
+//! table of contents, a cross-reference and a footnote jump are invisible
+//! to it.
 
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
@@ -44,7 +51,7 @@ pub struct PageRuns {
     boxes: Vec<doc::BoundingBox>,
     /// For each run, the target of the link annotation covering it, when
     /// one does.
-    links: Vec<Option<String>>,
+    links: Vec<Option<Anchor>>,
     /// How far into `letters` the fold has already matched. Blocks are
     /// folded in reading order, so a search normally succeeds at the
     /// cursor and never revisits the page.
@@ -59,7 +66,7 @@ impl PageRuns {
     /// that the markdown renderer does not emit, so letting it into the
     /// page's letters would shift every match after it.
     #[must_use]
-    pub fn new(spans: &pb::PageSpans) -> Self {
+    pub fn new(spans: &pb::PageSpans, internal: &[pb::LinkTarget]) -> Self {
         let mut letters = Vec::new();
         let mut owners = Vec::new();
         let mut boxes = Vec::with_capacity(spans.spans.len());
@@ -75,7 +82,7 @@ impl PageRuns {
                 }
             }
         }
-        let links = anchor_targets(spans, &boxes);
+        let links = anchor_targets(spans, internal, &boxes);
         Self {
             page_no: spans.page_no,
             letters,
@@ -155,16 +162,16 @@ impl PageRuns {
     /// with no linked letters gets no runs at all.
     fn hyperlink_spans(&self, at: usize, end: usize, columns: &[usize]) -> Vec<doc::InlineSpan> {
         let mut spans: Vec<doc::InlineSpan> = Vec::new();
-        let mut open: Option<(String, usize, usize)> = None;
+        let mut open: Option<(Anchor, usize, usize)> = None;
         for (offset, &owner) in self.owners[at..end].iter().enumerate() {
             let target = self.links.get(owner).and_then(Option::as_ref);
             match (&mut open, target) {
-                (Some((uri, _, last)), Some(target)) if uri == target => *last = offset,
+                (Some((anchor, _, last)), Some(target)) if anchor == target => *last = offset,
                 (open_run, target) => {
                     if let Some(run) = open_run.take() {
                         spans.push(inline_link(&run, columns));
                     }
-                    *open_run = target.map(|uri| (uri.clone(), offset, offset));
+                    *open_run = target.map(|anchor| (anchor.clone(), offset, offset));
                 }
             }
         }
@@ -204,22 +211,49 @@ pub struct Located {
     pub hyperlink: Option<String>,
 }
 
+/// Where a link annotation leads.
+#[derive(Clone, PartialEq, Eq)]
+enum Anchor {
+    /// Out of the document, to a URI.
+    External(String),
+    /// Into the document, to a 1-indexed page.
+    Internal(u32),
+}
+
 /// One link run as an inline span: `(target, first letter, last letter)`
 /// against the block's letter-to-character map.
-fn inline_link(run: &(String, usize, usize), columns: &[usize]) -> doc::InlineSpan {
-    let (uri, first, last) = run;
+fn inline_link(run: &(Anchor, usize, usize), columns: &[usize]) -> doc::InlineSpan {
+    let (anchor, first, last) = run;
     let start = columns.get(*first).copied().unwrap_or(0);
     // The range is half-open and measured in characters, so it ends one
     // past the last linked character.
     let end = columns.get(*last).copied().unwrap_or(start) + 1;
-    doc::InlineSpan {
+    let mut span = doc::InlineSpan {
         range: Some(doc::IntSpan {
             start: i32::try_from(start).unwrap_or(i32::MAX),
             end: i32::try_from(end).unwrap_or(i32::MAX),
         }),
-        hyperlink: Some(uri.clone()),
         ..doc::InlineSpan::default()
+    };
+    match anchor {
+        Anchor::External(uri) => span.hyperlink = Some(uri.clone()),
+        // An internal destination points at a page item, which is an item
+        // of this fragment: `pages` is keyed by page number, so the pointer
+        // resolves without knowing which text item happens to sit there.
+        Anchor::Internal(page_no) => {
+            span.target = Some(doc::FineRef {
+                r#ref: page_ref(*page_no),
+                range: None,
+            });
+        }
     }
+    span
+}
+
+/// The JSON-Pointer reference of one page item.
+#[must_use]
+pub fn page_ref(page_no: u32) -> String {
+    format!("#/pages/{page_no}")
 }
 
 /// For each run, the target of the link annotation covering it.
@@ -228,16 +262,38 @@ fn inline_link(run: &(String, usize, usize), columns: &[usize]) -> doc::InlineSp
 /// rectangle. Centres rather than edges because an annotation is drawn to
 /// the anchor's visual extent, which routinely clips a glyph's box by a
 /// fraction of a point at either end.
-fn anchor_targets(spans: &pb::PageSpans, boxes: &[doc::BoundingBox]) -> Vec<Option<String>> {
-    let annotations: Vec<(&doc::BoundingBox, &str)> = spans
+fn anchor_targets(
+    spans: &pb::PageSpans,
+    internal: &[pb::LinkTarget],
+    boxes: &[doc::BoundingBox],
+) -> Vec<Option<Anchor>> {
+    // External annotations arrive as runs of their own; internal ones do
+    // not reach the extractor at all and come from the metadata pass.
+    let mut annotations: Vec<(doc::BoundingBox, Anchor)> = spans
         .spans
         .iter()
         .enumerate()
         .filter(|(_, span)| {
             pb::SpanKind::try_from(span.kind) == Ok(pb::SpanKind::Link) && !span.link_uri.is_empty()
         })
-        .filter_map(|(index, span)| Some((boxes.get(index)?, span.link_uri.as_str())))
+        .filter_map(|(index, span)| {
+            Some((
+                boxes.get(index)?.clone(),
+                Anchor::External(span.link_uri.clone()),
+            ))
+        })
         .collect();
+    annotations.extend(
+        internal
+            .iter()
+            .filter(|link| link.uri.is_empty() && link.dest_page_no > 0)
+            .map(|link| {
+                (
+                    bounding_box(link.rect.as_ref()),
+                    Anchor::Internal(link.dest_page_no),
+                )
+            }),
+    );
     if annotations.is_empty() {
         return vec![None; boxes.len()];
     }
@@ -254,7 +310,7 @@ fn anchor_targets(spans: &pb::PageSpans, boxes: &[doc::BoundingBox]) -> Vec<Opti
             annotations
                 .iter()
                 .find(|(rect, _)| x >= rect.l && x <= rect.r && y >= rect.b && y <= rect.t)
-                .map(|(_, uri)| (*uri).to_owned())
+                .map(|(_, anchor)| anchor.clone())
         })
         .collect()
 }
@@ -327,9 +383,15 @@ mod tests {
         pb::PageSpans { page_no: 1, spans }
     }
 
+    /// One page's runs indexed with no internal links, which is every case
+    /// but the one test that supplies them.
+    fn index(spans: pb::PageSpans) -> PageRuns {
+        PageRuns::new(&spans, &[])
+    }
+
     #[test]
     fn a_block_spanning_two_runs_gets_the_box_around_both() {
-        let mut runs = PageRuns::new(&page(vec![
+        let mut runs = index(page(vec![
             span("Hello", 10.0, 700.0, pb::SpanKind::Text),
             span("world", 60.0, 700.0, pb::SpanKind::Text),
         ]));
@@ -346,7 +408,7 @@ mod tests {
 
     #[test]
     fn markdown_decoration_does_not_move_the_match() {
-        let mut runs = PageRuns::new(&page(vec![span(
+        let mut runs = index(page(vec![span(
             "A Heading",
             10.0,
             700.0,
@@ -360,7 +422,7 @@ mod tests {
 
     #[test]
     fn two_blocks_match_their_own_runs_not_each_others() {
-        let mut runs = PageRuns::new(&page(vec![
+        let mut runs = index(page(vec![
             span("alpha", 10.0, 700.0, pb::SpanKind::Text),
             span("alpha", 10.0, 600.0, pb::SpanKind::Text),
         ]));
@@ -375,7 +437,7 @@ mod tests {
 
     #[test]
     fn text_that_is_not_on_the_page_gets_no_box() {
-        let mut runs = PageRuns::new(&page(vec![span("alpha", 10.0, 700.0, pb::SpanKind::Text)]));
+        let mut runs = index(page(vec![span("alpha", 10.0, 700.0, pb::SpanKind::Text)]));
         assert!(
             runs.locate("beta").bbox.is_none(),
             "no box is better than a wrong one"
@@ -404,7 +466,7 @@ mod tests {
 
     #[test]
     fn a_link_covers_only_the_runs_under_its_rectangle() {
-        let mut runs = PageRuns::new(&page(vec![
+        let mut runs = index(page(vec![
             span("Please ", 10.0, 700.0, pb::SpanKind::Text),
             span("click here", 10.0, 690.0, pb::SpanKind::Text),
             span(" now", 10.0, 680.0, pb::SpanKind::Text),
@@ -428,7 +490,7 @@ mod tests {
 
     #[test]
     fn a_block_that_is_all_one_link_is_a_link_at_item_level() {
-        let mut runs = PageRuns::new(&page(vec![
+        let mut runs = index(page(vec![
             span("click here", 10.0, 690.0, pb::SpanKind::Text),
             annotation(690.0, "https://example.invalid/y"),
         ]));
@@ -442,7 +504,7 @@ mod tests {
 
     #[test]
     fn two_annotations_in_one_block_stay_two_runs() {
-        let mut runs = PageRuns::new(&page(vec![
+        let mut runs = index(page(vec![
             span("first", 10.0, 700.0, pb::SpanKind::Text),
             span("second", 10.0, 690.0, pb::SpanKind::Text),
             annotation(700.0, "https://example.invalid/1"),
@@ -461,11 +523,42 @@ mod tests {
     }
 
     #[test]
+    fn an_internal_destination_becomes_a_target_not_a_hyperlink() {
+        let spans = page(vec![span(
+            "see chapter two",
+            10.0,
+            690.0,
+            pb::SpanKind::Text,
+        )]);
+        let internal = [pb::LinkTarget {
+            page_no: 1,
+            rect: Some(pb::Rect {
+                x: 5.0,
+                y: 688.0,
+                width: 60.0,
+                height: 14.0,
+            }),
+            dest_page_no: 7,
+            ..pb::LinkTarget::default()
+        }];
+        let mut runs = PageRuns::new(&spans, &internal);
+        let located = runs.locate("see chapter two");
+        assert_eq!(located.spans.len(), 1);
+        let target = located.spans[0].target.as_ref().expect("a target");
+        assert_eq!(target.r#ref, "#/pages/7");
+        assert!(
+            located.spans[0].hyperlink.is_none(),
+            "an internal jump is not a URL"
+        );
+        assert!(located.hyperlink.is_none());
+    }
+
+    #[test]
     fn a_link_annotations_url_does_not_shift_the_page_letters() {
         // The link run's text is its URL, which the markdown renderer does
         // not emit. Letting it into the index would push every later block
         // onto the wrong runs.
-        let mut runs = PageRuns::new(&page(vec![
+        let mut runs = index(page(vec![
             span("https://example.invalid", 10.0, 700.0, pb::SpanKind::Link),
             span("click here", 10.0, 700.0, pb::SpanKind::Text),
         ]));
