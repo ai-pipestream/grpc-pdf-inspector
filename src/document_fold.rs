@@ -121,6 +121,12 @@ impl DocumentFold {
                 model: Some(PARSER.to_owned()),
                 version: Some(VERSION.to_owned()),
                 confidence: None,
+                // The detection score is the only number this pipeline
+                // computes and it is already on the 0-to-1 scale
+                // `confidence` names. There is no second, uncalibrated
+                // signal behind it to report.
+                raw_score: None,
+                raw_score_kind: None,
             },
             headings: Vec::new(),
             runs: None,
