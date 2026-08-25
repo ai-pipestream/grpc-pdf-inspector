@@ -153,6 +153,9 @@ message DocumentOrigin {
   // Web retrieval provenance for crawled sources (extension beyond the
   // upstream dialect).
   optional WebMeta web = 5;
+
+  // The source's own file identifier (a PDF /ID), hex-encoded.
+  optional string source_id = 6;
 }
 
 // ContentLayer defines the semantic layer where content appears in the document.
@@ -1041,6 +1044,9 @@ message PictureItem {
   // Identity of the drawing shape this picture came from (extension beyond
   // the upstream dialect).
   optional ShapeMeta shape = 16;
+  // A link target covering this picture's region (extension beyond the
+  // upstream dialect).
+  optional string hyperlink = 17;
 }
 
 // PictureMeta contains rich metadata for pictures, including AI analysis.
@@ -1323,6 +1329,13 @@ message PageItem {
   // The named page style this page uses, resolving into
   // Document.page_styles.
   optional string style_name = 6;
+  // The page's own label when the source numbers pages in its own scheme
+  // (iv, A-1) rather than by ordinal.
+  optional string page_label = 7;
+  // The full media box when it differs from the cropped `size`.
+  optional Size media_size = 8;
+  // The source's unit multiplier over its default unit (a PDF /UserUnit).
+  optional double user_unit = 9;
 }
 
 // PageQuality carries a page's extraction diagnostics as the measurements
@@ -1471,6 +1484,17 @@ message DocumentMeta {
   optional DocumentStatistics statistics = 27;
   // Typed user-defined properties, each in the shape the source stored.
   repeated UserProperty user_properties = 28;
+  // The source format's own version (a PDF version, an office format
+  // generation).
+  optional string format_version = 29;
+  // Whether the source declares authored structure (a tagged PDF).
+  optional bool structured = 30;
+  // The authoring application, when the source distinguishes it from the
+  // producing one in `generator`.
+  optional string authoring_tool = 31;
+  optional Protection protection = 32;
+  // The source's raw embedded metadata packet (XMP), verbatim bytes.
+  optional bytes raw_metadata = 33;
   // Source metadata that is genuinely open vocabulary. Data whose shape the
   // fleet knows gets a typed field, never an entry here.
   map<string, string> extra = 100;
@@ -1795,6 +1819,18 @@ message IndexMeta {
   // The source's index service or kind name.
   optional string service = 1;
   optional string title = 2;
+}
+
+// Protection is the source's own protection posture, as facts rather than
+// a boolean.
+message Protection {
+  bool encrypted = 1;
+  optional string handler = 2;
+  optional int32 key_bits = 3;
+  // The parse opened it without a password (an empty owner password).
+  bool opened_without_password = 4;
+  bool allows_extraction = 5;
+  bool allows_printing = 6;
 }
 
 // DocumentStatistics carries the source's own document statistics.

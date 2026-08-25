@@ -147,6 +147,9 @@ pub struct DocumentOrigin {
     /// upstream dialect).
     #[prost(message, optional, tag="5")]
     pub web: ::core::option::Option<WebMeta>,
+    /// The source's own file identifier (a PDF /ID), hex-encoded.
+    #[prost(string, optional, tag="6")]
+    pub source_id: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// GroupItem represents a logical grouping of document elements.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -942,6 +945,10 @@ pub struct PictureItem {
     /// the upstream dialect).
     #[prost(message, optional, tag="16")]
     pub shape: ::core::option::Option<ShapeMeta>,
+    /// A link target covering this picture's region (extension beyond the
+    /// upstream dialect).
+    #[prost(string, optional, tag="17")]
+    pub hyperlink: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// PictureMeta contains rich metadata for pictures, including AI analysis.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1359,6 +1366,16 @@ pub struct PageItem {
     /// Document.page_styles.
     #[prost(string, optional, tag="6")]
     pub style_name: ::core::option::Option<::prost::alloc::string::String>,
+    /// The page's own label when the source numbers pages in its own scheme
+    /// (iv, A-1) rather than by ordinal.
+    #[prost(string, optional, tag="7")]
+    pub page_label: ::core::option::Option<::prost::alloc::string::String>,
+    /// The full media box when it differs from the cropped `size`.
+    #[prost(message, optional, tag="8")]
+    pub media_size: ::core::option::Option<Size>,
+    /// The source's unit multiplier over its default unit (a PDF /UserUnit).
+    #[prost(double, optional, tag="9")]
+    pub user_unit: ::core::option::Option<f64>,
 }
 /// PageQuality carries a page's extraction diagnostics as the measurements
 /// they are, not booleans.
@@ -1552,6 +1569,22 @@ pub struct DocumentMeta {
     /// Typed user-defined properties, each in the shape the source stored.
     #[prost(message, repeated, tag="28")]
     pub user_properties: ::prost::alloc::vec::Vec<UserProperty>,
+    /// The source format's own version (a PDF version, an office format
+    /// generation).
+    #[prost(string, optional, tag="29")]
+    pub format_version: ::core::option::Option<::prost::alloc::string::String>,
+    /// Whether the source declares authored structure (a tagged PDF).
+    #[prost(bool, optional, tag="30")]
+    pub structured: ::core::option::Option<bool>,
+    /// The authoring application, when the source distinguishes it from the
+    /// producing one in `generator`.
+    #[prost(string, optional, tag="31")]
+    pub authoring_tool: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag="32")]
+    pub protection: ::core::option::Option<Protection>,
+    /// The source's raw embedded metadata packet (XMP), verbatim bytes.
+    #[prost(bytes="vec", optional, tag="33")]
+    pub raw_metadata: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     /// Source metadata that is genuinely open vocabulary. Data whose shape the
     /// fleet knows gets a typed field, never an entry here.
     #[prost(map="string, string", tag="100")]
@@ -1992,6 +2025,24 @@ pub struct IndexMeta {
     pub service: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, optional, tag="2")]
     pub title: ::core::option::Option<::prost::alloc::string::String>,
+}
+/// Protection is the source's own protection posture, as facts rather than
+/// a boolean.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct Protection {
+    #[prost(bool, tag="1")]
+    pub encrypted: bool,
+    #[prost(string, optional, tag="2")]
+    pub handler: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(int32, optional, tag="3")]
+    pub key_bits: ::core::option::Option<i32>,
+    /// The parse opened it without a password (an empty owner password).
+    #[prost(bool, tag="4")]
+    pub opened_without_password: bool,
+    #[prost(bool, tag="5")]
+    pub allows_extraction: bool,
+    #[prost(bool, tag="6")]
+    pub allows_printing: bool,
 }
 /// DocumentStatistics carries the source's own document statistics.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
