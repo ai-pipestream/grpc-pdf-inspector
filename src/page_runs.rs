@@ -42,6 +42,14 @@
 //! from the runs: the extractor reads `/A /URI` and nothing else, so a
 //! table of contents, a cross-reference and a footnote jump are invisible
 //! to it.
+//!
+//! Emphasis rides the same machinery. Bold, italic, underline and strikeout
+//! are per-run facts that markdown flattens into `**`, `*`, `<u>` and `<s>`
+//! inside a paragraph's text; grouped by run and reported as spans they are
+//! `Formatting` over the characters they actually cover, so a partially
+//! bold paragraph stays recoverable. A run with nothing to say — no link,
+//! no decoration — produces no span at all, which keeps "no span" meaning
+//! "the item's own default".
 
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
@@ -57,9 +65,9 @@ pub struct PageRuns {
     owners: Vec<usize>,
     /// Each run's box, in the same order the runs arrived.
     boxes: Vec<doc::BoundingBox>,
-    /// For each run, the target of the link annotation covering it, when
-    /// one does.
-    links: Vec<Option<Anchor>>,
+    /// For each run, how it differs from plain body text: its link target
+    /// and its decorations.
+    styles: Vec<Style>,
     /// For each run, the role its marked-content region was tagged with,
     /// when the document is tagged and the run sits in one.
     roles: Vec<Option<(pb::StructureRole, String)>>,
@@ -97,14 +105,14 @@ impl PageRuns {
                 }
             }
         }
-        let links = anchor_targets(spans, internal, &boxes);
+        let styles = styles(spans, &anchor_targets(spans, internal, &boxes));
         let roles = tagged_roles(spans, structure);
         Self {
             page_no: spans.page_no,
             letters,
             owners,
             boxes,
-            links,
+            styles,
             roles,
             cursor: 0,
         }
@@ -150,27 +158,39 @@ impl PageRuns {
         };
         let end = at + needle.len();
         self.cursor = self.cursor.max(end);
-        let spans = self.hyperlink_spans(at, end, &columns);
-        // A block every one of whose letters is under the same annotation
-        // is a link in the upstream dialect's sense too, and saying so
-        // keeps the fragment readable to a consumer that has no inline
-        // spans.
-        let hyperlink = spans
-            .first()
-            .filter(|_| spans.len() == 1)
-            .filter(|span| {
-                span.range.as_ref().is_some_and(|range| {
-                    range.start == 0
-                        && usize::try_from(range.end).unwrap_or(0) == text.chars().count()
-                })
-            })
-            .and_then(|span| span.hyperlink.clone());
+        let spans = self.inline_spans(at, end, &columns);
         Located {
+            hyperlink: self.whole_block_link(at, end),
             bbox: self.union(at, end),
             spans,
-            hyperlink,
             role: self.role(at, end),
         }
+    }
+
+    /// The external link covering every letter of the block, when one
+    /// does.
+    ///
+    /// A block that is entirely one link is a link in the upstream
+    /// dialect's sense too, and saying so keeps the fragment readable to a
+    /// consumer that has no inline spans. Decorations do not break this:
+    /// a link whose second half is bold is still entirely a link.
+    fn whole_block_link(&self, at: usize, end: usize) -> Option<String> {
+        let mut target: Option<&str> = None;
+        for &owner in &self.owners[at..end] {
+            let uri = match self
+                .styles
+                .get(owner)
+                .and_then(|style| style.anchor.as_ref())
+            {
+                Some(Anchor::External(uri)) => uri.as_str(),
+                _ => return None,
+            };
+            match target {
+                Some(known) if known != uri => return None,
+                _ => target = Some(uri),
+            }
+        }
+        target.map(ToOwned::to_owned)
     }
 
     /// The role the document gave the runs behind `letters[at..end]`.
@@ -195,28 +215,29 @@ impl PageRuns {
             .map(|(role, _)| role.clone())
     }
 
-    /// The link runs inside `letters[at..end]`, as character ranges into
+    /// The styled runs inside `letters[at..end]`, as character ranges into
     /// the block those letters came from.
     ///
-    /// Consecutive letters under the same annotation are one run; a block
-    /// with no linked letters gets no runs at all.
-    fn hyperlink_spans(&self, at: usize, end: usize, columns: &[usize]) -> Vec<doc::InlineSpan> {
+    /// Consecutive letters sharing a style are one span. A style with
+    /// nothing to say produces none, so a paragraph of plain body text
+    /// carries no spans at all.
+    fn inline_spans(&self, at: usize, end: usize, columns: &[usize]) -> Vec<doc::InlineSpan> {
         let mut spans: Vec<doc::InlineSpan> = Vec::new();
-        let mut open: Option<(Anchor, usize, usize)> = None;
+        let mut open: Option<(&Style, usize, usize)> = None;
         for (offset, &owner) in self.owners[at..end].iter().enumerate() {
-            let target = self.links.get(owner).and_then(Option::as_ref);
-            match (&mut open, target) {
-                (Some((anchor, _, last)), Some(target)) if anchor == target => *last = offset,
-                (open_run, target) => {
-                    if let Some(run) = open_run.take() {
-                        spans.push(inline_link(&run, columns));
+            let style = self.styles.get(owner).filter(|style| !style.is_plain());
+            match (&mut open, style) {
+                (Some((known, _, last)), Some(style)) if *known == style => *last = offset,
+                (open_run, style) => {
+                    if let Some((style, first, last)) = open_run.take() {
+                        spans.push(style.span(first, last, columns));
                     }
-                    *open_run = target.map(|anchor| (anchor.clone(), offset, offset));
+                    *open_run = style.map(|style| (style, offset, offset));
                 }
             }
         }
-        if let Some(run) = open {
-            spans.push(inline_link(&run, columns));
+        if let Some((style, first, last)) = open {
+            spans.push(style.span(first, last, columns));
         }
         spans
     }
@@ -288,34 +309,93 @@ enum Anchor {
     Internal(u32),
 }
 
-/// One link run as an inline span: `(target, first letter, last letter)`
-/// against the block's letter-to-character map.
-fn inline_link(run: &(Anchor, usize, usize), columns: &[usize]) -> doc::InlineSpan {
-    let (anchor, first, last) = run;
-    let start = columns.get(*first).copied().unwrap_or(0);
-    // The range is half-open and measured in characters, so it ends one
-    // past the last linked character.
-    let end = columns.get(*last).copied().unwrap_or(start) + 1;
-    let mut span = doc::InlineSpan {
-        range: Some(doc::IntSpan {
-            start: i32::try_from(start).unwrap_or(i32::MAX),
-            end: i32::try_from(end).unwrap_or(i32::MAX),
-        }),
-        ..doc::InlineSpan::default()
-    };
-    match anchor {
-        Anchor::External(uri) => span.hyperlink = Some(uri.clone()),
-        // An internal destination points at a page item, which is an item
-        // of this fragment: `pages` is keyed by page number, so the pointer
-        // resolves without knowing which text item happens to sit there.
-        Anchor::Internal(page_no) => {
-            span.target = Some(doc::FineRef {
-                r#ref: page_ref(*page_no),
-                range: None,
-            });
-        }
+/// How one run differs from plain body text.
+#[derive(Clone, Default, PartialEq)]
+struct Style {
+    /// The link annotation covering the run, when one does.
+    anchor: Option<Anchor>,
+    /// Whether the face is bold.
+    bold: bool,
+    /// Whether the face is italic.
+    italic: bool,
+    /// Whether a rule is drawn under the run.
+    underline: bool,
+    /// Whether a rule crosses it.
+    strikeout: bool,
+    /// The face the run is set in.
+    font_family: String,
+    /// Its type size in points.
+    font_size: f32,
+}
+
+impl Style {
+    /// Whether the run has nothing to say beyond being text.
+    ///
+    /// Font and size alone are not something to say: every run has them,
+    /// and a span per run stating the body face would be noise the length
+    /// of the document. They are reported on the spans that exist for
+    /// another reason, where they qualify a run that already stands out.
+    const fn is_plain(&self) -> bool {
+        self.anchor.is_none() && !self.bold && !self.italic && !self.underline && !self.strikeout
     }
-    span
+
+    /// This style over `columns[first..=last]` as an inline span.
+    fn span(&self, first: usize, last: usize, columns: &[usize]) -> doc::InlineSpan {
+        let start = columns.get(first).copied().unwrap_or(0);
+        // The range is half-open and measured in characters, so it ends one
+        // past the last character it covers.
+        let end = columns.get(last).copied().unwrap_or(start) + 1;
+        let decorated = self.bold || self.italic || self.underline || self.strikeout;
+        let mut span = doc::InlineSpan {
+            range: Some(doc::IntSpan {
+                start: i32::try_from(start).unwrap_or(i32::MAX),
+                end: i32::try_from(end).unwrap_or(i32::MAX),
+            }),
+            formatting: decorated.then(|| doc::Formatting {
+                bold: self.bold,
+                italic: self.italic,
+                underline: self.underline,
+                strikethrough: self.strikeout,
+                ..doc::Formatting::default()
+            }),
+            font_family: (!self.font_family.is_empty()).then(|| self.font_family.clone()),
+            font_size_pt: (self.font_size > 0.0).then(|| f64::from(self.font_size)),
+            ..doc::InlineSpan::default()
+        };
+        match &self.anchor {
+            Some(Anchor::External(uri)) => span.hyperlink = Some(uri.clone()),
+            // An internal destination points at a page item, which is an
+            // item of this fragment: `pages` is keyed by page number, so
+            // the pointer resolves without knowing which text item happens
+            // to sit there.
+            Some(Anchor::Internal(page_no)) => {
+                span.target = Some(doc::FineRef {
+                    r#ref: page_ref(*page_no),
+                    range: None,
+                });
+            }
+            None => {}
+        }
+        span
+    }
+}
+
+/// Each run's style: its link target, if any, and how it is set.
+fn styles(spans: &pb::PageSpans, anchors: &[Option<Anchor>]) -> Vec<Style> {
+    spans
+        .spans
+        .iter()
+        .enumerate()
+        .map(|(index, span)| Style {
+            anchor: anchors.get(index).and_then(Clone::clone),
+            bold: span.bold,
+            italic: span.italic,
+            underline: span.underline,
+            strikeout: span.strikeout,
+            font_family: span.font_family.clone(),
+            font_size: span.font_size,
+        })
+        .collect()
 }
 
 /// The JSON-Pointer reference of one page item.
@@ -587,6 +667,82 @@ mod tests {
         assert_eq!(
             targets,
             ["https://example.invalid/1", "https://example.invalid/2"]
+        );
+    }
+
+    /// One run set in a decorated face.
+    fn decorated(text: &str, y: f64, bold: bool, italic: bool) -> pb::TextSpan {
+        let mut span = span(text, 10.0, y, pb::SpanKind::Text);
+        span.bold = bold;
+        span.italic = italic;
+        span.font_family = if bold { "Helvetica-Bold" } else { "Helvetica" }.to_owned();
+        span.font_size = 11.0;
+        span
+    }
+
+    #[test]
+    fn a_decorated_run_becomes_a_formatting_span_over_its_own_characters() {
+        let mut runs = index(page(vec![
+            decorated("plain ", 700.0, false, false),
+            decorated("bold", 690.0, true, false),
+            decorated(" plain", 680.0, false, false),
+        ]));
+        let located = runs.locate("plain bold plain");
+        assert_eq!(located.spans.len(), 1, "{:?}", located.spans);
+        let span = &located.spans[0];
+        let formatting = span.formatting.as_ref().expect("a decorated run says so");
+        assert!(formatting.bold);
+        assert_eq!(span.font_family.as_deref(), Some("Helvetica-Bold"));
+        assert_eq!(span.font_size_pt, Some(11.0));
+
+        let range = span.range.as_ref().expect("a range");
+        let text: Vec<char> = "plain bold plain".chars().collect();
+        let covered: String = text[range.start as usize..range.end as usize]
+            .iter()
+            .collect();
+        assert_eq!(covered, "bold");
+    }
+
+    #[test]
+    fn undecorated_unlinked_runs_produce_no_spans() {
+        let mut runs = index(page(vec![
+            decorated("all", 700.0, false, false),
+            decorated(" plain", 690.0, false, false),
+        ]));
+        assert!(runs.locate("all plain").spans.is_empty());
+    }
+
+    #[test]
+    fn a_link_that_is_also_bold_is_one_span_carrying_both() {
+        let mut runs = index(page(vec![
+            decorated("click here", 690.0, true, false),
+            annotation(690.0, "https://example.invalid/z"),
+        ]));
+        let located = runs.locate("click here");
+        assert_eq!(located.spans.len(), 1, "{:?}", located.spans);
+        let span = &located.spans[0];
+        assert_eq!(span.hyperlink.as_deref(), Some("https://example.invalid/z"));
+        assert!(span.formatting.as_ref().expect("formatting").bold);
+        assert_eq!(
+            located.hyperlink.as_deref(),
+            Some("https://example.invalid/z"),
+            "a decoration inside a link does not stop the block being a link"
+        );
+    }
+
+    #[test]
+    fn a_link_whose_second_half_is_bold_is_still_wholly_a_link() {
+        let mut runs = index(page(vec![
+            decorated("click ", 700.0, false, false),
+            decorated("here", 690.0, true, false),
+            annotation(700.0, "https://example.invalid/w"),
+            annotation(690.0, "https://example.invalid/w"),
+        ]));
+        let located = runs.locate("click here");
+        assert_eq!(located.spans.len(), 2, "the decoration changes mid-link");
+        assert_eq!(
+            located.hyperlink.as_deref(),
+            Some("https://example.invalid/w")
         );
     }
 

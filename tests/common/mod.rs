@@ -622,6 +622,62 @@ pub fn furniture_pdf(pages: u32, head: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page PDF whose middle line is set in a bold face and whose
+/// surrounding lines are not.
+///
+/// The three lines join into one paragraph, so the bold is a property of
+/// part of a block rather than of the block. Markdown can only spell that
+/// as `**` characters inside the text; a run-level span can say which
+/// characters it covers.
+#[must_use]
+pub fn styled_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let regular_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let bold_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica-Bold",
+    });
+
+    let content = b"BT /F1 11 Tf 72 700 Td (Ordinary prose leading into the emphasis,) Tj ET\n\
+                    BT /F2 11 Tf 72 686 Td (a phrase set in a bold face,) Tj ET\n\
+                    BT /F1 11 Tf 72 672 Td (and ordinary prose after it again.) Tj ET"
+        .to_vec();
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content));
+
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => regular_id, "F2" => bold_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {
