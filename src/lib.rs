@@ -31,6 +31,7 @@ pub mod proto;
 pub mod service;
 pub mod spans;
 pub mod structure;
+pub mod tables;
 
 pub use limits::Limits;
 pub use metrics::Metrics;

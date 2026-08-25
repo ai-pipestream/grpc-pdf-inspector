@@ -74,6 +74,62 @@ pub struct PdfOptions {
     /// read of the file.
     #[prost(bool, tag="7")]
     pub emit_structure: bool,
+    /// Also stream the tables the detector found on each page, as one
+    /// `tables` event per page carrying a page with any. Default false.
+    ///
+    /// The detector works from the same positioned runs the markdown is
+    /// rendered from and reports the column and row boundaries in page
+    /// points, which is the richest geometry available anywhere on this wire.
+    /// Markdown can only render a table as pipe characters, so this is the
+    /// only form in which a table survives as a table. It costs nothing
+    /// beyond the extraction pass that is already running.
+    #[prost(bool, tag="8")]
+    pub emit_tables: bool,
+}
+/// TableCells is one row of a detected table.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TableCells {
+    /// The row's cells, left to right. A row shorter than the table's column
+    /// count ends where the detector found it ending.
+    #[prost(string, repeated, tag="1")]
+    pub cells: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+}
+/// TableRegion is one detected table: its grid, its contents, and where its
+/// lines fall on the page.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct TableRegion {
+    /// The table's extent, measured from the runs it claims. This is what
+    /// closes the last column and the last row, whose far edges the
+    /// boundaries below do not name.
+    #[prost(message, optional, tag="1")]
+    pub bbox: ::core::option::Option<Rect>,
+    /// Where each column starts, as an x position in page points, ascending.
+    /// One per column: these are the detector's own column positions, not
+    /// fences, so the last column runs to `bbox`'s right edge.
+    #[prost(double, repeated, tag="2")]
+    pub column_boundaries: ::prost::alloc::vec::Vec<f64>,
+    /// Where each row sits, as a y position in page points, descending —
+    /// page space grows upwards and a table is read downwards. One per row: a
+    /// row's band runs from its own value up to the previous row's, and the
+    /// first row's top edge is `bbox`'s.
+    #[prost(double, repeated, tag="3")]
+    pub row_boundaries: ::prost::alloc::vec::Vec<f64>,
+    /// The cells, row by row, top to bottom.
+    #[prost(message, repeated, tag="4")]
+    pub rows: ::prost::alloc::vec::Vec<TableCells>,
+    /// Whether this is data or a table of contents.
+    #[prost(enumeration="TableKind", tag="5")]
+    pub kind: i32,
+}
+/// PageTables carries the tables found on one page.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PageTables {
+    /// The 1-indexed page.
+    #[prost(uint32, tag="1")]
+    pub page_no: u32,
+    /// The tables, in reading order.
+    #[prost(message, repeated, tag="2")]
+    pub tables: ::prost::alloc::vec::Vec<TableRegion>,
 }
 /// Rect is an axis-aligned rectangle in PDF user space.
 ///
@@ -627,6 +683,43 @@ impl ProcessMode {
         }
     }
 }
+/// TableKind separates a real data table from a table of contents.
+///
+/// They share row and column structure, which is why one detector finds
+/// both, but a table of contents is a navigation aid rather than data and
+/// belongs in a different place downstream.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TableKind {
+    /// Never sent. Present because proto3 requires a zero value.
+    Unspecified = 0,
+    /// A data table.
+    Data = 1,
+    /// A table of contents.
+    Contents = 2,
+}
+impl TableKind {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TABLE_KIND_UNSPECIFIED",
+            Self::Data => "TABLE_KIND_DATA",
+            Self::Contents => "TABLE_KIND_CONTENTS",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TABLE_KIND_UNSPECIFIED" => Some(Self::Unspecified),
+            "TABLE_KIND_DATA" => Some(Self::Data),
+            "TABLE_KIND_CONTENTS" => Some(Self::Contents),
+            _ => None,
+        }
+    }
+}
 /// SpanKind names what a positioned run actually is.
 ///
 /// The extractor emits more than glyphs: an image XObject contributes its
@@ -1059,7 +1152,7 @@ pub struct ParsePdfResponse {
     /// Unknown variants must be ignored rather than treated as failures: this
     /// oneof is the extension point, and a later server may add events an
     /// older client has no name for.
-    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5, 6, 7")]
+    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5, 6, 7, 8")]
     pub event: ::core::option::Option<parse_pdf_response::Event>,
 }
 /// Nested message and enum types in `ParsePdfResponse`.
@@ -1108,6 +1201,11 @@ pub mod parse_pdf_response {
         /// `PdfOptions.emit_structure` was set.
         #[prost(message, tag="7")]
         Structure(super::PageStructure),
+        /// The tables found on one page, before that page's `page` event and
+        /// only when `PdfOptions.emit_tables` was set. A page with no tables
+        /// produces no event.
+        #[prost(message, tag="8")]
+        Tables(super::PageTables),
     }
 }
 /// GetServiceInfoRequest asks for the server's build and limits. It carries

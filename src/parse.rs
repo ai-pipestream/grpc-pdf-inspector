@@ -59,6 +59,7 @@ use crate::metrics::Metrics;
 use crate::proto::v1 as pb;
 use crate::spans;
 use crate::structure;
+use crate::tables;
 
 /// How the call ended.
 #[derive(Debug)]
@@ -395,6 +396,17 @@ fn parse(
                     events.route(
                         pb::parse_pdf_response::Event::Structure(roles),
                         options.emit_structure,
+                    )?;
+                }
+
+                // The grids go out before the markdown that flattens them
+                // into pipe characters.
+                if events.wanted(options.emit_tables)
+                    && let Some(tables) = tables::page_tables(page_no, &page_items)
+                {
+                    events.route(
+                        pb::parse_pdf_response::Event::Tables(tables),
+                        options.emit_tables,
                     )?;
                 }
 

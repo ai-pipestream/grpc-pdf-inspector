@@ -50,7 +50,8 @@ service PdfParseService {
   // A successful stream is exactly: one `info`, an optional `metadata`,
   // then — per page, in requested page order, in FULL mode and for
   // text-bearing documents only — an optional `structure` event, an
-  // optional `spans` event, and that page's `page` event; then, only when
+  // optional `tables` event, an optional `spans` event, and that page's
+  // `page` event; then, only when
   // `options.emit_document` was set, one `document`; then one `status`.
   // A failed stream ends with a gRPC status and no `status` event:
   //
@@ -130,6 +131,11 @@ message ParsePdfResponse {
     // `page` events. FULL mode only, and only when
     // `PdfOptions.emit_structure` was set.
     PageStructure structure = 7;
+
+    // The tables found on one page, before that page's `page` event and
+    // only when `PdfOptions.emit_tables` was set. A page with no tables
+    // produces no event.
+    PageTables tables = 8;
   }
 }
 

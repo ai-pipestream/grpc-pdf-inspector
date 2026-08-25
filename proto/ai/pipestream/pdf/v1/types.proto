@@ -114,6 +114,75 @@ message PdfOptions {
   // them is a document that does not have to be guessed at. It costs one
   // read of the file.
   bool emit_structure = 7;
+
+  // Also stream the tables the detector found on each page, as one
+  // `tables` event per page carrying a page with any. Default false.
+  //
+  // The detector works from the same positioned runs the markdown is
+  // rendered from and reports the column and row boundaries in page
+  // points, which is the richest geometry available anywhere on this wire.
+  // Markdown can only render a table as pipe characters, so this is the
+  // only form in which a table survives as a table. It costs nothing
+  // beyond the extraction pass that is already running.
+  bool emit_tables = 8;
+}
+
+// TableKind separates a real data table from a table of contents.
+//
+// They share row and column structure, which is why one detector finds
+// both, but a table of contents is a navigation aid rather than data and
+// belongs in a different place downstream.
+enum TableKind {
+  // Never sent. Present because proto3 requires a zero value.
+  TABLE_KIND_UNSPECIFIED = 0;
+
+  // A data table.
+  TABLE_KIND_DATA = 1;
+
+  // A table of contents.
+  TABLE_KIND_CONTENTS = 2;
+}
+
+// TableCells is one row of a detected table.
+message TableCells {
+  // The row's cells, left to right. A row shorter than the table's column
+  // count ends where the detector found it ending.
+  repeated string cells = 1;
+}
+
+// TableRegion is one detected table: its grid, its contents, and where its
+// lines fall on the page.
+message TableRegion {
+  // The table's extent, measured from the runs it claims. This is what
+  // closes the last column and the last row, whose far edges the
+  // boundaries below do not name.
+  Rect bbox = 1;
+
+  // Where each column starts, as an x position in page points, ascending.
+  // One per column: these are the detector's own column positions, not
+  // fences, so the last column runs to `bbox`'s right edge.
+  repeated double column_boundaries = 2;
+
+  // Where each row sits, as a y position in page points, descending —
+  // page space grows upwards and a table is read downwards. One per row: a
+  // row's band runs from its own value up to the previous row's, and the
+  // first row's top edge is `bbox`'s.
+  repeated double row_boundaries = 3;
+
+  // The cells, row by row, top to bottom.
+  repeated TableCells rows = 4;
+
+  // Whether this is data or a table of contents.
+  TableKind kind = 5;
+}
+
+// PageTables carries the tables found on one page.
+message PageTables {
+  // The 1-indexed page.
+  uint32 page_no = 1;
+
+  // The tables, in reading order.
+  repeated TableRegion tables = 2;
 }
 
 // Rect is an axis-aligned rectangle in PDF user space.

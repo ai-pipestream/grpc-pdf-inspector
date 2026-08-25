@@ -110,6 +110,14 @@ pub struct DocumentFold {
     /// tagged and the stream carried them. Held like `runs`: the
     /// `structure` event arrives before the page it describes.
     structure: Option<pb::PageStructure>,
+    /// The grids found on the page being folded, in reverse reading order
+    /// so the next one is the last one. Each pipe-syntax block in the
+    /// page's markdown takes one: both sequences are in reading order, so
+    /// the nth flattened table is the nth detected grid.
+    detected_tables: Vec<pb::TableRegion>,
+    /// The list currently being accumulated: whether its markers count, and
+    /// the self ref of the group its items hang off.
+    open_list: Option<(bool, String)>,
 }
 
 impl Default for DocumentFold {
@@ -153,6 +161,8 @@ impl DocumentFold {
             runs: None,
             internal_links: HashMap::new(),
             structure: None,
+            detected_tables: Vec::new(),
+            open_list: None,
         }
     }
 
@@ -170,6 +180,9 @@ impl DocumentFold {
             Event::Info(info) => self.on_info(info),
             Event::Metadata(metadata) => self.on_metadata(metadata),
             Event::Structure(structure) => self.structure = Some(structure.clone()),
+            Event::Tables(tables) => {
+                self.detected_tables = tables.tables.iter().rev().cloned().collect();
+            }
             Event::Spans(spans) => {
                 let internal = self
                     .internal_links
@@ -191,6 +204,8 @@ impl DocumentFold {
         self.headings.clear();
         self.runs = None;
         self.structure = None;
+        self.detected_tables.clear();
+        self.open_list = None;
         self.internal_links.clear();
         std::mem::replace(&mut self.document, Self::new().document)
     }
@@ -322,45 +337,171 @@ impl DocumentFold {
         }
     }
 
-    /// Fold one page's markdown into text items.
+    /// Fold one page's markdown into items.
     fn on_page(&mut self, page: &pb::PageMarkdown) {
         for block in blocks(&page.markdown) {
-            let (guessed, text) = match block {
-                Block::Heading { level, text } => (Some(level), text),
-                Block::Paragraph(text) => (None, text),
-            };
-            let located = self.locate(&text, page.page_no);
-            // The document's own word for the block beats the markdown
-            // renderer's guess at it. The renderer inferred heading depth
-            // from type size; a tagged document states it.
-            let authored = located
-                .role
-                .as_ref()
-                .and_then(|(role, _)| structure::heading_level(*role));
-            let level = authored.or(guessed);
-            if let Some(level) = level {
-                // A header opens a level on the ladder before it is placed,
-                // so it is parented to the header enclosing it rather than
-                // to the one it closes.
-                self.close_headings(level);
-            }
-            let self_ref = self.push_text(&text, page.page_no, level, located);
-            if let Some(level) = level {
-                self.headings.push((level, self_ref));
+            match block {
+                Block::Table(text) => self.on_table(&text, page.page_no),
+                Block::ListItem {
+                    marker,
+                    enumerated,
+                    text,
+                } => {
+                    let located = self.locate(&text, page.page_no);
+                    self.open_list(enumerated);
+                    self.push_text(
+                        &text,
+                        page.page_no,
+                        Kind::ListItem { marker, enumerated },
+                        located,
+                    );
+                }
+                Block::Code { language, text } => {
+                    self.close_list();
+                    let located = self.locate(&text, page.page_no);
+                    self.push_code(&text, page.page_no, language.as_deref(), located);
+                }
+                block => {
+                    self.close_list();
+                    let (guessed, text) = match block {
+                        Block::Heading { level, text } => (Some(level), text),
+                        Block::Paragraph(text) => (None, text),
+                        // The arms above handled every other variant.
+                        _ => continue,
+                    };
+                    let located = self.locate(&text, page.page_no);
+                    // The document's own word for the block beats the
+                    // markdown renderer's guess at it. The renderer inferred
+                    // heading depth from type size; a tagged document states
+                    // it.
+                    let authored = located
+                        .role
+                        .as_ref()
+                        .and_then(|(role, _)| structure::heading_level(*role));
+                    let level = authored.or(guessed);
+                    if let Some(level) = level {
+                        // A header opens a level on the ladder before it is
+                        // placed, so it is parented to the header enclosing
+                        // it rather than to the one it closes.
+                        self.close_headings(level);
+                    }
+                    let kind = level.map_or(Kind::Paragraph, Kind::Heading);
+                    let self_ref = self.push_text(&text, page.page_no, kind, located);
+                    if let Some(level) = level {
+                        self.headings.push((level, self_ref));
+                    }
+                }
             }
         }
+        // A page ends whatever it was in the middle of.
+        self.close_list();
     }
 
-    /// Append one text item — a paragraph, or a section header when `level`
-    /// is set — and return its self ref.
-    fn push_text(
-        &mut self,
-        text: &str,
-        page_no: u32,
-        level: Option<i32>,
-        located: Located,
-    ) -> String {
+    /// Fold one flattened table back into a grid.
+    ///
+    /// The detector found the grid; the renderer printed pipe characters;
+    /// this puts the grid back. When no grid was detected for this block —
+    /// because the caller's stream carried none — the pipe characters are
+    /// kept as a paragraph, which is what they were before.
+    fn on_table(&mut self, text: &str, page_no: u32) {
+        self.close_list();
+        let located = self.locate(text, page_no);
+        let Some(region) = self.detected_tables.pop() else {
+            self.push_text(text, page_no, Kind::Paragraph, located);
+            return;
+        };
         let parent = self.current_parent();
+        let self_ref = format!("#/tables/{}", self.document.tables.len());
+        let bbox = region.bbox.as_ref().map(bounding_box).or(located.bbox);
+        let kind = pb::TableKind::try_from(region.kind).unwrap_or(pb::TableKind::Unspecified);
+        self.document.tables.push(doc::TableItem {
+            self_ref: self_ref.clone(),
+            parent: Some(reference(&parent)),
+            content_layer: doc::ContentLayer::Body as i32,
+            // A table of contents is navigation rather than data, and the
+            // detector says which it found.
+            label: if kind == pb::TableKind::Contents {
+                doc::DocItemLabel::DocumentIndex
+            } else {
+                doc::DocItemLabel::Table
+            } as i32,
+            prov: provenance(page_no, bbox),
+            data: Some(table_data(&region)),
+            source: vec![doc::SourceType {
+                source: Some(doc::source_type::Source::Collector(self.source.clone())),
+            }],
+            ..doc::TableItem::default()
+        });
+        self.link_child(&parent, &self_ref);
+    }
+
+    /// Append one code block. `CodeItem` inlines the base fields rather
+    /// than wrapping them, so it is built here rather than in
+    /// [`Self::push_text`].
+    fn push_code(&mut self, text: &str, page_no: u32, language: Option<&str>, located: Located) {
+        let parent = self.current_parent();
+        let self_ref = format!("#/texts/{}", self.document.texts.len());
+        self.document.texts.push(doc::BaseTextItem {
+            item: Some(doc::base_text_item::Item::Code(doc::CodeItem {
+                self_ref: self_ref.clone(),
+                parent: Some(reference(&parent)),
+                content_layer: doc::ContentLayer::Body as i32,
+                label: doc::DocItemLabel::Code as i32,
+                prov: provenance(page_no, located.bbox),
+                orig: text.to_owned(),
+                text: text.to_owned(),
+                // The fence's own word for the language, kept verbatim
+                // rather than mapped onto an enum that may not have it.
+                code_language_raw: language.map(ToOwned::to_owned),
+                source: vec![doc::SourceType {
+                    source: Some(doc::source_type::Source::Collector(self.source.clone())),
+                }],
+                ..doc::CodeItem::default()
+            })),
+        });
+        self.link_child(&parent, &self_ref);
+    }
+
+    /// Open a list group, or keep the open one when it is the same kind of
+    /// list.
+    fn open_list(&mut self, enumerated: bool) {
+        if self
+            .open_list
+            .as_ref()
+            .is_some_and(|(counted, _)| *counted == enumerated)
+        {
+            return;
+        }
+        self.close_list();
+        let parent = self.current_parent();
+        let self_ref = format!("#/groups/{}", self.document.groups.len());
+        self.document.groups.push(doc::GroupItem {
+            self_ref: self_ref.clone(),
+            parent: Some(reference(&parent)),
+            content_layer: doc::ContentLayer::Body as i32,
+            label: if enumerated {
+                doc::GroupLabel::OrderedList
+            } else {
+                doc::GroupLabel::List
+            } as i32,
+            ..doc::GroupItem::default()
+        });
+        self.link_child(&parent, &self_ref);
+        self.open_list = Some((enumerated, self_ref));
+    }
+
+    /// Close the open list, if there is one.
+    fn close_list(&mut self) {
+        self.open_list = None;
+    }
+
+    /// Append one text item of the given kind and return its self ref.
+    fn push_text(&mut self, text: &str, page_no: u32, kind: Kind, located: Located) -> String {
+        let parent = match (&kind, self.open_list.as_ref()) {
+            // A list item hangs off the group that opened for it.
+            (Kind::ListItem { .. }, Some((_, group))) => group.clone(),
+            _ => self.current_parent(),
+        };
         let self_ref = format!("#/texts/{}", self.document.texts.len());
         let base = doc::TextItemBase {
             self_ref: self_ref.clone(),
@@ -374,9 +515,7 @@ impl DocumentFold {
             // knows the tagged-PDF vocabulary reads more out of "BlockQuote"
             // or "Caption" than any label this fold could map it onto.
             style_name: located.role.map(|(_, name)| name),
-            label: level.map_or(doc::DocItemLabel::Paragraph, |_| {
-                doc::DocItemLabel::SectionHeader
-            }) as i32,
+            label: kind.label() as i32,
             orig: text.to_owned(),
             text: text.to_owned(),
             source: vec![doc::SourceType {
@@ -384,14 +523,23 @@ impl DocumentFold {
             }],
             ..doc::TextItemBase::default()
         };
-        let variant = match level {
-            Some(level) => doc::base_text_item::Item::SectionHeader(doc::SectionHeaderItem {
-                base: Some(base),
-                // Redundant with the nesting, and kept anyway: docling
-                // populates both.
-                level,
-            }),
-            None => doc::base_text_item::Item::Text(doc::TextItem { base: Some(base) }),
+        let variant = match kind {
+            Kind::Heading(level) => {
+                doc::base_text_item::Item::SectionHeader(doc::SectionHeaderItem {
+                    base: Some(base),
+                    // Redundant with the nesting, and kept anyway: the
+                    // upstream dialect populates both.
+                    level,
+                })
+            }
+            Kind::ListItem { marker, enumerated } => {
+                doc::base_text_item::Item::ListItem(doc::ListItem {
+                    base: Some(base),
+                    enumerated,
+                    marker: Some(marker),
+                })
+            }
+            Kind::Paragraph => doc::base_text_item::Item::Text(doc::TextItem { base: Some(base) }),
         };
         self.document.texts.push(doc::BaseTextItem {
             item: Some(variant),
@@ -445,6 +593,13 @@ impl DocumentFold {
             if let Some(body) = self.document.body.as_mut() {
                 body.children.push(reference(child));
             }
+        } else if let Some(index) = parent
+            .strip_prefix("#/groups/")
+            .and_then(|rest| rest.parse::<usize>().ok())
+        {
+            if let Some(group) = self.document.groups.get_mut(index) {
+                group.children.push(reference(child));
+            }
         } else if let Some(base) = self.heading_base(parent) {
             base.children.push(reference(child));
         }
@@ -460,23 +615,183 @@ impl DocumentFold {
     }
 }
 
+/// What kind of item a block of markdown becomes.
+enum Kind {
+    /// Prose.
+    Paragraph,
+    /// A section header at the given depth.
+    Heading(i32),
+    /// One item of a list.
+    ListItem {
+        /// The marker the source printed.
+        marker: String,
+        /// Whether that marker counts.
+        enumerated: bool,
+    },
+}
+
+impl Kind {
+    /// The schema label for this kind of item.
+    const fn label(&self) -> doc::DocItemLabel {
+        match self {
+            Self::Paragraph => doc::DocItemLabel::Paragraph,
+            Self::Heading(_) => doc::DocItemLabel::SectionHeader,
+            Self::ListItem { .. } => doc::DocItemLabel::ListItem,
+        }
+    }
+}
+
+/// One detected grid as the schema's table data.
+///
+/// Every cell keeps its own box, cut from the column and row boundaries the
+/// detector measured. The first row is marked as the header because that is
+/// the convention the renderer itself follows when it prints the grid as
+/// markdown; the detector reports no header row of its own.
+fn table_data(region: &pb::TableRegion) -> doc::TableData {
+    let columns = region
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .max()
+        .unwrap_or(0);
+    let header_rows = usize::from(region.kind == pb::TableKind::Data as i32);
+    let mut cells = Vec::new();
+    let mut grid = Vec::new();
+    for (row_index, row) in region.rows.iter().enumerate() {
+        let mut row_cells = Vec::new();
+        for (column_index, text) in row.cells.iter().enumerate() {
+            let cell = doc::TableCell {
+                bbox: cell_bbox(region, row_index, column_index),
+                row_span: 1,
+                col_span: 1,
+                start_row_offset_idx: i32::try_from(row_index).unwrap_or(i32::MAX),
+                end_row_offset_idx: i32::try_from(row_index + 1).unwrap_or(i32::MAX),
+                start_col_offset_idx: i32::try_from(column_index).unwrap_or(i32::MAX),
+                end_col_offset_idx: i32::try_from(column_index + 1).unwrap_or(i32::MAX),
+                text: text.clone(),
+                column_header: row_index < header_rows,
+                ..doc::TableCell::default()
+            };
+            row_cells.push(cell.clone());
+            cells.push(cell);
+        }
+        grid.push(doc::TableRow { cells: row_cells });
+    }
+    doc::TableData {
+        table_cells: cells,
+        num_rows: i32::try_from(region.rows.len()).unwrap_or(i32::MAX),
+        num_cols: i32::try_from(columns).unwrap_or(i32::MAX),
+        grid,
+        ..doc::TableData::default()
+    }
+}
+
+/// One cell's box, cut from the grid's own measurements.
+///
+/// The detector reports one x per column and one y per row, not fences. A
+/// cell's right edge is therefore the next column's x, and its top edge the
+/// previous row's y — page space grows upwards while a table is read
+/// downwards. The outermost edges, which no boundary names, come from the
+/// table's own extent. Nothing here is interpolated: every number is one
+/// the detector or the extractor measured.
+fn cell_bbox(region: &pb::TableRegion, row: usize, column: usize) -> Option<doc::BoundingBox> {
+    let extent = region.bbox.as_ref()?;
+    let left = *region.column_boundaries.get(column)?;
+    let right = region
+        .column_boundaries
+        .get(column + 1)
+        .copied()
+        .unwrap_or(extent.x + extent.width);
+    let bottom = *region.row_boundaries.get(row)?;
+    let top = row
+        .checked_sub(1)
+        .and_then(|previous| region.row_boundaries.get(previous).copied())
+        .unwrap_or(extent.y + extent.height);
+    Some(doc::BoundingBox {
+        l: left.min(right),
+        r: left.max(right),
+        t: top.max(bottom),
+        b: top.min(bottom),
+        coord_origin: Some(doc::CoordOrigin::Bottomleft as i32),
+        coord_origin_raw: None,
+    })
+}
+
+/// A wire rectangle as a schema bounding box, in the same space.
+fn bounding_box(rect: &pb::Rect) -> doc::BoundingBox {
+    doc::BoundingBox {
+        l: rect.x,
+        t: rect.y + rect.height,
+        r: rect.x + rect.width,
+        b: rect.y,
+        coord_origin: Some(doc::CoordOrigin::Bottomleft as i32),
+        coord_origin_raw: None,
+    }
+}
+
 /// One block of a page's markdown: a heading, or a paragraph of prose.
 enum Block {
+    /// An ATX heading line.
     Heading { level: i32, text: String },
+    /// One item of a bullet or numbered list.
+    ListItem {
+        /// The marker the renderer printed, without its trailing space.
+        marker: String,
+        /// Whether the marker is a number rather than a bullet.
+        enumerated: bool,
+        /// The item's text, marker removed.
+        text: String,
+    },
+    /// A fenced code block.
+    Code {
+        /// The language on the opening fence, when it named one.
+        language: Option<String>,
+        /// The code, fences removed and indentation kept.
+        text: String,
+    },
+    /// A run of pipe-syntax rows: a table the renderer flattened.
+    Table(String),
+    /// Prose.
     Paragraph(String),
 }
 
-/// Split page markdown into blocks: ATX headings on their own lines,
-/// paragraphs between blank lines.
+/// Split page markdown into blocks.
 ///
-/// This is a structural read of markdown, not a markdown parser: a
-/// `#`-leading line inside a fenced code block would be misread as a
-/// heading. That is accepted — extraction markdown is generated, not
-/// authored, and the fold's contract is coarseness, not fidelity.
+/// This is a structural read of markdown, not a markdown parser, and it
+/// reads exactly the constructs the extraction renderer emits: ATX
+/// headings, fenced code, `-` and `1.` list markers, pipe rows, and
+/// blank-line-separated prose. Anything else is prose, which is what
+/// generated markdown mostly is.
 fn blocks(markdown: &str) -> Vec<Block> {
     let mut blocks = Vec::new();
     let mut paragraph: Vec<&str> = Vec::new();
+    let mut fence: Option<(Option<String>, Vec<String>)> = None;
+
     for line in markdown.lines() {
+        // A fence swallows everything until it is closed, so nothing
+        // inside a code block is read as markdown.
+        if let Some((language, body)) = fence.as_mut() {
+            if line.trim_start().starts_with("```") {
+                blocks.push(Block::Code {
+                    language: language.clone(),
+                    text: body.join("\n"),
+                });
+                fence = None;
+            } else {
+                body.push(line.to_owned());
+            }
+            continue;
+        }
+        if let Some(rest) = line.trim_start().strip_prefix("```") {
+            flush_paragraph(&mut paragraph, &mut blocks);
+            let language = rest.trim();
+            fence = Some((
+                (!language.is_empty()).then(|| language.to_owned()),
+                Vec::new(),
+            ));
+            continue;
+        }
+
         if line.trim().is_empty() {
             flush_paragraph(&mut paragraph, &mut blocks);
             continue;
@@ -484,21 +799,79 @@ fn blocks(markdown: &str) -> Vec<Block> {
         if let Some((level, text)) = atx_heading(line) {
             flush_paragraph(&mut paragraph, &mut blocks);
             blocks.push(Block::Heading { level, text });
-        } else {
-            paragraph.push(line.trim());
+            continue;
         }
+        if let Some((marker, enumerated, text)) = list_item(line) {
+            flush_paragraph(&mut paragraph, &mut blocks);
+            blocks.push(Block::ListItem {
+                marker,
+                enumerated,
+                text,
+            });
+            continue;
+        }
+        if is_table_row(line) {
+            // Pipe rows accumulate like a paragraph and are recognized as a
+            // table when the run ends, because one row is not a table.
+            paragraph.push(line.trim());
+            continue;
+        }
+        paragraph.push(line.trim());
+    }
+    if let Some((language, body)) = fence {
+        // An unterminated fence is still a code block; the renderer
+        // produced it and the page simply ended.
+        blocks.push(Block::Code {
+            language,
+            text: body.join("\n"),
+        });
     }
     flush_paragraph(&mut paragraph, &mut blocks);
     blocks
 }
 
 /// End the paragraph being accumulated, if there is one.
+///
+/// A run of lines that are all pipe rows is a table rather than prose.
 fn flush_paragraph(lines: &mut Vec<&str>, blocks: &mut Vec<Block>) {
     if lines.is_empty() {
         return;
     }
-    blocks.push(Block::Paragraph(lines.join("\n")));
+    let text = lines.join("\n");
+    let table = lines.len() > 1 && lines.iter().all(|line| is_table_row(line));
+    blocks.push(if table {
+        Block::Table(text)
+    } else {
+        Block::Paragraph(text)
+    });
     lines.clear();
+}
+
+/// Whether a line is a pipe-syntax table row.
+fn is_table_row(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with('|') && line.ends_with('|') && line.len() > 1
+}
+
+/// Parse a list line into its marker, whether the marker counts, and the
+/// text after it.
+///
+/// Only the markers the extraction renderer emits are recognized: `- ` for
+/// bullets and `N. ` for numbers. A line beginning with a dash and no space
+/// is a sentence that starts with a dash.
+fn list_item(line: &str) -> Option<(String, bool, String)> {
+    let line = line.trim_start();
+    if let Some(rest) = line.strip_prefix("- ") {
+        let text = rest.trim();
+        return (!text.is_empty()).then(|| ("-".to_owned(), false, text.to_owned()));
+    }
+    let digits: String = line.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    let rest = line.get(digits.len()..)?.strip_prefix(". ")?;
+    let text = rest.trim();
+    (!text.is_empty()).then(|| (format!("{digits}."), true, text.to_owned()))
 }
 
 /// Parse an ATX heading line into its level and text, or `None` when the
@@ -580,14 +953,18 @@ fn reference(target: &str) -> doc::RefItem {
 mod tests {
     use super::*;
 
-    /// The base of any text item, whichever variant it is.
+    /// The base of any text item that has one. `CodeItem` does not: it
+    /// inlines the base fields rather than wrapping them.
     fn base_of(item: &doc::BaseTextItem) -> &doc::TextItemBase {
         match item.item.as_ref().expect("a variant") {
             doc::base_text_item::Item::Text(text) => text.base.as_ref().expect("a base"),
             doc::base_text_item::Item::SectionHeader(header) => {
                 header.base.as_ref().expect("a base")
             }
-            other => panic!("the fold makes paragraphs and section headers, got {other:?}"),
+            doc::base_text_item::Item::ListItem(list_item) => {
+                list_item.base.as_ref().expect("a base")
+            }
+            other => panic!("this fold makes no {other:?}"),
         }
     }
 
@@ -637,60 +1014,130 @@ mod tests {
     fn assert_sound(document: &doc::Document) {
         let body = document.body.as_ref().expect("a body");
 
-        // Every self_ref is its position in the arena.
-        let refs: Vec<String> = document
-            .texts
-            .iter()
-            .enumerate()
-            .map(|(index, item)| {
-                let base = base_of(item);
-                assert_eq!(
-                    base.self_ref,
-                    format!("#/texts/{index}"),
-                    "self_ref matches its arena position"
-                );
-                base.self_ref.clone()
-            })
-            .collect();
+        // Every self_ref is its position in its own arena.
+        let mut refs: Vec<String> = Vec::new();
+        for (index, item) in document.texts.iter().enumerate() {
+            let self_ref = self_ref_of(item);
+            assert_eq!(
+                self_ref,
+                format!("#/texts/{index}"),
+                "self_ref matches its arena position"
+            );
+            refs.push(self_ref);
+        }
+        for (index, group) in document.groups.iter().enumerate() {
+            assert_eq!(group.self_ref, format!("#/groups/{index}"));
+            refs.push(group.self_ref.clone());
+        }
+        for (index, table) in document.tables.iter().enumerate() {
+            assert_eq!(table.self_ref, format!("#/tables/{index}"));
+            refs.push(table.self_ref.clone());
+        }
 
         // Every parent resolves, and lists the item as its child.
-        for item in &document.texts {
-            let base = base_of(item);
-            let parent = &base.parent.as_ref().expect("a parent").r#ref;
-            let children = if parent == BODY_REF {
-                &body.children
-            } else {
-                let index: usize = parent
-                    .strip_prefix("#/texts/")
-                    .and_then(|rest| rest.parse().ok())
-                    .unwrap_or_else(|| panic!("parent {parent} resolves"));
-                &base_of(&document.texts[index]).children
-            };
+        let parents: Vec<(String, String)> = document
+            .texts
+            .iter()
+            .map(|item| (self_ref_of(item), parent_of(item)))
+            .chain(document.groups.iter().map(|group| {
+                (
+                    group.self_ref.clone(),
+                    group.parent.as_ref().expect("a parent").r#ref.clone(),
+                )
+            }))
+            .chain(document.tables.iter().map(|table| {
+                (
+                    table.self_ref.clone(),
+                    table.parent.as_ref().expect("a parent").r#ref.clone(),
+                )
+            }))
+            .collect();
+        for (self_ref, parent) in &parents {
+            let children = children_of(document, parent);
             assert!(
-                children.iter().any(|child| child.r#ref == base.self_ref),
-                "{parent} lists {}",
-                base.self_ref
+                children.iter().any(|child| child.r#ref == *self_ref),
+                "{parent} lists {self_ref}"
             );
         }
 
         // Everything listed as a child is an item, exactly once.
-        let mut listed: Vec<&str> = body
+        let mut listed: Vec<String> = body
             .children
             .iter()
-            .map(|child| child.r#ref.as_str())
+            .map(|child| child.r#ref.clone())
             .collect();
         for item in &document.texts {
             listed.extend(
-                base_of(item)
-                    .children
+                children_of_item(item)
                     .iter()
-                    .map(|child| child.r#ref.as_str()),
+                    .map(|child| child.r#ref.clone()),
             );
         }
-        let mut refs: Vec<&str> = refs.iter().map(String::as_str).collect();
-        listed.sort_unstable();
-        refs.sort_unstable();
+        for group in &document.groups {
+            listed.extend(group.children.iter().map(|child| child.r#ref.clone()));
+        }
+        listed.sort();
+        refs.sort();
         assert_eq!(listed, refs, "every item is listed exactly once");
+    }
+
+    /// The self ref of any text item, whichever variant it is.
+    fn self_ref_of(item: &doc::BaseTextItem) -> String {
+        match item.item.as_ref().expect("a variant") {
+            doc::base_text_item::Item::Code(code) => code.self_ref.clone(),
+            other => base_of(&doc::BaseTextItem {
+                item: Some(other.clone()),
+            })
+            .self_ref
+            .clone(),
+        }
+    }
+
+    /// The parent ref of any text item.
+    fn parent_of(item: &doc::BaseTextItem) -> String {
+        match item.item.as_ref().expect("a variant") {
+            doc::base_text_item::Item::Code(code) => {
+                code.parent.as_ref().expect("a parent").r#ref.clone()
+            }
+            other => base_of(&doc::BaseTextItem {
+                item: Some(other.clone()),
+            })
+            .parent
+            .as_ref()
+            .expect("a parent")
+            .r#ref
+            .clone(),
+        }
+    }
+
+    /// The children of any text item.
+    fn children_of_item(item: &doc::BaseTextItem) -> Vec<doc::RefItem> {
+        match item.item.as_ref().expect("a variant") {
+            doc::base_text_item::Item::Code(code) => code.children.clone(),
+            other => base_of(&doc::BaseTextItem {
+                item: Some(other.clone()),
+            })
+            .children
+            .clone(),
+        }
+    }
+
+    /// The children a ref names, whatever kind of item it is.
+    fn children_of(document: &doc::Document, self_ref: &str) -> Vec<doc::RefItem> {
+        if self_ref == BODY_REF {
+            return document.body.as_ref().expect("a body").children.clone();
+        }
+        if let Some(index) = self_ref
+            .strip_prefix("#/groups/")
+            .and_then(|rest| rest.parse::<usize>().ok())
+        {
+            return document.groups[index].children.clone();
+        }
+        let index: usize = self_ref
+            .strip_prefix("#/texts/")
+            .and_then(|rest| rest.parse().ok())
+            .unwrap_or_else(|| panic!("parent {self_ref} resolves"));
+        children_of_item(&document.texts[index])
     }
 
     #[test]
@@ -881,6 +1328,208 @@ mod tests {
             base.prov.is_empty(),
             "there is no page to name, so nothing is claimed"
         );
+    }
+
+    #[test]
+    fn a_bullet_list_becomes_list_items_inside_a_list_group() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&page(1, "- first\n- second\n\nprose after\n"));
+        let document = fold.take();
+
+        assert_eq!(document.groups.len(), 1, "one list, one group");
+        assert_eq!(
+            document.groups[0].label,
+            doc::GroupLabel::List as i32,
+            "a bullet list is not an ordered one"
+        );
+        assert_eq!(document.groups[0].children.len(), 2);
+
+        let markers: Vec<(&str, bool)> = document.texts[..2]
+            .iter()
+            .map(|item| match item.item.as_ref() {
+                Some(doc::base_text_item::Item::ListItem(list_item)) => (
+                    list_item.marker.as_deref().expect("a marker"),
+                    list_item.enumerated,
+                ),
+                other => panic!("a list item, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(markers, [("-", false), ("-", false)]);
+        assert_eq!(base_of(&document.texts[0]).text, "first", "marker removed");
+        assert_eq!(
+            base_of(&document.texts[0]).label,
+            doc::DocItemLabel::ListItem as i32
+        );
+
+        // Prose after the list is not in it.
+        assert_eq!(
+            base_of(&document.texts[2]).parent.as_ref().unwrap().r#ref,
+            BODY_REF
+        );
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_numbered_list_is_an_ordered_group_and_keeps_its_numbers() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&page(1, "1. alpha\n2. beta\n"));
+        let document = fold.take();
+        assert_eq!(
+            document.groups[0].label,
+            doc::GroupLabel::OrderedList as i32
+        );
+        match document.texts[1].item.as_ref() {
+            Some(doc::base_text_item::Item::ListItem(list_item)) => {
+                assert!(list_item.enumerated);
+                assert_eq!(list_item.marker.as_deref(), Some("2."));
+            }
+            other => panic!("a list item, got {other:?}"),
+        }
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn switching_list_kind_starts_a_new_group() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&page(1, "- bullet\n1. number\n"));
+        let document = fold.take();
+        assert_eq!(document.groups.len(), 2, "two kinds of list, two groups");
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_dash_that_is_not_a_marker_is_prose() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&page(1, "-not a list\n"));
+        let document = fold.take();
+        assert!(document.groups.is_empty());
+        assert_eq!(
+            base_of(&document.texts[0]).label,
+            doc::DocItemLabel::Paragraph as i32
+        );
+    }
+
+    #[test]
+    fn a_fenced_block_becomes_a_code_item_without_its_fences() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&page(1, "```rust\nlet x = 1;\nlet y = 2;\n```\n"));
+        let document = fold.take();
+        match document.texts[0].item.as_ref() {
+            Some(doc::base_text_item::Item::Code(code)) => {
+                assert_eq!(code.text, "let x = 1;\nlet y = 2;");
+                assert_eq!(code.code_language_raw.as_deref(), Some("rust"));
+                assert_eq!(code.label, doc::DocItemLabel::Code as i32);
+                assert!(!code.text.contains("```"), "the fences are syntax");
+            }
+            other => panic!("a code item, got {other:?}"),
+        }
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_hash_inside_a_fence_is_code_not_a_heading() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&page(1, "```\n# not a heading\n```\n"));
+        let document = fold.take();
+        assert_eq!(document.texts.len(), 1);
+        assert!(matches!(
+            document.texts[0].item.as_ref(),
+            Some(doc::base_text_item::Item::Code(_))
+        ));
+    }
+
+    #[test]
+    fn a_flattened_table_becomes_a_grid_again() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Tables(pb::PageTables {
+            page_no: 1,
+            tables: vec![pb::TableRegion {
+                bbox: Some(pb::Rect {
+                    x: 100.0,
+                    y: 600.0,
+                    width: 200.0,
+                    height: 40.0,
+                }),
+                column_boundaries: vec![100.0, 200.0],
+                row_boundaries: vec![640.0, 620.0],
+                rows: vec![
+                    pb::TableCells {
+                        cells: vec!["Year".to_owned(), "Count".to_owned()],
+                    },
+                    pb::TableCells {
+                        cells: vec!["1843".to_owned(), "7".to_owned()],
+                    },
+                ],
+                kind: pb::TableKind::Data.into(),
+            }],
+        }));
+        fold.consume(&page(1, "| Year | Count |\n| 1843 | 7 |\n"));
+        let document = fold.take();
+
+        assert!(
+            document.texts.is_empty(),
+            "the pipe characters did not become a paragraph"
+        );
+        assert_eq!(document.tables.len(), 1);
+        let table = &document.tables[0];
+        assert_eq!(table.label, doc::DocItemLabel::Table as i32);
+        assert_eq!(table.prov[0].page_no, 1);
+
+        let data = table.data.as_ref().expect("a grid");
+        assert_eq!((data.num_rows, data.num_cols), (2, 2));
+        assert_eq!(data.table_cells.len(), 4);
+        assert_eq!(data.grid.len(), 2);
+        assert_eq!(data.table_cells[0].text, "Year");
+        assert!(data.table_cells[0].column_header, "the first row heads it");
+        assert!(!data.table_cells[2].column_header);
+
+        // Every cell is cut from the values the detector measured; the
+        // outermost edges close on the table's own extent.
+        let cell = data.table_cells[3].bbox.as_ref().expect("a cell box");
+        assert!((cell.l - 200.0).abs() < f64::EPSILON, "{cell:?}");
+        assert!((cell.r - 300.0).abs() < f64::EPSILON, "{cell:?}");
+        assert!((cell.b - 620.0).abs() < f64::EPSILON, "{cell:?}");
+        assert!((cell.t - 640.0).abs() < f64::EPSILON, "{cell:?}");
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_table_of_contents_is_labelled_as_one() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&pb::parse_pdf_response::Event::Tables(pb::PageTables {
+            page_no: 1,
+            tables: vec![pb::TableRegion {
+                rows: vec![pb::TableCells {
+                    cells: vec!["Chapter One".to_owned(), "3".to_owned()],
+                }],
+                kind: pb::TableKind::Contents.into(),
+                ..pb::TableRegion::default()
+            }],
+        }));
+        fold.consume(&page(1, "| Chapter One | 3 |\n| Chapter Two | 9 |\n"));
+        let document = fold.take();
+        assert_eq!(
+            document.tables[0].label,
+            doc::DocItemLabel::DocumentIndex as i32,
+            "a contents table is navigation, not data"
+        );
+        let data = document.tables[0].data.as_ref().expect("a grid");
+        assert!(
+            !data.table_cells[0].column_header,
+            "a contents table has no header row"
+        );
+    }
+
+    #[test]
+    fn pipe_characters_with_no_detected_grid_stay_a_paragraph() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&page(1, "| Year | Count |\n| 1843 | 7 |\n"));
+        let document = fold.take();
+        assert!(document.tables.is_empty(), "nothing was detected");
+        assert_eq!(document.texts.len(), 1, "so nothing was lost either");
+        assert!(base_of(&document.texts[0]).text.contains('|'));
+        assert_sound(&document);
     }
 
     #[test]

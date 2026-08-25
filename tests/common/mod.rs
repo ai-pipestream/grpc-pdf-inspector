@@ -490,6 +490,67 @@ pub fn tagged_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page PDF whose content is a grid of short cells in three
+/// columns and four rows, which is what a borderless data table is.
+///
+/// No rules are drawn: the columns are made of aligned text and nothing
+/// else, which is the case markdown can only render as pipe characters and
+/// the detector can render as a grid with coordinates.
+#[must_use]
+pub fn table_pdf() -> Vec<u8> {
+    const COLUMNS: [i32; 3] = [72, 240, 400];
+    const ROWS: [(&str, &str, &str); 4] = [
+        ("Year", "Engine", "Cards"),
+        ("1837", "Analytical", "Punched"),
+        ("1843", "Notes", "Woven"),
+        ("1854", "Difference", "None"),
+    ];
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut content = String::new();
+    for (index, (first, second, third)) in ROWS.iter().enumerate() {
+        let y = 700 - 24 * i32::try_from(index).expect("four rows fit in an i32");
+        for (column, text) in COLUMNS.iter().zip([first, second, third]) {
+            content.push_str(&format!("BT /F1 11 Tf {column} {y} Td ({text}) Tj ET\n"));
+        }
+    }
+
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {
@@ -647,6 +708,7 @@ pub fn shape(events: &[pb::parse_pdf_response::Event]) -> Vec<&'static str> {
             pb::parse_pdf_response::Event::Spans(_) => "spans",
             pb::parse_pdf_response::Event::Metadata(_) => "metadata",
             pb::parse_pdf_response::Event::Structure(_) => "structure",
+            pb::parse_pdf_response::Event::Tables(_) => "tables",
         })
         .collect()
 }
@@ -659,6 +721,19 @@ pub fn spans(events: &[pb::parse_pdf_response::Event]) -> Vec<&pb::PageSpans> {
         .iter()
         .filter_map(|event| match event {
             pb::parse_pdf_response::Event::Spans(spans) => Some(spans),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Every `tables` event, in the order received. Only when
+/// `options.emit_tables` was set, and only for pages that have one.
+#[must_use]
+pub fn tables(events: &[pb::parse_pdf_response::Event]) -> Vec<&pb::PageTables> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            pb::parse_pdf_response::Event::Tables(tables) => Some(tables),
             _ => None,
         })
         .collect()

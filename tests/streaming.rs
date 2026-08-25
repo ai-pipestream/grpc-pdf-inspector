@@ -127,6 +127,9 @@ async fn info_arrives_before_extraction_runs() {
             pb::parse_pdf_response::Event::Structure(_) => {
                 panic!("a `structure` event without `emit_structure`")
             }
+            pb::parse_pdf_response::Event::Tables(_) => {
+                panic!("a `tables` event without `emit_tables`")
+            }
         }
     }
     assert!(matches!(
