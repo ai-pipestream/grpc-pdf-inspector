@@ -7,7 +7,8 @@
 //! those runs by default, so `Document.pictures` was structurally always
 //! empty and `DOC_ITEM_LABEL_PICTURE` never appeared. A link annotation
 //! over a figure had nowhere to go at all: its rectangle covers no text, so
-//! no inline span can carry it.
+//! no inline span can carry it. It leaves the document as the picture's
+//! `hyperlink` and jumps back into it as the picture's `target`.
 
 mod common;
 
@@ -79,6 +80,7 @@ async fn the_fold_places_the_picture_and_hangs_the_region_link_on_it() {
         Some(FIGURE_LINK),
         "a link over a figure has nowhere else to go"
     );
+    assert!(picture.target.is_none(), "this one leads out, not in");
 
     // The picture is a child of whatever it sits under, like any item.
     let parent = &picture.parent.as_ref().expect("a parent").r#ref;
@@ -100,6 +102,37 @@ async fn the_fold_places_the_picture_and_hangs_the_region_link_on_it() {
             assert!(base.hyperlink.is_none(), "{:?}", base.text);
         }
     }
+}
+
+#[tokio::test]
+async fn a_figure_that_jumps_into_the_document_carries_a_target() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::illustrated_pdf_linking_inward(),
+            pb::PdfOptions {
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    let document = common::documents(&events)[0];
+    let picture = &document.pictures[0];
+    assert!(
+        picture.hyperlink.is_none(),
+        "a jump inside the document is not a URL"
+    );
+    assert_eq!(
+        picture.target.as_ref().expect("a target").r#ref,
+        "#/pages/2",
+        "the figure points at the page item the destination lands on"
+    );
+    assert!(
+        document.pages.contains_key(&2),
+        "and that item is one this fragment emitted"
+    );
 }
 
 #[tokio::test]

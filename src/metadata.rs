@@ -131,6 +131,12 @@ impl<'a> Reader<'a> {
         };
         let created_raw = text_of(info, b"CreationDate").unwrap_or_default();
         let modified_raw = text_of(info, b"ModDate").unwrap_or_default();
+        let trapped = info
+            .get(b"Trapped")
+            .ok()
+            .and_then(|object| object.as_name().ok())
+            .map(|name| String::from_utf8_lossy(name).into_owned())
+            .unwrap_or_default();
         pb::DocumentInfo {
             title: text_of(info, b"Title").unwrap_or_default(),
             authors: split_list(text_of(info, b"Author").as_deref()),
@@ -142,12 +148,8 @@ impl<'a> Reader<'a> {
             modified: timestamp(&modified_raw),
             created_raw,
             modified_raw,
-            trapped: info
-                .get(b"Trapped")
-                .ok()
-                .and_then(|object| object.as_name().ok())
-                .map(|name| String::from_utf8_lossy(name).into_owned())
-                .unwrap_or_default(),
+            trapped: trapped.clone(),
+            trapped_state: trapped_state(&trapped).into(),
         }
     }
 
@@ -696,6 +698,22 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// Map a `/Trapped` name onto the wire enum.
+///
+/// The format defines exactly three names. Anything else — and there is
+/// something else in the wild, because producers write what they like into
+/// the information dictionary — is UNSPECIFIED here and stays verbatim in
+/// `DocumentInfo.trapped`, so a name this build has never seen is reported
+/// rather than reinterpreted.
+fn trapped_state(name: &str) -> pb::Trapped {
+    match name {
+        "True" => pb::Trapped::True,
+        "False" => pb::Trapped::False,
+        "Unknown" => pb::Trapped::Unknown,
+        _ => pb::Trapped::Unspecified,
+    }
+}
+
 /// The name a destination is given by, when it is given by name.
 fn destination_name(destination: &Object) -> Option<String> {
     match destination {
@@ -925,6 +943,23 @@ mod tests {
         assert!(timestamp("").is_none());
         assert!(timestamp("today").is_none());
         assert!(timestamp("D:20241301").is_none(), "there is no month 13");
+    }
+
+    #[test]
+    fn the_three_trapping_names_are_typed_and_anything_else_is_not() {
+        assert_eq!(trapped_state("True"), pb::Trapped::True);
+        assert_eq!(trapped_state("False"), pb::Trapped::False);
+        assert_eq!(
+            trapped_state("Unknown"),
+            pb::Trapped::Unknown,
+            "declaring ignorance is a declaration"
+        );
+        assert_eq!(trapped_state(""), pb::Trapped::Unspecified);
+        assert_eq!(
+            trapped_state("Partial"),
+            pb::Trapped::Unspecified,
+            "a name the format does not define is not reinterpreted"
+        );
     }
 
     #[test]

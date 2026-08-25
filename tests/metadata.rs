@@ -59,7 +59,12 @@ async fn the_whole_information_dictionary_is_read_not_only_the_title() {
     assert_eq!(info.keywords, ["engine", "difference", "notes"]);
     assert_eq!(info.creator_tool, "An Authoring Application");
     assert_eq!(info.producer, "A PDF Writer 2.0");
-    assert_eq!(info.trapped, "False");
+    assert_eq!(info.trapped, "False", "the name the file spells");
+    assert_eq!(
+        info.trapped_state,
+        pb::Trapped::False as i32,
+        "and the same declaration, typed"
+    );
 
     // The dates are instants, with the file's own spelling kept beside
     // them so nothing is lost to the parse.
@@ -182,6 +187,36 @@ async fn named_destinations_and_internal_links_resolve_to_pages() {
 }
 
 #[tokio::test]
+async fn a_document_that_declares_no_trapping_is_not_reported_as_untrapped() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::text_pdf(1, 20, "untrapped-marker"),
+            pb::PdfOptions {
+                mode: pb::ProcessMode::DetectOnly.into(),
+                emit_metadata: true,
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the document should parse");
+
+    let info = common::metadata(&events).info.as_ref().expect("an info");
+    assert!(info.trapped.is_empty());
+    assert_eq!(info.trapped_state, pb::Trapped::Unspecified as i32);
+
+    let document = common::documents(&events)[0];
+    assert!(
+        document
+            .source_meta
+            .as_ref()
+            .is_none_or(|meta| meta.trapped.is_none()),
+        "saying nothing is not the same as saying no"
+    );
+}
+
+#[tokio::test]
 async fn the_fold_writes_the_metadata_the_schema_has_homes_for() {
     let events = parse(pb::PdfOptions {
         emit_document: true,
@@ -212,6 +247,11 @@ async fn the_fold_writes_the_metadata_the_schema_has_homes_for() {
         meta.raw_metadata.as_deref().map(|packet| &packet[..9]),
         Some(&b"<?xpacket"[..]),
         "the XMP packet travels verbatim"
+    );
+    assert_eq!(
+        meta.trapped,
+        Some(doc::Trapped::False as i32),
+        "the file declares that trapping was not applied"
     );
     let protection = meta.protection.as_ref().expect("a protection block");
     assert!(!protection.encrypted);

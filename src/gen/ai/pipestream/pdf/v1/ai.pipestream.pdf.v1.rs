@@ -403,9 +403,15 @@ pub struct DocumentInfo {
     /// The modification date exactly as written.
     #[prost(string, tag="10")]
     pub modified_raw: ::prost::alloc::string::String,
-    /// The `/Trapped` value: "True", "False" or "Unknown".
+    /// The `/Trapped` name exactly as the file spells it. Empty when the file
+    /// declares none.
     #[prost(string, tag="11")]
     pub trapped: ::prost::alloc::string::String,
+    /// The same declaration, typed. UNSPECIFIED both when the file declares
+    /// nothing and when it declares a name outside the three the format
+    /// defines, which `trapped` above still carries verbatim.
+    #[prost(enumeration="Trapped", tag="12")]
+    pub trapped_state: i32,
 }
 /// EncryptionInfo describes how the document is protected, whether or not
 /// the protection stopped this parse.
@@ -1112,6 +1118,51 @@ impl StructureRole {
             "STRUCTURE_ROLE_WARICHU" => Some(Self::Warichu),
             "STRUCTURE_ROLE_WT" => Some(Self::Wt),
             "STRUCTURE_ROLE_WP" => Some(Self::Wp),
+            _ => None,
+        }
+    }
+}
+/// Trapped is a document's declaration about whether trapping — the
+/// deliberate overlap of adjacent inks that hides press misregistration —
+/// has been applied to it.
+///
+/// Three-valued by definition: a prepress workflow needs to tell "trapping
+/// was done", "trapping was not done" and "nobody has decided yet" apart,
+/// and only the last of those is safe to guess at.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Trapped {
+    /// The document declares nothing, or declares a name the format does not
+    /// define.
+    Unspecified = 0,
+    /// Trapping has been applied. The file is ready to print as it stands.
+    True = 1,
+    /// Trapping has not been applied.
+    False = 2,
+    /// The document says explicitly that it does not know, which is not the
+    /// same as saying nothing.
+    Unknown = 3,
+}
+impl Trapped {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TRAPPED_UNSPECIFIED",
+            Self::True => "TRAPPED_TRUE",
+            Self::False => "TRAPPED_FALSE",
+            Self::Unknown => "TRAPPED_UNKNOWN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TRAPPED_UNSPECIFIED" => Some(Self::Unspecified),
+            "TRAPPED_TRUE" => Some(Self::True),
+            "TRAPPED_FALSE" => Some(Self::False),
+            "TRAPPED_UNKNOWN" => Some(Self::Unknown),
             _ => None,
         }
     }

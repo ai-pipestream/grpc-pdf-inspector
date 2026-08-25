@@ -94,7 +94,8 @@ and folio numbers the strippers remove, which used to vanish silently.
   file-format version, the catalog language, the tagged flag, the file
   identifier, the encryption posture, the outline, embedded file
   attachments, per-page boxes, rotation and page labels, named
-  destinations, and every link annotation with its destination resolved.
+  destinations, the trapping declaration, and every link annotation with
+  its destination resolved.
 
 ### The optional Document projection
 
@@ -121,7 +122,8 @@ collector's parse of the same document:
   the file's own `/ID`. Link annotations become `InlineSpan.hyperlink`
   over the anchored words, internal cross-references become
   `InlineSpan.target` pointing at the page they lead to, and a link over a
-  figure becomes that `PictureItem`'s `hyperlink`.
+  figure becomes that `PictureItem`'s `hyperlink` when it leads out of the
+  document or its `target` when it leads back into one.
 - Bold, italic, underline and strikeout become `InlineSpan.formatting`
   over the characters they actually cover, with the face and type size
   beside them, instead of `**` and `<u>` inside the text.

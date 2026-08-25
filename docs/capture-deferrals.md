@@ -45,12 +45,17 @@ Three reasons appear below and they are not interchangeable:
 | U24 file identifier | `PdfMetadata.file_id`, `DocumentOrigin.source_id` |
 | S3 formatting | `TextSpan` flags, `InlineSpan.formatting` / `.font_family` / `.font_size_pt` over the characters they cover |
 | D7 image placements | `SPAN_KIND_IMAGE` runs, `Document.pictures[]` with their boxes |
-| Links over non-text regions | `PictureItem.hyperlink` |
+| Links over non-text regions | `PictureItem.hyperlink` for external targets, `PictureItem.target` for internal ones |
 | U8 / U13 / U16 posture and identity, on the Document plane | `DocumentMeta.format_version` / `.structured` / `.authoring_tool` / `.subject` / `.protection` / `.raw_metadata` |
 | U15 / U23 page geometry and labels, on the Document plane | `PageItem.page_label` / `.media_size` / `.user_unit` |
+| Trapping declaration | `DocumentInfo.trapped` (verbatim) and `.trapped_state` (typed), `DocumentMeta.trapped` |
 | Version constant | derived from the manifest during const evaluation |
 
 ## Not reachable without an upstream change
+
+Four asks, and they are the whole of what this service cannot capture. Each
+one is data the parser crate computes and does not return; none of them can
+be fixed from here.
 
 **D18 — invisible text (render mode 3).** The content-stream walker
 recognises invisible text and takes a parameter controlling whether to keep
@@ -84,32 +89,24 @@ verdict from the runs it already has. Making the detector public would
 remove a whole read of the file from every FULL call. **Ask:** a public
 layout analyser over `&[TextItem]`.
 
-**D20 — detector page statistics.** Text-operator counts, image counts and
-area, distinct-character counts, path-operator counts and font-capability
-flags are computed and collapsed into one of four reason strings. Several
-are already marked dead inside the crate.
-
-**U4 — `pages_sampled` / `pages_with_text` / `ocr_recommended`.** These are
-on `PdfTypeResult`, which `process_pdf_mem_with_options` does not return.
-Reaching them means a second detection call; `pages_sampled` in particular
-would say how much of the document the confidence figure is based on.
-Deliberate deferral rather than an upstream ask.
+Two rows the audit listed here are not asks and belong below with the rest
+of the deliberate deferrals: **D20**, the detector's per-page statistics,
+which are collapsed into one of four reason strings and several of which
+the crate already marks dead; and **U4**, `pages_sampled` /
+`pages_with_text` / `ocr_recommended`, which are on `PdfTypeResult` and
+reachable with a second detection call this service chooses not to make.
 
 ## Needs a typed home in the Document schema
 
-Everything this ledger previously listed here landed in the canonical
-schema at gRParse `af1b769` and is wired: `DocumentMeta.format_version`,
-`.structured`, `.authoring_tool`, `.subject`, `.protection` (a `Protection`
-message) and `.raw_metadata`; `DocumentOrigin.source_id`;
+Nothing. Every row this ledger has carried under that heading landed in the
+canonical schema and is wired: `DocumentMeta.format_version`, `.structured`,
+`.authoring_tool`, `.subject`, `.protection`, `.raw_metadata` and `.trapped`
+(gRParse `af1b769` and `4f6ad0d`); `DocumentOrigin.source_id`;
 `PageItem.page_label`, `.media_size` and `.user_unit`;
-`PictureItem.hyperlink`.
+`PictureItem.hyperlink` and `.target`.
 
-One row is left, and it is small:
-
-| Datum | Event-plane field | Shape it wants |
-|---|---|---|
-| Trapping state | `DocumentInfo.trapped` | A `Trapped` enum on `DocumentMeta`. `extra` is the wrong shape for a three-valued vocabulary, and the return is small enough that it has not been asked for. |
-| An internal destination over a picture | `LinkTarget.dest_page_no` on an annotation whose rectangle covers only an image | `PictureItem.target` (`FineRef`), mirroring `InlineSpan.target`. `PictureItem` has a hyperlink and no target, so a figure that jumps into the document rather than out of it is dropped. |
+What is left to capture is the four asks above, and they are all inside the
+parser crate.
 
 ## Deliberate, and cheap to add later
 
@@ -126,6 +123,9 @@ One row is left, and it is small:
   reader this service now has could read all four off the XObject
   dictionary; the pixel bytes would need a decoder the default build does
   not link, and `ImageRef` stays unset until then.
+- **U4 detector sampling statistics.** `pages_sampled` in particular would
+  say how much of the document the confidence figure is actually based on.
+  It costs a second detection call.
 - **U5 page-count estimate for unparseable files.** A byte-scan estimate
   exists and the failure path returns `INVALID_ARGUMENT` and nothing else.
 - **U7 region-scoped re-asks.** A coordinator holding a box from another

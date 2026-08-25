@@ -675,8 +675,37 @@ message DocumentInfo {
   // The modification date exactly as written.
   string modified_raw = 10;
 
-  // The `/Trapped` value: "True", "False" or "Unknown".
+  // The `/Trapped` name exactly as the file spells it. Empty when the file
+  // declares none.
   string trapped = 11;
+
+  // The same declaration, typed. UNSPECIFIED both when the file declares
+  // nothing and when it declares a name outside the three the format
+  // defines, which `trapped` above still carries verbatim.
+  Trapped trapped_state = 12;
+}
+
+// Trapped is a document's declaration about whether trapping — the
+// deliberate overlap of adjacent inks that hides press misregistration —
+// has been applied to it.
+//
+// Three-valued by definition: a prepress workflow needs to tell "trapping
+// was done", "trapping was not done" and "nobody has decided yet" apart,
+// and only the last of those is safe to guess at.
+enum Trapped {
+  // The document declares nothing, or declares a name the format does not
+  // define.
+  TRAPPED_UNSPECIFIED = 0;
+
+  // Trapping has been applied. The file is ready to print as it stands.
+  TRAPPED_TRUE = 1;
+
+  // Trapping has not been applied.
+  TRAPPED_FALSE = 2;
+
+  // The document says explicitly that it does not know, which is not the
+  // same as saying nothing.
+  TRAPPED_UNKNOWN = 3;
 }
 
 // EncryptionInfo describes how the document is protected, whether or not

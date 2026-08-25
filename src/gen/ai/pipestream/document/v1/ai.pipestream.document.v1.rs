@@ -949,6 +949,10 @@ pub struct PictureItem {
     /// upstream dialect).
     #[prost(string, optional, tag="17")]
     pub hyperlink: ::core::option::Option<::prost::alloc::string::String>,
+    /// An internal destination covering this picture's region: a figure that
+    /// jumps into the document rather than out of it.
+    #[prost(message, optional, tag="18")]
+    pub target: ::core::option::Option<FineRef>,
 }
 /// PictureMeta contains rich metadata for pictures, including AI analysis.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1585,6 +1589,10 @@ pub struct DocumentMeta {
     /// The source's raw embedded metadata packet (XMP), verbatim bytes.
     #[prost(bytes="vec", optional, tag="33")]
     pub raw_metadata: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// The source's trapping declaration, three-valued as the format defines
+    /// it.
+    #[prost(enumeration="Trapped", optional, tag="34")]
+    pub trapped: ::core::option::Option<i32>,
     /// Source metadata that is genuinely open vocabulary. Data whose shape the
     /// fleet knows gets a typed field, never an entry here.
     #[prost(map="string, string", tag="100")]
@@ -3666,6 +3674,39 @@ impl VerticalAlignment {
             "VERTICAL_ALIGNMENT_TOP" => Some(Self::Top),
             "VERTICAL_ALIGNMENT_MIDDLE" => Some(Self::Middle),
             "VERTICAL_ALIGNMENT_BOTTOM" => Some(Self::Bottom),
+            _ => None,
+        }
+    }
+}
+/// Trapped is a source's own three-valued trapping declaration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum Trapped {
+    Unspecified = 0,
+    True = 1,
+    False = 2,
+    Unknown = 3,
+}
+impl Trapped {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TRAPPED_UNSPECIFIED",
+            Self::True => "TRAPPED_TRUE",
+            Self::False => "TRAPPED_FALSE",
+            Self::Unknown => "TRAPPED_UNKNOWN",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TRAPPED_UNSPECIFIED" => Some(Self::Unspecified),
+            "TRAPPED_TRUE" => Some(Self::True),
+            "TRAPPED_FALSE" => Some(Self::False),
+            "TRAPPED_UNKNOWN" => Some(Self::Unknown),
             _ => None,
         }
     }

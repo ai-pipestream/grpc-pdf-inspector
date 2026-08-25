@@ -687,6 +687,31 @@ pub fn styled_pdf() -> Vec<u8> {
 /// anchor text — the case that has nowhere to go except onto the picture.
 #[must_use]
 pub fn illustrated_pdf(uri: &str) -> Vec<u8> {
+    illustrated(FigureLink::External(uri))
+}
+
+/// The same page, but the annotation over the figure jumps to a second
+/// page of the same document instead of out of it.
+///
+/// A figure that leads into the document rather than out of it is the case
+/// with nowhere to go until `PictureItem` grew a target: a hyperlink cannot
+/// hold it and no inline span can either, because the rectangle covers no
+/// words.
+#[must_use]
+pub fn illustrated_pdf_linking_inward() -> Vec<u8> {
+    illustrated(FigureLink::Internal)
+}
+
+/// Where the annotation over the figure leads.
+enum FigureLink<'a> {
+    /// Out of the document, to a URI.
+    External(&'a str),
+    /// Into the document, to its second page.
+    Internal,
+}
+
+/// Build the illustrated fixture with the given annotation action.
+fn illustrated(link: FigureLink<'_>) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -716,36 +741,67 @@ pub fn illustrated_pdf(uri: &str) -> Vec<u8> {
             "BT /F1 11 Tf 72 {y} Td (Body line {line} of the article, long enough that the page reads as prose rather than as a picture.) Tj ET\n"
         ));
     }
-
     let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
-    let annotation_id = doc.add_object(dictionary! {
+
+    // An internal destination needs somewhere to land, so that arm gets a
+    // second page. The external arm keeps the one-page document it had.
+    let page_id = doc.new_object_id();
+    let mut kids = vec![Object::Reference(page_id)];
+    let mut annotation = dictionary! {
         "Type" => "Annot",
         "Subtype" => "Link",
         "Rect" => vec![72.into(), 120.into(), 192.into(), 200.into()],
-        "A" => dictionary! {
-            "Type" => "Action",
-            "S" => "URI",
-            "URI" => Object::string_literal(uri),
-        },
-    });
+    };
+    match link {
+        FigureLink::External(uri) => annotation.set(
+            "A",
+            dictionary! {
+                "Type" => "Action",
+                "S" => "URI",
+                "URI" => Object::string_literal(uri),
+            },
+        ),
+        FigureLink::Internal => {
+            let second_content = doc.add_object(Stream::new(
+                dictionary! {},
+                b"BT /F1 11 Tf 72 700 Td (The page the figure leads to.) Tj ET".to_vec(),
+            ));
+            let second_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => dictionary! {
+                    "Font" => dictionary! { "F1" => font_id },
+                },
+                "Contents" => second_content,
+            });
+            kids.push(Object::Reference(second_id));
+            annotation.set("Dest", vec![Object::Reference(second_id), "Fit".into()]);
+        }
+    }
+    let annotation_id = doc.add_object(annotation);
 
-    let page_id = doc.add_object(dictionary! {
-        "Type" => "Page",
-        "Parent" => pages_id,
-        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
-        "Resources" => dictionary! {
-            "Font" => dictionary! { "F1" => font_id },
-            "XObject" => dictionary! { "Im1" => image_id },
-        },
-        "Contents" => content_id,
-        "Annots" => vec![Object::Reference(annotation_id)],
-    });
+    doc.objects.insert(
+        page_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+                "XObject" => dictionary! { "Im1" => image_id },
+            },
+            "Contents" => content_id,
+            "Annots" => vec![Object::Reference(annotation_id)],
+        }),
+    );
+    let count = kids.len() as i64;
     doc.objects.insert(
         pages_id,
         Object::Dictionary(dictionary! {
             "Type" => "Pages",
-            "Kids" => vec![Object::Reference(page_id)],
-            "Count" => 1,
+            "Kids" => kids,
+            "Count" => count,
         }),
     );
     let catalog_id = doc.add_object(dictionary! {

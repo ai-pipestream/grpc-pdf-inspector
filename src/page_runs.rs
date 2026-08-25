@@ -147,18 +147,28 @@ impl PageRuns {
     pub fn pictures(&self) -> Vec<Picture> {
         self.images
             .iter()
-            .map(|&index| Picture {
-                bbox: self.boxes[index].clone(),
-                hyperlink: match self
+            .map(|&index| {
+                let anchor = self
                     .styles
                     .get(index)
-                    .and_then(|style| style.anchor.as_ref())
-                {
-                    Some(Anchor::External(uri)) => Some(uri.clone()),
-                    // An internal destination over a picture has nowhere to
-                    // go: PictureItem carries a hyperlink and no target.
-                    _ => None,
-                },
+                    .and_then(|style| style.anchor.as_ref());
+                Picture {
+                    bbox: self.boxes[index].clone(),
+                    hyperlink: match anchor {
+                        Some(Anchor::External(uri)) => Some(uri.clone()),
+                        _ => None,
+                    },
+                    // An internal destination resolves the same way an
+                    // anchored one does: onto the page item it lands on,
+                    // which is an item of this fragment.
+                    target: match anchor {
+                        Some(Anchor::Internal(page_no)) => Some(doc::FineRef {
+                            r#ref: page_ref(*page_no),
+                            range: None,
+                        }),
+                        _ => None,
+                    },
+                }
             })
             .collect()
     }
@@ -305,8 +315,11 @@ impl PageRuns {
 pub struct Picture {
     /// Where the image was drawn.
     pub bbox: doc::BoundingBox,
-    /// A link annotation covering it, when one does.
+    /// An external link annotation covering it, when one does.
     pub hyperlink: Option<String>,
+    /// An internal destination covering it: a figure that jumps into the
+    /// document rather than out of it.
+    pub target: Option<doc::FineRef>,
 }
 
 /// One block of text, located among the runs that produced it.
@@ -845,6 +858,7 @@ mod tests {
         assert!((pictures[0].bbox.l - 72.0).abs() < f64::EPSILON);
         assert!((pictures[0].bbox.t - 200.0).abs() < f64::EPSILON);
         assert!(pictures[0].hyperlink.is_none(), "nothing links to it");
+        assert!(pictures[0].target.is_none());
     }
 
     #[test]
@@ -868,6 +882,39 @@ mod tests {
         assert_eq!(
             runs.pictures()[0].hyperlink.as_deref(),
             Some("https://example.invalid/figure")
+        );
+        assert!(runs.pictures()[0].target.is_none(), "out, not in");
+    }
+
+    #[test]
+    fn an_internal_destination_over_a_picture_lands_on_the_picture() {
+        let mut image = span("[Image: Im1]", 72.0, 120.0, pb::SpanKind::Image);
+        image.bbox = Some(pb::Rect {
+            x: 72.0,
+            y: 120.0,
+            width: 120.0,
+            height: 80.0,
+        });
+        let internal = [pb::LinkTarget {
+            page_no: 1,
+            rect: Some(pb::Rect {
+                x: 70.0,
+                y: 118.0,
+                width: 124.0,
+                height: 84.0,
+            }),
+            dest_page_no: 4,
+            ..pb::LinkTarget::default()
+        }];
+        let runs = PageRuns::new(&page(vec![image]), &internal, None);
+        let pictures = runs.pictures();
+        assert_eq!(
+            pictures[0].target.as_ref().expect("a target").r#ref,
+            "#/pages/4"
+        );
+        assert!(
+            pictures[0].hyperlink.is_none(),
+            "a jump inside the document is not a URL"
         );
     }
 

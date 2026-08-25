@@ -1047,6 +1047,9 @@ message PictureItem {
   // A link target covering this picture's region (extension beyond the
   // upstream dialect).
   optional string hyperlink = 17;
+  // An internal destination covering this picture's region: a figure that
+  // jumps into the document rather than out of it.
+  optional FineRef target = 18;
 }
 
 // PictureMeta contains rich metadata for pictures, including AI analysis.
@@ -1495,6 +1498,9 @@ message DocumentMeta {
   optional Protection protection = 32;
   // The source's raw embedded metadata packet (XMP), verbatim bytes.
   optional bytes raw_metadata = 33;
+  // The source's trapping declaration, three-valued as the format defines
+  // it.
+  optional Trapped trapped = 34;
   // Source metadata that is genuinely open vocabulary. Data whose shape the
   // fleet knows gets a typed field, never an entry here.
   map<string, string> extra = 100;
@@ -1819,6 +1825,14 @@ message IndexMeta {
   // The source's index service or kind name.
   optional string service = 1;
   optional string title = 2;
+}
+
+// Trapped is a source's own three-valued trapping declaration.
+enum Trapped {
+  TRAPPED_UNSPECIFIED = 0;
+  TRAPPED_TRUE = 1;
+  TRAPPED_FALSE = 2;
+  TRAPPED_UNKNOWN = 3;
 }
 
 // Protection is the source's own protection posture, as facts rather than

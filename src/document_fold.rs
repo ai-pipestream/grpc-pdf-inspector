@@ -28,8 +28,9 @@
 //!   invented: a page whose box was never read has no size.
 //! - **Pictures are placed.** Every image the page drew becomes a
 //!   `PictureItem` with the box the content stream put it at, and a link
-//!   annotation over that box becomes its `hyperlink`. Its bytes are not
-//!   decoded, so `image` stays unset.
+//!   annotation over that box becomes its `hyperlink` when it leads out of
+//!   the document and its `target` when it leads back into one. Its bytes
+//!   are not decoded, so `image` stays unset.
 //! - **Furniture is reported, not deleted.** Repeated headers, footers and
 //!   folio numbers are stripped from the body by default and used to
 //!   vanish. When the stream reports them they go into the furniture group
@@ -273,6 +274,10 @@ impl DocumentFold {
                 // than inferred.
                 structured: Some(metadata.tagged),
                 protection: metadata.encryption.as_ref().map(protection),
+                // Three-valued by definition: "not trapped" and "nobody has
+                // decided" are different answers and only one of them is
+                // safe to assume.
+                trapped: trapped(info).map(Into::into),
                 // The source's own metadata packet, verbatim: no dialect is
                 // imposed on it by copying it.
                 raw_metadata: (!metadata.xmp_packet.is_empty())
@@ -497,10 +502,12 @@ impl DocumentFold {
                 content_layer: doc::ContentLayer::Body as i32,
                 label: doc::DocItemLabel::Picture as i32,
                 prov: provenance(page_no, Some(picture.bbox)),
-                // A link annotation over the picture's region. The bytes of
-                // the image are not decoded here, so `image` stays unset
+                // A link annotation over the picture's region: out of the
+                // document as a hyperlink, into it as a target. The bytes
+                // of the image are not decoded here, so `image` stays unset
                 // rather than describing something this pass did not read.
                 hyperlink: picture.hyperlink,
+                target: picture.target,
                 source: vec![doc::SourceType {
                     source: Some(doc::source_type::Source::Collector(self.source.clone())),
                 }],
@@ -1072,6 +1079,21 @@ fn group(self_ref: &str, layer: doc::ContentLayer) -> doc::GroupItem {
         self_ref: self_ref.to_owned(),
         content_layer: layer as i32,
         ..doc::GroupItem::default()
+    }
+}
+
+/// The document's trapping declaration, when it makes one.
+///
+/// A file that says nothing is left unset rather than reported as
+/// untrapped: "trapping was not applied" and "nobody has decided" are
+/// different answers to a prepress workflow, and the schema's UNSPECIFIED
+/// is the third.
+fn trapped(info: &pb::DocumentInfo) -> Option<doc::Trapped> {
+    match pb::Trapped::try_from(info.trapped_state) {
+        Ok(pb::Trapped::True) => Some(doc::Trapped::True),
+        Ok(pb::Trapped::False) => Some(doc::Trapped::False),
+        Ok(pb::Trapped::Unknown) => Some(doc::Trapped::Unknown),
+        _ => None,
     }
 }
 
