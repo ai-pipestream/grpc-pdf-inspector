@@ -50,15 +50,16 @@ pub use detector::{
     detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
 };
 pub use extractor::{
-    extract_text, extract_text_with_positions, extract_text_with_positions_mem,
-    extract_text_with_positions_pages, extract_text_with_positions_pages_with_password,
+    extract_text, extract_text_with_positions, extract_text_with_positions_and_rects_mem,
+    extract_text_with_positions_mem, extract_text_with_positions_pages,
+    extract_text_with_positions_pages_with_password,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
-pub use types::{LayoutComplexity, PdfLine, PdfRect, TextItem};
+pub use types::{LayoutComplexity, PageExtraction, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};

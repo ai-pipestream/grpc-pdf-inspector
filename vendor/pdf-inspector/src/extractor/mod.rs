@@ -134,6 +134,23 @@ pub fn extract_text_with_positions_mem_pages(
     Ok(items)
 }
 
+/// Extract text with positions, plus the rectangles and line segments the
+/// selected pages drew, from a memory buffer.
+///
+/// The rects come from `re` operators and the lines from path operators.
+/// Together they are the vector geometry the rect- and line-driven table
+/// detectors run on: [`crate::tables::detect_tables_from_rects`] and
+/// [`crate::tables::detect_tables_from_lines`] are public and take exactly
+/// these, so without this accessor a caller could only reach the heuristic
+/// detector and a table drawn with real rules was detected no better than a
+/// borderless one.
+pub fn extract_text_with_positions_and_rects_mem(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<PageExtraction, PdfError> {
+    extract_text_with_positions_mem_and_rects(buffer, page_filter)
+}
+
 /// Extract text with positions and rectangles from memory buffer.
 pub(crate) fn extract_text_with_positions_mem_and_rects(
     buffer: &[u8],
