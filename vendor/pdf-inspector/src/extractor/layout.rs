@@ -8,9 +8,11 @@ use log::debug;
 
 /// Represents a column region on a page
 #[derive(Debug, Clone)]
-pub(crate) struct ColumnRegion {
-    pub(crate) x_min: f32,
-    pub(crate) x_max: f32,
+pub struct ColumnRegion {
+    /// Left edge of the column, in page points.
+    pub x_min: f32,
+    /// Right edge of the column, in page points.
+    pub x_max: f32,
 }
 
 /// Detect column boundaries on a page using a horizontal projection profile.
@@ -18,11 +20,16 @@ pub(crate) struct ColumnRegion {
 /// Builds an occupancy histogram across the page width and finds empty valleys
 /// (gutters) where no text exists. Validates valleys with vertical consistency
 /// checks to avoid false positives.
-pub(crate) fn detect_columns(
-    items: &[TextItem],
-    page: u32,
-    page_has_table: bool,
-) -> Vec<ColumnRegion> {
+///
+/// `items` may hold the whole document's runs; only those whose `page` is
+/// `page` are read. `page_has_table` suppresses the gutters a table's own
+/// column spacing would otherwise produce, so pass the table detectors'
+/// verdict for this page.
+///
+/// Two or more regions is what `LayoutComplexity::pages_with_columns`
+/// counts, so a caller holding extracted items can reach that verdict
+/// without a second read of the file.
+pub fn detect_columns(items: &[TextItem], page: u32, page_has_table: bool) -> Vec<ColumnRegion> {
     const BIN_WIDTH: f32 = 2.0;
     const MIN_GUTTER_WIDTH: f32 = 8.0;
     const MIN_VERTICAL_SPAN_RATIO: f32 = 0.30;

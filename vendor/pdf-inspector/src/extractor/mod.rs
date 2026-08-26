@@ -28,7 +28,7 @@ use links::{extract_form_fields, extract_page_links};
 pub use crate::text_utils::{is_bold_font, is_italic_font};
 pub use crate::types::{ItemType, TextLine};
 pub(crate) use fonts::FontStyleCache;
-pub(crate) use layout::detect_columns;
+pub use layout::detect_columns;
 #[cfg(test)]
 use layout::filter_markdown_page_numbers;
 pub(crate) use layout::filter_markdown_page_numbers_with_removed_pages;
@@ -36,7 +36,7 @@ pub(crate) use layout::group_into_lines_with_thresholds;
 pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_charts;
 pub(crate) use layout::group_prefiltered_items_into_lines_with_thresholds_and_regions;
 pub(crate) use layout::is_newspaper_layout;
-pub(crate) use layout::ColumnRegion;
+pub use layout::ColumnRegion;
 pub use layout::{group_into_lines, group_into_lines_preserving_all_text};
 pub(crate) use xobjects::FormWalkBudget;
 
