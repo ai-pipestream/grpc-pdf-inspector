@@ -13,10 +13,16 @@ rust-version = "1.88"
 publish = false # Server binary; not a library for crates.io.
 
 [dependencies]
-# firecrawl's MIT-licensed PDF classifier/extractor. Default features only:
-# pure Rust (lopdf + rayon), no models, no ONNX. The firecrawl monorepo itself
-# is AGPL and is never touched; this is the published crate only.
-pdf-inspector = "1.17.0"
+# firecrawl's MIT-licensed PDF classifier/extractor, vendored under
+# `vendor/pdf-inspector` and patched there. Default features only: pure Rust
+# (lopdf + rayon), no models, no ONNX. The firecrawl monorepo itself is AGPL
+# and is never touched; this is the published 1.17.0 crate only.
+#
+# It is vendored rather than depended on from crates.io because four things
+# this service must capture are computed inside it and not returned by any
+# public API. `vendor/pdf-inspector/README.md` names them and
+# `docs/capture-deferrals.md` records the patch for each.
+pdf-inspector = { path = "vendor/pdf-inspector" }
 # The document's own dictionaries: the information dictionary, the XMP
 # packet, the outline, embedded files, per-page boxes and the link
 # annotations' destinations. pdf-inspector reads none of them and does not

@@ -14,40 +14,58 @@
 //! dev-time, the image has no protoc and no build tooling). What is left is
 //! the manifest itself, which `include_str!` makes available to `const`
 //! evaluation. Everything below therefore runs at compile time, allocates
-//! nothing, and fails the build rather than the parse when the dependency
-//! line it expects is not there.
+//! nothing, and fails the build rather than the parse when the line it
+//! expects is not there.
+//!
+//! The manifest it reads is the *vendored crate's* own, because that is
+//! where the version of the linked parser is now stated: this service
+//! depends on `vendor/pdf-inspector` by path, and a path dependency carries
+//! no version in the depending manifest to read.
 
 /// The name of the parser crate this build links.
 pub const PARSER_CRATE: &str = "pdf-inspector";
 
-/// This crate's own manifest, the source of truth for the version below.
-const MANIFEST: &str = include_str!("../Cargo.toml");
+/// The vendored parser's own manifest, the source of truth for the version
+/// below.
+const MANIFEST: &str = include_str!("../vendor/pdf-inspector/Cargo.toml");
 
-/// Version of the parser this build links, read out of `Cargo.toml`.
+/// Version of the parser this build links, read out of the vendored crate's
+/// manifest.
 ///
-/// The dependency is declared as an exact version rather than a caret
-/// range, so the requirement string and the linked version are the same
-/// thing; a range would make this a lie of a different shape and is worth
-/// failing on if it ever appears.
-pub const PARSER_VERSION: &str = dependency_version(MANIFEST, PARSER_CRATE);
+/// It is the released version the vendored copy was taken from. The patches
+/// applied on top of it (see `vendor/pdf-inspector/README.md`) are additive
+/// visibility changes: they make the crate return data it already computed
+/// and change nothing it parses, so the version still names the parser's
+/// behaviour honestly.
+pub const PARSER_VERSION: &str = manifest_value(MANIFEST, "version");
+
+/// The vendored manifest describes the crate this build claims to link.
+///
+/// A copy of some other crate landing in `vendor/pdf-inspector` would
+/// otherwise be reported under this crate's name; this fails the build
+/// instead.
+const _: () = assert!(
+    equal(manifest_value(MANIFEST, "name"), PARSER_CRATE),
+    "vendor/pdf-inspector holds a crate other than pdf-inspector"
+);
 
 /// Name and version of the parser this build links, attached to every
 /// Document item's `CollectorSource.model`.
 pub const PARSER: &str = joined();
 
-/// Find `\n<crate> = "` in `manifest` and return the version literal that
+/// Find `\n<key> = "` in `manifest` and return the string literal that
 /// follows it.
 ///
-/// A `const fn`, so a manifest that does not declare the dependency the way
-/// this expects (a renamed key, a table-form `{ version = ... }`, a caret
-/// range) is a compile error naming the problem, not a runtime surprise.
-const fn dependency_version<'a>(manifest: &'a str, crate_name: &str) -> &'a str {
+/// A `const fn`, so a manifest that does not state the key the way this
+/// expects (a renamed key, a table-form `{ version = ... }`, a caret range)
+/// is a compile error naming the problem, not a runtime surprise.
+const fn manifest_value<'a>(manifest: &'a str, key: &str) -> &'a str {
     let manifest = manifest.as_bytes();
-    let start = match declaration_end(manifest, crate_name.as_bytes()) {
+    let start = match declaration_end(manifest, key.as_bytes()) {
         Some(start) => start,
         None => panic!(
-            "Cargo.toml no longer declares the parser as `<crate> = \"<version>\"`; \
-             update src/parser_version.rs to match how it is declared now"
+            "the vendored parser's Cargo.toml no longer states `<key> = \"<value>\"`; \
+             update src/parser_version.rs to match how it is stated now"
         ),
     };
     let mut end = start;
@@ -60,8 +78,8 @@ const fn dependency_version<'a>(manifest: &'a str, crate_name: &str) -> &'a str 
                 manifest[end],
                 b'^' | b'~' | b'*' | b'=' | b'<' | b'>' | b','
             ),
-            "the parser dependency must be pinned to an exact version so the \
-             model string names what is actually linked"
+            "the parser's version must be an exact one so the model string \
+             names what is actually linked"
         );
         end += 1;
     }
@@ -98,6 +116,24 @@ const fn starts_with(haystack: &[u8], at: usize, needle: &[u8]) -> bool {
             return false;
         }
         index += 1;
+    }
+    true
+}
+
+/// Whether two strings hold the same bytes.
+///
+/// `str`'s own `==` is not usable in `const` evaluation.
+const fn equal(left: &str, right: &str) -> bool {
+    let (left, right) = (left.as_bytes(), right.as_bytes());
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut at = 0;
+    while at < left.len() {
+        if left[at] != right[at] {
+            return false;
+        }
+        at += 1;
     }
     true
 }
@@ -151,13 +187,18 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_parser_version_is_the_one_the_manifest_declares() {
+    fn the_parser_version_is_the_one_the_vendored_manifest_states() {
         let declared = MANIFEST
             .lines()
-            .find_map(|line| line.strip_prefix("pdf-inspector = \""))
+            .find_map(|line| line.strip_prefix("version = \""))
             .and_then(|rest| rest.split('"').next())
-            .expect("the manifest declares the parser dependency");
+            .expect("the vendored manifest states the crate's version");
         assert_eq!(PARSER_VERSION, declared);
+    }
+
+    #[test]
+    fn the_vendored_crate_is_the_parser_this_service_names() {
+        assert_eq!(manifest_value(MANIFEST, "name"), PARSER_CRATE);
     }
 
     #[test]
@@ -171,12 +212,9 @@ mod tests {
 
     #[test]
     fn a_declaration_that_is_not_an_exact_pin_is_found() {
-        // The reader anchors on `\n<name> = "`, so a table-form or renamed
+        // The reader anchors on `\n<key> = "`, so a table-form or renamed
         // declaration is not silently read as something else.
-        assert_eq!(
-            dependency_version("\nthing = \"2.0.1\"\n", "thing"),
-            "2.0.1"
-        );
+        assert_eq!(manifest_value("\nthing = \"2.0.1\"\n", "thing"), "2.0.1");
         assert_eq!(
             declaration_end(b"\nthing = { version = \"2\" }", b"thing"),
             None

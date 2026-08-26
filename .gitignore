@@ -1,5 +1,8 @@
 # --- Rust build output ---
 /target
+# Building the vendored crate on its own manifest puts a target tree beside
+# its sources. Nothing in it is source.
+/vendor/*/target
 debug
 **/*.rs.bk
 *.pdb
