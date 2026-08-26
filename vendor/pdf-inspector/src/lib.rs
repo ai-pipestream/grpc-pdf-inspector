@@ -39,7 +39,7 @@ pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
 pub mod tables;
-mod text_quality;
+pub mod text_quality;
 pub mod text_utils;
 pub mod tounicode;
 pub mod types;
@@ -60,15 +60,16 @@ pub use markdown::{
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
 pub use process_mode::ProcessMode;
+pub use text_quality::{
+    analyze_text_quality, detect_encoding_issues, LetterFrequencyScore, TextQualityReport,
+    MIN_LETTERS_FOR_GARBLE_SCORE,
+};
 pub use types::{LayoutComplexity, PageExtraction, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
-use text_quality::{
-    analyze_text_quality, detect_encoding_issues, is_cid_garbage, is_garbage_text,
-    region_items_have_decoding_issue,
-};
+use text_quality::{is_cid_garbage, is_garbage_text, region_items_have_decoding_issue};
 use tounicode::FontCMaps;
 
 #[cfg(not(target_arch = "wasm32"))]

@@ -37,7 +37,7 @@ use std::collections::BTreeMap;
 ///    - More than 50% of `$` are between letters (clear substitution pattern), OR
 ///    - More than 20 letter-dollar-letter occurrences (even if some `$` are also
 ///      used as trailing/leading separators, 20+ is far beyond normal financial text).
-pub(crate) fn detect_encoding_issues(markdown: &str) -> bool {
+pub fn detect_encoding_issues(markdown: &str) -> bool {
     // Heuristic 1: U+FFFD replacement characters
     if markdown.contains('\u{FFFD}') {
         return true;
@@ -189,7 +189,7 @@ impl CipherGarbleStats {
     /// schematic), case-shift rate 0.021, cosine 0.801.
     fn looks_garbled(&self) -> bool {
         // Need a statistically meaningful, Latin-dominant sample.
-        if self.ascii_letters < 200
+        if self.ascii_letters < MIN_LETTERS_FOR_GARBLE_SCORE
             || self.non_latin_letters > self.ascii_letters + self.latin_ext_letters
         {
             return false;
@@ -223,13 +223,81 @@ impl CipherGarbleStats {
 
         case_shifts || permuted_language
     }
+
+    /// The letter statistics as a caller sees them.
+    fn score(&self) -> LetterFrequencyScore {
+        LetterFrequencyScore {
+            ascii_letters: self.ascii_letters,
+            english_cosine: self.english_cosine(),
+            english_shape_cosine: self.english_shape_cosine(),
+            looks_garbled: self.looks_garbled(),
+        }
+    }
 }
 
+/// Fewest ASCII letters a page must contribute before its letter statistics
+/// mean anything.
+///
+/// Below this the ratios are noise: a caption or a folio number can be a
+/// long way from any language's letter distribution without being garbled,
+/// so the verdict never fires and a caller reporting a score should say
+/// nothing rather than report one.
+pub const MIN_LETTERS_FOR_GARBLE_SCORE: usize = 200;
+
+/// One page's letter-frequency evidence: the correlation that separates
+/// substitution-cipher garble from natural text, and the verdict it feeds.
+///
+/// A broken ToUnicode CMap shifts every character by a per-range constant,
+/// so `Certificate` extracts as `8VceZWZTReV`: printable ASCII, word-like
+/// token lengths, no replacement characters, and a letter histogram that is
+/// a permutation of a natural one. That is what these two numbers measure,
+/// and until they were public only the boolean they produce escaped the
+/// crate.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct LetterFrequencyScore {
+    /// ASCII letters the page's runs contributed. Compare against
+    /// [`MIN_LETTERS_FOR_GARBLE_SCORE`] before reading anything into the
+    /// rest.
+    pub ascii_letters: usize,
+    /// Cosine similarity between the page's letter histogram and English
+    /// letter frequencies, which every Latin-script language in the crate's
+    /// eval corpus scores at least 0.80 against. Substitution-cipher text
+    /// scores around 0.53. 1.0 for a page with no ASCII letters at all.
+    pub english_cosine: f64,
+    /// The same comparison with both histograms sorted descending, so it
+    /// measures the *shape* of the frequency profile and ignores which
+    /// letter sits where. A substitution cipher is a bijection and
+    /// preserves this exactly; non-linguistic ASCII (hex dumps, DNA) does
+    /// not.
+    pub english_shape_cosine: f64,
+    /// Whether this page's statistics fire the crate's own garble verdict,
+    /// which is [`MIN_LETTERS_FOR_GARBLE_SCORE`], a Latin-dominance check,
+    /// a vowel-ratio floor and the two cosines above taken together.
+    pub looks_garbled: bool,
+}
+
+impl LetterFrequencyScore {
+    /// Whether the page contributed enough letters for the statistics to
+    /// carry information.
+    #[must_use]
+    pub const fn is_measurable(&self) -> bool {
+        self.ascii_letters >= MIN_LETTERS_FOR_GARBLE_SCORE
+    }
+}
+
+/// What [`analyze_text_quality`] concluded about a set of extracted items.
 #[derive(Debug, Default)]
-pub(crate) struct TextQualityReport {
-    pub(crate) pages_needing_ocr: Vec<u32>,
-    pub(crate) has_encoding_issues: bool,
-    pub(crate) reasons_by_page: BTreeMap<u32, Vec<String>>,
+pub struct TextQualityReport {
+    /// 1-indexed pages whose text layer this analysis judged unusable.
+    pub pages_needing_ocr: Vec<u32>,
+    /// Whether any page reached a verdict at all.
+    pub has_encoding_issues: bool,
+    /// Why, per page. The reason strings are the `OCR_REASON_*` constants.
+    pub reasons_by_page: BTreeMap<u32, Vec<String>>,
+    /// The letter-frequency evidence behind the substitution-cipher half of
+    /// the verdict, for every page that contributed text. A page with a
+    /// clean text layer appears here too, with the score that says so.
+    pub letter_frequency: BTreeMap<u32, LetterFrequencyScore>,
 }
 
 #[derive(Debug, Default)]
@@ -247,7 +315,7 @@ enum TextSpanIssueKind {
     Strong,
 }
 
-pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
+pub fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
     let mut reasons_by_page = BTreeMap::new();
     let mut evidence_by_page = BTreeMap::<u32, PageTextQualityEvidence>::new();
 
@@ -278,7 +346,9 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         }
     }
 
+    let mut letter_frequency = BTreeMap::new();
     for (page, evidence) in evidence_by_page {
+        letter_frequency.insert(page, evidence.cipher_garble.score());
         if reasons_by_page.contains_key(&page) {
             continue;
         }
@@ -297,6 +367,7 @@ pub(crate) fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         has_encoding_issues: !pages_needing_ocr.is_empty(),
         pages_needing_ocr,
         reasons_by_page,
+        letter_frequency,
     }
 }
 
