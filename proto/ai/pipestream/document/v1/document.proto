@@ -1050,6 +1050,16 @@ message PictureItem {
   // An internal destination covering this picture's region: a figure that
   // jumps into the document rather than out of it.
   optional FineRef target = 18;
+  // Chart provenance when this picture renders a chart (extension beyond
+  // the upstream dialect).
+  optional ChartMeta chart = 19;
+}
+
+// ChartMeta records where a rendered chart's data came from.
+message ChartMeta {
+  repeated GridSpan sources = 1;
+  bool has_row_headers = 2;
+  bool has_column_headers = 3;
 }
 
 // PictureMeta contains rich metadata for pictures, including AI analysis.
@@ -1316,6 +1326,18 @@ message FieldItem {
   repeated ProvenanceItem prov = 7;
   repeated SourceType source = 8;
   repeated FineRef comments = 9;
+
+  // The field's programmatic name in the source form (extension beyond the
+  // upstream dialect).
+  optional string field_name = 10;
+  // A choice field's entries and which one is selected; selected_index is
+  // presence-tracked because zero is a real selection.
+  repeated string options = 11;
+  optional int32 selected_index = 12;
+  // The field's span in the document's annotation space.
+  optional FineRef span = 13;
+  // Fieldmark parameters, a genuinely open per-field vocabulary.
+  map<string, string> parameters = 14;
 }
 
 // PageItem represents metadata about a single page in the document.
@@ -1797,6 +1819,8 @@ message CommentMeta {
   optional FineRef parent = 6;
   // The text the comment anchors to, verbatim.
   optional string anchored_text = 7;
+  // A note the source displays permanently rather than on hover.
+  bool shown = 8;
 }
 
 // ShapeMeta is the identity of the drawing shape an item came from.
@@ -1905,6 +1929,9 @@ message NamedRange {
   bool has_totals = 4;
   // named or database.
   optional string kind = 5;
+  // The defining expression when the range is a formula rather than a
+  // rectangle; `range` stays unset then.
+  optional string expression = 6;
 }
 
 // PivotSpec is one pivot table definition.
