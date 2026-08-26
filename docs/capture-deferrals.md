@@ -6,7 +6,9 @@ captured — with the reason, so the next person does not re-derive it.
 Three reasons appear below and they are not interchangeable:
 
 - **Not reachable** — the data exists inside the parser crate and no public
-  API returns it. Fixing this means an upstream change, not a change here.
+  API returns it. This category is now empty: the crate is vendored under
+  `vendor/pdf-inspector` and the four APIs that were private are public
+  there. See "The upstream asks, and the patches that answered them".
 - **Needs a typed home** — the data reaches the event plane, fully typed,
   but the Document schema has no field for it. It is not flattened into a
   string map; per the fleet's typing rule, data whose shape is known gets a
@@ -49,52 +51,113 @@ Three reasons appear below and they are not interchangeable:
 | U8 / U13 / U16 posture and identity, on the Document plane | `DocumentMeta.format_version` / `.structured` / `.authoring_tool` / `.subject` / `.protection` / `.raw_metadata` |
 | U15 / U23 page geometry and labels, on the Document plane | `PageItem.page_label` / `.media_size` / `.user_unit` |
 | Trapping declaration | `DocumentInfo.trapped` (verbatim) and `.trapped_state` (typed), `DocumentMeta.trapped` |
-| Version constant | derived from the manifest during const evaluation |
+| Version constant | derived from the vendored crate's manifest during const evaluation |
+| D18 invisible text | `PageMarkdown.invisible` runs with their boxes, `ParseStatus.has_invisible_text`, and the runs as items under `CONTENT_LAYER_INVISIBLE` |
+| D21 the garble score | `PageMarkdown.garble_score`, `PageQuality.garble_score` |
+| D13 vector rectangles and line segments | the ruled-table detectors, reached through `TableRegion` and `Document.tables[]` |
+| Layout complexity from items | `ParseStatus.layout`, computed in the page loop instead of by a second read of the file |
 
-## Not reachable without an upstream change
+## The upstream asks, and the patches that answered them
 
-Four asks, and they are the whole of what this service cannot capture. Each
-one is data the parser crate computes and does not return; none of them can
-be fixed from here.
+Four asks stood here, and each one was data the parser crate computes and
+returns through no public API. They were recorded as needing an upstream
+change because there was no way to fix them from the service side.
+
+There was a way. The crate is MIT licensed, so it is vendored under
+`vendor/pdf-inspector` and the four APIs are public there. The copy landed
+unpatched first, so the vendoring can be diffed against the crates.io
+tarball on its own, and each patch is a commit of its own on top of it.
+Every patch is an additive visibility change: nothing that was public
+changed shape, no threshold moved, and the crate parses exactly what it
+parsed before. `vendor/pdf-inspector/README.md` is the map;
+`AGENTS.md` has the rules for touching it.
 
 **D18 — invisible text (render mode 3).** The content-stream walker
-recognises invisible text and takes a parameter controlling whether to keep
-it, but every public entry point passes `false`, and the
-`skipped_invisible` flag it returns is discarded by the caller inside the
-crate. So an OCR-under-image text layer or a hidden watermark cannot be
-emitted under `CONTENT_LAYER_INVISIBLE`, and cannot even be reported as
-having existed. **Ask:** make `include_invisible` an option on
-`extract_text_with_positions_mem_pages`, or return the flag.
+recognised invisible text and took a parameter controlling whether to keep
+it, but every public entry point passed `false`, and the
+`skipped_invisible` flag it returned was discarded by the caller inside the
+crate.
 
-**D21 — the garble score itself.** `PageQuality.garble_score` stays unset.
-The letter-frequency correlation that distinguishes substitution-cipher
-garble from natural text lives in a private module, and only the derived
-boolean escapes. Replacement-character runs are counted here instead,
-because they can be counted exactly; putting a differently-defined number
-under the name `garble_score` would be worse than leaving it empty.
-**Ask:** make the text-quality analysis public, or return its score
-per page.
+- *Patch* `5c726bc`: `extract_text_with_positions_and_rects_mem_with_invisible`
+  and `extract_text_with_positions_mem_pages_with_invisible` take the
+  option and return the flag. The per-page flag is folded across the pages
+  instead of being dropped in the extraction loop.
+- *Wired*: `ParseStatus.has_invisible_text` in every FULL call, free from
+  the extraction pass. `PdfOptions.report_invisible` (or a Document, which
+  consumes the same events) adds `PageMarkdown.invisible`: the hidden runs
+  with their boxes, and the same runs as Document items under
+  `CONTENT_LAYER_INVISIBLE` in the furniture group. A hidden watermark is
+  a reportable item and is never silently absent.
+- *Tests*: `tests/invisible.rs`, over a fixture that draws its watermark
+  with `3 Tr`.
 
-**D13 — vector rectangles and line segments.** `PdfRect` and `PdfLine` are
-public types, but the memory-based accessor that returns them is
-`pub(crate)`. Without them the rect- and line-driven table detectors are
-unreachable and only the heuristic detector over items can run, so a table
-drawn with real rules is detected no better than a borderless one.
-**Ask:** a public `extract_text_with_positions_and_rects_mem`.
+**D21 — the garble score itself.** The letter-frequency correlation that
+distinguishes substitution-cipher garble from natural text lived in a
+private module, and only the derived boolean escaped, so
+`PageQuality.garble_score` had no source.
 
-**Layout complexity from items.** `pages_with_columns` cannot be recomputed
-from items a caller holds: the column detector is `pub(crate)`. That is why
-FULL mode runs a separate analysis pass rather than deriving the layout
-verdict from the runs it already has. Making the detector public would
-remove a whole read of the file from every FULL call. **Ask:** a public
-layout analyser over `&[TextItem]`.
+- *Patch* `758c6ed`: `text_quality` is a public module.
+  `analyze_text_quality`, `TextQualityReport` and `detect_encoding_issues`
+  are public, and the report gains `letter_frequency`: a
+  `LetterFrequencyScore` per page with both cosines, the letter count they
+  are computed over, and the verdict they feed.
+  `MIN_LETTERS_FOR_GARBLE_SCORE` names the floor below which the statistic
+  is noise.
+- *Wired*: `PageMarkdown.garble_score` and `PageQuality.garble_score` carry
+  `1 - english_cosine`, which is the library's own number turned the right
+  way up for a field defined with 0.0 as clean. A page with too few letters
+  to measure reports nothing rather than a reassuring zero.
+  Replacement-character runs are still counted beside it: they measure a
+  different failure.
+- *Tests*: `tests/quality.rs`, over a fixture whose second page is its
+  first page with every letter substituted.
 
-Two rows the audit listed here are not asks and belong below with the rest
-of the deliberate deferrals: **D20**, the detector's per-page statistics,
-which are collapsed into one of four reason strings and several of which
-the crate already marks dead; and **U4**, `pages_sampled` /
+**D13 — vector rectangles and line segments.** `PdfRect` and `PdfLine` were
+public types and `detect_tables_from_rects` and `detect_tables_from_lines`
+were public functions, but the memory-based accessor returning the geometry
+they run on was `pub(crate)`, so both detectors were unreachable and only
+the alignment heuristic could run.
+
+- *Patch* `8bb537e`: `extract_text_with_positions_and_rects_mem`, and
+  `PageExtraction` with it.
+- *Wired*: `src/tables.rs` runs the crate's own three detectors in the
+  crate's own order, rules first and alignment last. It calls them; it
+  reimplements nothing.
+- *Tests*: `tests/tables.rs`, over a ruled fixture that the alignment
+  detector misses outright, asserted as part of the test so the fixture
+  cannot quietly stop being interesting.
+
+**Layout complexity from items.** `pages_with_columns` could not be
+recomputed from items a caller held, because the column detector was
+`pub(crate)`. FULL therefore ran a whole separate analysis pass over the
+file for a verdict its own runs already contained.
+
+- *Patch* `9340221`: `extractor::detect_columns` and `ColumnRegion` are
+  public.
+- *Wired*: FULL computes `pages_with_tables` from the table detectors it
+  runs per page anyway and `pages_with_columns` from `detect_columns` over
+  the runs it holds, and the analysis pass is deleted. FULL reads the
+  document twice now, not three times.
+- *Tests*: `tests/passes.rs` counts the reads through
+  `Metrics::parser_pass`, so a pass coming back fails a test.
+
+Two rows the audit listed here were never asks and belong below with the
+rest of the deliberate deferrals: **D20**, the detector's per-page
+statistics, which are collapsed into one of four reason strings and several
+of which the crate already marks dead; and **U4**, `pages_sampled` /
 `pages_with_text` / `ocr_recommended`, which are on `PdfTypeResult` and
 reachable with a second detection call this service chooses not to make.
+
+### What the patches did not change
+
+The FULL layout verdict and the per-page OCR reasons are computed from the
+runs this service renders from, rather than from the runs the analysis pass
+used to build for itself. The analysis pass filtered folio context out of
+its items first and suppressed the text of pages whose CID passthrough
+produced garbage; this does neither. The verdicts can therefore differ from
+the ones the deleted pass would have given on a document where that
+filtering mattered. It is the more direct answer of the two: it describes
+the runs that were actually delivered.
 
 ## Needs a typed home in the Document schema
 
@@ -105,10 +168,18 @@ canonical schema and is wired: `DocumentMeta.format_version`, `.structured`,
 `PageItem.page_label`, `.media_size` and `.user_unit`;
 `PictureItem.hyperlink` and `.target`.
 
-What is left to capture is the four asks above, and they are all inside the
-parser crate.
+Nothing is deferred on reachability either. The four asks above are wired,
+and what remains below is deliberate: things that are reachable and homed
+and not worth doing yet.
 
 ## Deliberate, and cheap to add later
+
+Several of these say "the crate does not emit it". That is no longer a wall,
+because the crate is vendored and patchable here; it is a cost. The bar for
+a patch is the one in `AGENTS.md`: additive, visible in its own commit, and
+never a change to what the crate parses. A row below that needs the crate to
+compute something new rather than to return something it already computes is
+the one to be careful with.
 
 - **Sub- and superscript.** The extractor computes them from font-size
   ratio plus baseline offset and uses the result only for spacing, so
@@ -150,6 +221,23 @@ parser crate.
 
 ## Known approximations
 
+- **Separating hidden runs from visible ones.** The parser has one switch
+  for the invisible layer and it governs the whole walk, so the hidden runs
+  are the multiset difference between a walk that kept them and one that
+  did not, keyed on page, text and box. Both walks read the same operators
+  in the same order and the skip branch advances the text matrix exactly as
+  the keep branch does, so a visible run is identical in both. The
+  exception is a hidden run close enough to a visible one for the extractor
+  to join them into a single item: that item is in neither walk unchanged,
+  so it reads as invisible. Its text and its box are still exactly what the
+  page drew, and over-reporting is the safe direction for a field whose
+  purpose is that nothing hides.
+- **What a table's column boundaries mean.** They are the detector's own
+  numbers and the three detectors do not agree: a ruled table reports the
+  rules, so a two-column grid has three boundaries, while a table found
+  from alignment reports where each column's text starts. `TableRegion.bbox`
+  is measured from the runs either way, so the table's own edges are exact
+  in both cases.
 - **Table headers.** The detector reports no header row. The first row of a
   data table is marked `column_header` because that is the convention the
   crate's own markdown renderer follows when it prints the grid; a table of
@@ -157,7 +245,9 @@ parser crate.
 - **Row and column spans.** Every cell is 1x1. Spans need the vector-grid
   route (`detect_vector_grid_in_region_mem` feeding
   `extract_tables_with_structure_cells_mem`), which is a larger job and is
-  only available for border-drawn tables.
+  only available for border-drawn tables. The geometry those entry points
+  need does reach this service now, so the job is no longer blocked; it is
+  just still a job.
 - **Locating a block among its runs.** The fold matches a block of markdown
   to the runs behind it by comparing letters and digits, forwards through
   the page. A page whose renderer reorders runs — multi-column layouts
