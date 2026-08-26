@@ -14,30 +14,44 @@
 //! out as that page's markdown comes back. `tests/streaming.rs` holds the
 //! test that fails if someone turns this back into a batch.
 //!
-//! # Three library passes in FULL, on purpose
+//! # Two library passes in FULL, and not three
 //!
 //! Detection (`process_pdf_mem_with_options` in detect-only mode) runs
 //! first and alone, because `info` is the product's front door and it has
 //! to go out before anything expensive starts. It is cheap: it reads
 //! content streams, not glyphs.
 //!
-//! FULL then runs two more. The analysis pass
-//! (`process_pdf_mem_with_options` in analyze mode) is what computes layout
-//! complexity and the per-page text-quality verdicts, and the library
-//! exposes no way to compute either from items a caller already holds — the
-//! column detector and the quality module are both crate-private. The
-//! extraction pass is `extract_text_with_positions_mem_pages`, whose items
-//! this module renders to markdown itself with
-//! [`to_markdown_from_items_with_rects_and_page_count`].
+//! FULL then runs exactly one more:
+//! `extract_text_with_positions_and_rects_mem_with_invisible`, whose runs,
+//! rectangles and line segments answer everything the rest of the mode
+//! needs. The markdown is rendered from those runs here with
+//! [`to_markdown_from_items_with_rects_and_page_count`]; the tables come
+//! from the same runs plus the vector geometry; the layout verdict comes
+//! from the runs and the tables; the text-quality verdicts and the garble
+//! score come from `analyze_text_quality` over the runs.
 //!
-//! That last choice is the one worth defending, because the obvious call is
-//! `extract_pages_markdown_mem` and this used to make it. It takes no
-//! options — it hardcodes `MarkdownOptions::default()` — and it throws the
-//! items away, and the items are where every coordinate, every font, every
-//! marked-content id and the entire link layer live. Rendering from items
-//! keeps all of that in hand and costs the analysis pass to keep the layout
-//! answer honest. The trade is deliberate: the wire gained geometry and
-//! links, and one more read of the file is what they cost.
+//! There used to be a third pass. Layout complexity and the per-page
+//! text-quality verdicts were fetched with a whole separate analysis pass
+//! over the file, because the column detector and the quality module were
+//! both private to the parser crate and neither could be reached from items
+//! a caller held. The crate is vendored now and both are public
+//! (`vendor/pdf-inspector/README.md`), so the answer is computed from the
+//! runs already in hand and the pass is gone.
+//!
+//! Rendering from runs rather than calling `extract_pages_markdown_mem` is
+//! the other choice worth stating. That entry point takes no options, it
+//! hardcodes `MarkdownOptions::default()`, and it throws the runs away, and
+//! the runs are where every coordinate, every font, every marked-content id
+//! and the entire link layer live.
+//!
+//! Two optional passes remain, each paid for only by the call that asks:
+//! `emit_structure` reads the tagged structure tree, `emit_metadata` reads
+//! the document's own dictionaries, and `report_invisible` re-walks the
+//! content streams with the invisible layer kept, but only for a document
+//! whose first walk said there was an invisible layer to keep.
+//! [`Metrics::parser_pass`](crate::metrics::Metrics::parser_pass) counts
+//! them, so the count is a thing tests hold rather than a claim in a
+//! comment.
 //!
 //! [`to_markdown_from_items_with_rects_and_page_count`]: pdf_inspector::to_markdown_from_items_with_rects_and_page_count
 //!
@@ -47,7 +61,7 @@
 //! positioned items (`TextItem::page`) and `PdfOptions::pages`. Any
 //! conversion happens here, at the library boundary, and nowhere else.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
 use pdf_inspector::{MarkdownOptions, PdfOptions, PdfType, ProcessMode};
@@ -223,7 +237,12 @@ fn parse(
     if !options.password.is_empty() {
         detect = detect.password(options.password.clone());
     }
+    metrics.parser_pass();
     let detected = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, detect))?;
+    // Detection's own per-page verdicts, kept because the trailer's
+    // `extraction_ocr_reasons` is these merged with what reading the text
+    // layer concludes, exactly as the analysis pass used to merge them.
+    let detection_reasons = detected.ocr_reasons_by_page.clone();
 
     // The optional second consumer of this stream: when the caller asked for
     // a Document, every event is folded on its way out and the folded
@@ -264,6 +283,7 @@ fn parse(
         // Not `guarded`: a metadata dictionary this reader cannot make
         // sense of is a gap in the metadata, not a failed parse. The text
         // extraction runs off its own reader and is unaffected.
+        metrics.parser_pass();
         let metadata = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::metadata::read(bytes, password)
         }))
@@ -290,6 +310,7 @@ fn parse(
     let mut layout = None;
     let mut has_encoding_issues = false;
     let mut extraction_ocr_reasons = Vec::new();
+    let mut has_invisible_text = false;
 
     // What happens after `info` depends on the mode and on what detection
     // found. Scanned and image-based documents have no text layer at all, so
@@ -299,6 +320,7 @@ fn parse(
         pb::ProcessMode::DetectOnly | pb::ProcessMode::Unspecified => {}
         _ if !text_bearing => {}
         pb::ProcessMode::Analyze => {
+            metrics.parser_pass();
             let analyzed = guarded(|| {
                 pdf_inspector::process_pdf_mem_with_options(bytes, analyze_options(options))
             })?;
@@ -315,6 +337,7 @@ fn parse(
                 full = full.pages(options.pages.iter().copied());
             }
             full = full.password(options.password.clone());
+            metrics.parser_pass();
             let processed = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, full))?;
             if let Some(markdown) = processed.markdown.filter(|md| !md.is_empty()) {
                 let markdown_bytes = markdown.len() as u64;
@@ -331,6 +354,11 @@ fn parse(
                     // The whole-document API takes no markdown options, so
                     // there is no second rendering to difference against.
                     furniture: Vec::new(),
+                    // Neither the invisible layer nor a per-page score is
+                    // reachable through the whole-document API, and this
+                    // event is not a page anyway.
+                    invisible: Vec::new(),
+                    garble_score: None,
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -346,35 +374,57 @@ fn parse(
             extraction_ocr_reasons = ocr_reasons_proto(&processed.ocr_reasons_by_page);
         }
         pb::ProcessMode::Full => {
-            // The analysis pass. Layout complexity and the per-page
-            // text-quality verdicts are computed inside the library from
-            // machinery it does not expose (the column detector and the
-            // text-quality module are both crate-private), so they cannot be
-            // recovered from the items the extraction pass returns. Asking
-            // for them costs a read of the file and is the price of the
-            // markdown pass below giving up the answers it used to come
-            // with.
-            let analyzed = guarded(|| {
-                pdf_inspector::process_pdf_mem_with_options(bytes, analyze_options(options))
-            })?;
-            layout = Some(layout_proto(&analyzed.layout));
-            has_encoding_issues = analyzed.has_encoding_issues;
-            extraction_ocr_reasons = ocr_reasons_proto(&analyzed.ocr_reasons_by_page);
-            let verdicts = page_verdicts(&analyzed);
-
-            // The extraction pass. Positioned items, not markdown: the
-            // markdown is rendered from them here so that the items — the
-            // boxes, the fonts, the marked-content ids, the link
-            // annotations — stay in hand instead of being rendered away
-            // inside the library.
+            // The extraction pass, and the only one this mode needs.
+            // Positioned runs rather than markdown, so that the boxes, the
+            // fonts, the marked-content ids and the link annotations stay
+            // in hand instead of being rendered away inside the library;
+            // and the vector geometry with them, so the ruled-table
+            // detectors are reachable at all.
             let filter: Option<HashSet<u32>> =
                 (!options.pages.is_empty()).then(|| options.pages.iter().copied().collect());
-            let items = guarded(|| {
-                pdf_inspector::extractor::extract_text_with_positions_mem_pages(
+            metrics.parser_pass();
+            let ((items, rects, lines), skipped_invisible) = guarded(|| {
+                pdf_inspector::extract_text_with_positions_and_rects_mem_with_invisible(
                     bytes,
                     filter.as_ref(),
+                    false,
                 )
             })?;
+            // What the walk left out, said whether or not anyone asked for
+            // the runs themselves. A text layer nobody is told about is
+            // what this reports.
+            has_invisible_text = skipped_invisible;
+
+            // The text-quality verdicts, from the runs this call already
+            // holds rather than from a second read of the file.
+            let quality = pdf_inspector::analyze_text_quality(&items);
+            has_encoding_issues = quality.has_encoding_issues;
+            let verdicts = page_verdicts(&detection_reasons, &quality);
+            extraction_ocr_reasons = verdicts
+                .iter()
+                .map(|(page, reasons)| pb::PageOcrReasons {
+                    page: *page,
+                    reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
+                })
+                .collect();
+
+            // The invisible layer's own runs, which need the walk run again
+            // with the layer kept. Taken only when someone is listening and
+            // only when the first walk said there is something to find.
+            let mut invisible = if events.wanted(options.report_invisible) && skipped_invisible {
+                metrics.parser_pass();
+                let (kept, _) = guarded(|| {
+                    pdf_inspector::extract_text_with_positions_mem_pages_with_invisible(
+                        bytes,
+                        filter.as_ref(),
+                        true,
+                    )
+                })?;
+                spans::by_page(spans::only_invisible(&items, kept))
+            } else {
+                BTreeMap::new()
+            };
+
             let mut by_page = spans::by_page(items);
 
             // The document's own structure tree, when anyone wants it.
@@ -383,6 +433,7 @@ fn parse(
             let mut structure = if events.wanted(options.emit_structure) {
                 let selected: Option<Vec<u32>> =
                     (!options.pages.is_empty()).then(|| options.pages.clone());
+                metrics.parser_pass();
                 let elements = guarded(|| {
                     pdf_inspector::extract_structure_elements_mem(bytes, selected.as_deref())
                 })?;
@@ -390,6 +441,11 @@ fn parse(
             } else {
                 BTreeMap::new()
             };
+
+            // The layout verdict, accumulated page by page below out of the
+            // detectors the pages run through anyway.
+            let mut pages_with_tables = Vec::new();
+            let mut pages_with_columns = Vec::new();
 
             for page_no in requested_pages(options, detected.page_count) {
                 let page_items = by_page.remove(&page_no).unwrap_or_default();
@@ -404,11 +460,30 @@ fn parse(
                     )?;
                 }
 
-                // The grids go out before the markdown that flattens them
-                // into pipe characters.
-                if events.wanted(options.emit_tables)
-                    && let Some(tables) = tables::page_tables(page_no, &page_items)
-                {
+                // The grids. They are detected on every page whether or not
+                // the caller wants the event, because the layout verdict is
+                // "which pages have a data table" and that is this
+                // detector's answer; the analysis pass that used to be
+                // asked for it ran the same three detectors over the same
+                // runs, one whole read of the file later. They go out
+                // before the markdown that flattens them into pipe
+                // characters.
+                let page_tables = tables::page_tables(page_no, &page_items, &rects, &lines);
+                if page_tables.as_ref().is_some_and(tables::has_data_table) {
+                    pages_with_tables.push(page_no);
+                }
+                // Columns are counted after the tables, because a table's
+                // own column spacing looks like a gutter and the detector
+                // needs telling that this page has one.
+                let columns = pdf_inspector::extractor::detect_columns(
+                    &page_items,
+                    page_no,
+                    pages_with_tables.last() == Some(&page_no),
+                );
+                if columns.len() >= 2 {
+                    pages_with_columns.push(page_no);
+                }
+                if let Some(tables) = page_tables {
                     events.route(
                         pb::parse_pdf_response::Event::Tables(tables),
                         options.emit_tables,
@@ -454,11 +529,17 @@ fn parse(
                 let markdown = markdown.trim().to_owned();
                 let furniture = dropped_runs(&drawn, &markdown);
                 let markdown_bytes = markdown.len() as u64;
-                let (needs_ocr, reason) = verdicts
-                    .get(&page_no)
+                let reasons = verdicts.get(&page_no);
+                let needs_ocr = reasons.is_some();
+                let reason = reasons
+                    .and_then(|reasons| reasons.first())
                     .copied()
-                    .unwrap_or((false, pb::OcrReason::Unspecified));
+                    .unwrap_or(pb::OcrReason::Unspecified);
                 let replacement_runs = replacement_runs(&markdown);
+                // The rendering is the last thing the encoding backstop can
+                // look at, and it catches a page whose runs were each
+                // individually unremarkable.
+                has_encoding_issues |= pdf_inspector::detect_encoding_issues(&markdown);
                 events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
                     page_no,
                     markdown,
@@ -466,6 +547,13 @@ fn parse(
                     ocr_reason: reason.into(),
                     replacement_runs,
                     furniture,
+                    invisible: invisible
+                        .remove(&page_no)
+                        .unwrap_or_default()
+                        .iter()
+                        .map(spans::span)
+                        .collect(),
+                    garble_score: garble_score(&quality, page_no),
                 }))?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -473,6 +561,12 @@ fn parse(
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted += 1;
             }
+
+            layout = Some(pb::LayoutComplexity {
+                is_complex: !pages_with_tables.is_empty() || !pages_with_columns.is_empty(),
+                pages_with_tables,
+                pages_with_columns,
+            });
         }
     }
 
@@ -489,6 +583,7 @@ fn parse(
         has_encoding_issues,
         processing_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         extraction_ocr_reasons,
+        has_invisible_text,
     }))?;
     Ok(())
 }
@@ -598,31 +693,54 @@ fn analyze_options(options: &pb::PdfOptions) -> PdfOptions {
     analyze
 }
 
-/// Per-page OCR verdicts from an analysis result, keyed by 1-indexed page.
+/// Per-page OCR verdicts, keyed by 1-indexed page.
 ///
-/// A page can carry several reasons; the first is the one a per-page event
-/// can hold, and the whole list still travels on the trailer.
+/// Two sources, merged the way the library merges them: what sampling
+/// detection concluded about the document, and what reading its text layer
+/// concluded about each page. A page in the map is a page judged unusable;
+/// its first reason is the one a per-page event can hold, and the whole
+/// list travels on the trailer.
 fn page_verdicts(
-    analyzed: &pdf_inspector::PdfProcessResult,
-) -> HashMap<u32, (bool, pb::OcrReason)> {
-    // A page the analysis gave a reason for is a page it judged unusable,
-    // whether or not it also made the OCR list, so both sources set the
-    // verdict and only the reason distinguishes them.
-    let mut verdicts: HashMap<u32, (bool, pb::OcrReason)> = analyzed
-        .ocr_reasons_by_page
-        .iter()
-        .filter_map(|page| {
-            page.reasons
-                .first()
-                .map(|reason| (page.page, (true, ocr_reason(reason))))
-        })
-        .collect();
-    for page in &analyzed.pages_needing_ocr {
-        verdicts
-            .entry(*page)
-            .or_insert((true, pb::OcrReason::Unspecified));
+    detection: &[pdf_inspector::PageOcrReasons],
+    quality: &pdf_inspector::TextQualityReport,
+) -> BTreeMap<u32, Vec<pb::OcrReason>> {
+    let mut verdicts: BTreeMap<u32, Vec<pb::OcrReason>> = BTreeMap::new();
+    let mut add = |page: u32, reasons: &[String]| {
+        let entry = verdicts.entry(page).or_default();
+        for reason in reasons {
+            let reason = ocr_reason(reason);
+            if !entry.contains(&reason) {
+                entry.push(reason);
+            }
+        }
+    };
+    for page in detection {
+        add(page.page, &page.reasons);
+    }
+    for (page, reasons) in &quality.reasons_by_page {
+        add(*page, reasons);
+    }
+    // A page the quality pass listed without giving a reason for is still a
+    // page it judged unusable.
+    for page in &quality.pages_needing_ocr {
+        verdicts.entry(*page).or_default();
     }
     verdicts
+}
+
+/// How far a page's letters sit from where a natural language puts them, or
+/// `None` when the page carried too few of them for the question to have an
+/// answer.
+///
+/// The library reports the correlation, which is 1.0 for text whose letters
+/// fall where they should. The wire reports its distance from that, because
+/// `garble_score` is defined with 0.0 as clean. Nothing else is done to it:
+/// the number is the library's own, turned the right way up.
+fn garble_score(quality: &pdf_inspector::TextQualityReport, page_no: u32) -> Option<f64> {
+    let score = quality.letter_frequency.get(&page_no)?;
+    score
+        .is_measurable()
+        .then(|| (1.0 - score.english_cosine).clamp(0.0, 1.0))
 }
 
 /// Map the library's per-page OCR reasons onto the wire message.

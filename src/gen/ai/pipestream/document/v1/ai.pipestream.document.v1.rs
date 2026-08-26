@@ -953,6 +953,20 @@ pub struct PictureItem {
     /// jumps into the document rather than out of it.
     #[prost(message, optional, tag="18")]
     pub target: ::core::option::Option<FineRef>,
+    /// Chart provenance when this picture renders a chart (extension beyond
+    /// the upstream dialect).
+    #[prost(message, optional, tag="19")]
+    pub chart: ::core::option::Option<ChartMeta>,
+}
+/// ChartMeta records where a rendered chart's data came from.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ChartMeta {
+    #[prost(message, repeated, tag="1")]
+    pub sources: ::prost::alloc::vec::Vec<GridSpan>,
+    #[prost(bool, tag="2")]
+    pub has_row_headers: bool,
+    #[prost(bool, tag="3")]
+    pub has_column_headers: bool,
 }
 /// PictureMeta contains rich metadata for pictures, including AI analysis.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1348,6 +1362,22 @@ pub struct FieldItem {
     pub source: ::prost::alloc::vec::Vec<SourceType>,
     #[prost(message, repeated, tag="9")]
     pub comments: ::prost::alloc::vec::Vec<FineRef>,
+    /// The field's programmatic name in the source form (extension beyond the
+    /// upstream dialect).
+    #[prost(string, optional, tag="10")]
+    pub field_name: ::core::option::Option<::prost::alloc::string::String>,
+    /// A choice field's entries and which one is selected; selected_index is
+    /// presence-tracked because zero is a real selection.
+    #[prost(string, repeated, tag="11")]
+    pub options: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(int32, optional, tag="12")]
+    pub selected_index: ::core::option::Option<i32>,
+    /// The field's span in the document's annotation space.
+    #[prost(message, optional, tag="13")]
+    pub span: ::core::option::Option<FineRef>,
+    /// Fieldmark parameters, a genuinely open per-field vocabulary.
+    #[prost(map="string, string", tag="14")]
+    pub parameters: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 /// PageItem represents metadata about a single page in the document.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1994,6 +2024,9 @@ pub struct CommentMeta {
     /// The text the comment anchors to, verbatim.
     #[prost(string, optional, tag="7")]
     pub anchored_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// A note the source displays permanently rather than on hover.
+    #[prost(bool, tag="8")]
+    pub shown: bool,
 }
 /// ShapeMeta is the identity of the drawing shape an item came from.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2148,6 +2181,10 @@ pub struct NamedRange {
     /// named or database.
     #[prost(string, optional, tag="5")]
     pub kind: ::core::option::Option<::prost::alloc::string::String>,
+    /// The defining expression when the range is a formula rather than a
+    /// rectangle; `range` stays unset then.
+    #[prost(string, optional, tag="6")]
+    pub expression: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// PivotSpec is one pivot table definition.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]

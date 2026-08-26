@@ -9,26 +9,95 @@
 //! characters, and a consumer that wants a table has to parse GFM back out
 //! of a paragraph.
 //!
-//! Nothing here re-detects anything. The detector is public and takes the
-//! same positioned runs the extraction pass already produced; this module
-//! calls it and maps what it returns.
+//! Nothing here re-detects anything. The detectors are public and take the
+//! same positioned runs, rectangles and line segments the extraction pass
+//! already produced; this module calls them and maps what they return.
+//!
+//! There are three of them and the order matters. A table drawn with real
+//! rules says where its cells are, so the rectangle detector is asked
+//! first and the line detector second; only a table with no rules at all
+//! falls through to the heuristic that infers columns from alignment. That
+//! is the cascade the library runs internally for its own layout verdict,
+//! and running it here is what makes a ruled table detect at least as well
+//! as a borderless one instead of worse.
 
-use pdf_inspector::TextItem;
-use pdf_inspector::tables::{Table, TableKind, detect_tables};
+use pdf_inspector::tables::{
+    Table, TableKind, detect_tables, detect_tables_from_lines, detect_tables_from_rects,
+};
+use pdf_inspector::types::ItemType;
+use pdf_inspector::{PdfLine, PdfRect, TextItem};
 
 use crate::proto::v1 as pb;
 
 /// The tables on one page, or `None` when the page has none.
 ///
-/// `base_font_size` is the page's body size, which the detector uses to
-/// tell a table's cells from surrounding prose.
+/// `items` are the page's runs; `rects` and `lines` may be the whole
+/// document's, because every detector filters them to `page_no` itself.
 #[must_use]
-pub fn page_tables(page_no: u32, items: &[TextItem]) -> Option<pb::PageTables> {
-    let tables: Vec<pb::TableRegion> = detect_tables(items, body_font_size(items), false)
+pub fn page_tables(
+    page_no: u32,
+    items: &[TextItem],
+    rects: &[PdfRect],
+    lines: &[PdfLine],
+) -> Option<pb::PageTables> {
+    // The rectangle detector strips image placeholders before it clusters,
+    // because an image's left edge is not a column edge, and the indices it
+    // reports are into what is left. Doing that filtering here, once, keeps
+    // one slice of runs for the detectors and for the extents below; a
+    // detector handed one slice and an extent read out of another is how a
+    // box ends up naming the wrong runs.
+    let laid_out: Vec<TextItem> = items
         .iter()
-        .map(|table| region(table, items))
+        .filter(|item| !matches!(item.item_type, ItemType::Image))
+        .cloned()
+        .collect();
+    let detected = detect(page_no, &laid_out, rects, lines);
+    let tables: Vec<pb::TableRegion> = detected
+        .iter()
+        .map(|table| region(table, &laid_out))
         .collect();
     (!tables.is_empty()).then_some(pb::PageTables { page_no, tables })
+}
+
+/// Run the three detectors in the order the library runs them, and take the
+/// first that finds a data table.
+///
+/// A table of contents is not the answer this cascade is looking for: it
+/// has rows and columns, so any detector can report one, and reporting it
+/// would stop the search before the ruled data table below it was found.
+/// The last detector's answer is kept whatever it is, so a page whose only
+/// table is a table of contents still reports it.
+fn detect(page_no: u32, items: &[TextItem], rects: &[PdfRect], lines: &[PdfLine]) -> Vec<Table> {
+    let has_data = |tables: &[Table]| tables.iter().any(|table| table.kind == TableKind::Data);
+
+    let (from_rects, _hints) = detect_tables_from_rects(items, rects, page_no);
+    if has_data(&from_rects) {
+        return from_rects;
+    }
+    let from_lines = detect_tables_from_lines(items, lines, page_no);
+    if has_data(&from_lines) {
+        return from_lines;
+    }
+    let heuristic = detect_tables(items, body_font_size(items), false);
+    if has_data(&heuristic) {
+        return heuristic;
+    }
+    // No detector found data. Whichever of them found a table of contents
+    // found the only table on the page.
+    [from_rects, from_lines, heuristic]
+        .into_iter()
+        .find(|tables| !tables.is_empty())
+        .unwrap_or_default()
+}
+
+/// Whether a page's detected tables include real data, which is what
+/// `LayoutComplexity.pages_with_tables` counts.
+#[must_use]
+pub fn has_data_table(tables: &pb::PageTables) -> bool {
+    tables
+        .tables
+        .iter()
+        .any(|table| table.kind == pb::TableKind::Data as i32)
 }
 
 /// One detected table as the wire message.
@@ -52,11 +121,12 @@ fn region(table: &Table, items: &[TextItem]) -> pb::TableRegion {
 
 /// The table's extent, measured from the runs it claims.
 ///
-/// The detector's column and row values are where each column and row
-/// *starts*, so they cannot say where the last column ends or how far the
-/// last row descends. The runs can: the table's extent is the hull of the
-/// items it took. A table that claims no run has no extent, and says so
-/// rather than reporting a point at the origin.
+/// What a detector's column and row values mean varies with the detector:
+/// the alignment one reports where each column and row starts, the ruled
+/// ones report the rules themselves. Neither can be relied on to say where
+/// the table's own edges are. The runs can: the table's extent is the hull
+/// of the items it took. A table that claims no run has no extent, and says
+/// so rather than reporting a point at the origin.
 fn bbox(table: &Table, items: &[TextItem]) -> Option<pb::Rect> {
     let claimed = || {
         table

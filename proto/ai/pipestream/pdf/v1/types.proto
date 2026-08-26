@@ -135,6 +135,23 @@ message PdfOptions {
   // the rendering and names what is missing, so the removal is visible
   // without the body having to carry it.
   bool report_furniture = 9;
+
+  // Report the text the page drew invisibly, on `PageMarkdown.invisible`.
+  // Default false.
+  //
+  // Text drawn with rendering mode 3 is on the page and cannot be seen: an
+  // OCR layer sitting behind a scan, a watermark meant not to print, a
+  // template's hidden field labels. It stays out of the markdown, which is
+  // right, because it is not content a reader saw. Leaving it out silently
+  // is not: a document can carry text that nothing downstream ever hears
+  // about. Setting this streams those runs with their boxes, beside the
+  // visible ones rather than inside them.
+  //
+  // `ParseStatus.has_invisible_text` says whether there was any at all, in
+  // every FULL call and at no cost. This flag is what turns the runs
+  // themselves on, and it costs a second walk of the content streams,
+  // taken only for a document that actually drew invisible text.
+  bool report_invisible = 10;
 }
 
 // TableKind separates a real data table from a table of contents.
@@ -168,9 +185,14 @@ message TableRegion {
   // boundaries below do not name.
   Rect bbox = 1;
 
-  // Where each column starts, as an x position in page points, ascending.
-  // One per column: these are the detector's own column positions, not
-  // fences, so the last column runs to `bbox`'s right edge.
+  // Where the columns divide, as x positions in page points, ascending.
+  //
+  // These are the detector's own numbers and which detector found the
+  // table decides what they are: a table drawn with rules reports the
+  // ruled edges, so a two-column grid has three of them, while a table
+  // found from alignment alone reports where each column's text starts and
+  // has one per column. `bbox` closes the extent either way, which is what
+  // makes the last column's far edge knowable in both cases.
   repeated double column_boundaries = 2;
 
   // Where each row sits, as a y position in page points, descending —
@@ -446,6 +468,31 @@ message PageMarkdown {
   // so it was neither visible nor auditable; this reports what went,
   // without putting it back into the body.
   repeated string furniture = 6;
+
+  // The runs this page drew with text rendering mode 3, which paints no
+  // glyphs: an OCR layer behind a scan, a hidden watermark, a template's
+  // unfilled labels.
+  //
+  // Empty unless `PdfOptions.report_invisible` was set, and empty then too
+  // for a page that drew none. These runs are never in `markdown`, because
+  // they are not content a reader saw, and they carry their boxes, so a
+  // consumer can say where on the page the hidden text sits.
+  repeated TextSpan invisible = 7;
+
+  // How far this page's letter frequencies sit from natural language, 0.0
+  // for a page whose letters fall where a Latin-script language puts them
+  // and rising towards 1.0 as they do not.
+  //
+  // This is the evidence behind OCR_REASON_SUSPECTED_GARBLED: a broken
+  // ToUnicode CMap shifts every character by a per-range constant, so
+  // "Certificate" extracts as "8VceZWZTReV": printable ASCII, word-like
+  // token lengths, no replacement character anywhere, and a letter
+  // histogram that is a permutation of a natural one. Ordinary prose
+  // scores near 0.05; cipher garble scores near 0.47.
+  //
+  // Absent when the page carried too few letters for the statistic to mean
+  // anything, which is the honest answer rather than a reassuring zero.
+  optional double garble_score = 8;
 }
 
 // StructureRole is one standard structure type from a tagged PDF.
@@ -958,6 +1005,16 @@ message ParseStatus {
   // `has_encoding_issues` above is these reasons collapsed to one boolean;
   // it stays for callers that only want the routing bit.
   repeated PageOcrReasons extraction_ocr_reasons = 6;
+
+  // True when some extracted page drew text with rendering mode 3, which
+  // paints no glyphs and therefore never reaches the markdown.
+  //
+  // Reported in FULL for text-bearing documents whether or not
+  // `PdfOptions.report_invisible` was set, because it is what the
+  // extraction pass already knows and a hidden text layer nobody is told
+  // about is the thing this field exists to prevent. Set the option to see
+  // the runs themselves on `PageMarkdown.invisible`.
+  bool has_invisible_text = 7;
 }
 
 // ServerLimits reports the ceilings a server actually enforces.

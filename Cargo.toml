@@ -1,6 +1,6 @@
 [package]
 name = "grpc-pdf-inspector"
-version = "0.1.0"
+version = "0.2.0"
 description = "A gRPC server that classifies PDFs in memory and streams per-page markdown back"
 license = "Apache-2.0"
 readme = "README.md"

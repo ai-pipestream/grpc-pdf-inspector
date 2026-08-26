@@ -13,7 +13,7 @@
 //! leaves every judgement about what a run *means* to the markdown
 //! renderer and the Document fold.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use pdf_inspector::TextItem;
 use pdf_inspector::types::ItemType;
@@ -32,6 +32,59 @@ pub fn by_page(items: Vec<TextItem>) -> BTreeMap<u32, Vec<TextItem>> {
         pages.entry(item.page).or_default().push(item);
     }
     pages
+}
+
+/// The runs an invisible-inclusive extraction produced that the visible one
+/// did not.
+///
+/// The parser has one switch for the invisible layer and it governs the
+/// whole walk, so the only way to separate hidden runs from visible ones is
+/// to hold both walks side by side and take the difference. It is a
+/// multiset difference, keyed on the page, the text and the box rounded to
+/// a hundredth of a point: a page that draws the same word twice keeps both
+/// copies on the visible side and neither is reported.
+///
+/// Both walks read the same operators in the same order and the skip branch
+/// advances the text matrix exactly as the keep branch does, so a visible
+/// run has the same text at the same coordinates in both. The exception is
+/// a hidden run close enough to a visible one for the extractor to join
+/// them into a single item: the joined item is not in the visible walk, so
+/// it reads as invisible. Its box and its text are still exactly what the
+/// page drew, and reporting it is the conservative direction.
+///
+/// Image placeholders, link rectangles and form values are dropped: they
+/// are not text the page drew, so "invisible" says nothing about them.
+#[must_use]
+pub fn only_invisible(visible: &[TextItem], with_invisible: Vec<TextItem>) -> Vec<TextItem> {
+    let mut seen: HashMap<Key, usize> = HashMap::new();
+    for item in visible {
+        *seen.entry(key(item)).or_default() += 1;
+    }
+    with_invisible
+        .into_iter()
+        .filter(|item| matches!(item.item_type, ItemType::Text) && !item.text.trim().is_empty())
+        .filter(|item| match seen.get_mut(&key(item)) {
+            Some(remaining) if *remaining > 0 => {
+                *remaining -= 1;
+                false
+            }
+            _ => true,
+        })
+        .collect()
+}
+
+/// What makes two runs of two walks the same run.
+type Key = (u32, String, i64, i64);
+
+/// A run's identity for [`only_invisible`].
+fn key(item: &TextItem) -> Key {
+    let hundredths = |value: f32| (f64::from(value) * 100.0).round() as i64;
+    (
+        item.page,
+        item.text.clone(),
+        hundredths(item.x),
+        hundredths(item.y),
+    )
 }
 
 /// One page's runs as the wire message.

@@ -6,6 +6,13 @@ back. It wraps firecrawl's MIT-licensed
 features only: pure Rust, lopdf + rayon, no models) behind the ai-pipestream
 fleet's collector conventions.
 
+The crate is vendored under `vendor/pdf-inspector` and patched there, because
+four things this service must capture are computed inside it and returned by
+none of its public API: the invisible text layer, the per-page garble score,
+the vector rectangles and line segments the ruled-table detectors run on, and
+the column detector. `vendor/pdf-inspector/README.md` names each patch and
+`docs/capture-deferrals.md` records the commit that made it.
+
 It is the fleet's cheap routing answer for PDF:
 
 - **Text-based** PDFs carry a real text layer. Classification says so in
@@ -62,8 +69,8 @@ document  only when options.emit_document is set: the whole parse folded
           into one ai.pipestream.document.v1.Document, after the last
           page, before status
 status    trailer: pages_extracted, warnings, layout complexity,
-          has_encoding_issues, per-page extraction OCR reasons, total
-          processing_time_ms
+          has_encoding_issues, has_invisible_text, per-page extraction OCR
+          reasons, total processing_time_ms
 ```
 
 Modes (`options.mode`): `DETECT_ONLY` (classification only, the ~10–50ms
@@ -76,6 +83,16 @@ file; `emit_spans` and `emit_tables` cost only the bandwidth of sending
 what the extraction pass already produced. `report_furniture` reports the
 runs a page drew that its markdown does not contain — the headers, footers
 and folio numbers the strippers remove, which used to vanish silently.
+`report_invisible` reports the runs a page drew with rendering mode 3, which
+paint no glyphs at all: it costs a second walk of the content streams, and
+only for a document whose first walk found an invisible layer to walk.
+
+A FULL call reads the document twice: once to classify it, once to extract
+it. Everything else the mode reports comes off the runs that second read
+returns, including the markdown, the tables, the layout verdict, the
+per-page OCR verdicts and the garble score.
+`grpc-pdf-inspector metrics parser_passes=` counts the reads, and
+`tests/passes.rs` holds them to those numbers.
 
 ### What the events carry beyond markdown
 
@@ -89,7 +106,17 @@ and folio numbers the strippers remove, which used to vanish silently.
   An authored heading beats a heading level guessed from type size.
 - **`tables`** — the detected grids: column and row positions in page
   points, the cells, and whether the detector read data or a table of
-  contents.
+  contents. Three detectors run in the order the library runs them: the
+  rules a table drew are asked first, then its line segments, and only a
+  table with no rules at all falls through to inferring columns from
+  alignment.
+- **`page.invisible`** — with `report_invisible` set, the runs the page drew
+  with text rendering mode 3, each with its box. They are never in the
+  markdown, because no reader saw them.
+- **`page.garble_score`** — how far the page's letter frequencies sit from
+  where a Latin-script language puts them, 0.0 for ordinary prose and
+  rising towards 1.0 for a text layer whose CMap substituted every
+  character. Absent for a page with too few letters to measure.
 - **`metadata`** — the information dictionary in full, the XMP packet, the
   file-format version, the catalog language, the tagged flag, the file
   identifier, the encryption posture, the outline, embedded file
@@ -130,7 +157,13 @@ collector's parse of the same document:
 - Every image the page drew becomes a `PictureItem` with the box the
   content stream placed it at.
 - Runs the markdown dropped go into the furniture group under
-  `CONTENT_LAYER_FURNITURE` when `report_furniture` is set.
+  `CONTENT_LAYER_FURNITURE` when `report_furniture` is set, and runs the
+  page drew invisibly go into the same group under
+  `CONTENT_LAYER_INVISIBLE`, with their boxes. A hidden watermark is an
+  item a coordinator can act on rather than text nobody was told about.
+- `PageItem.quality` carries what the reading pass measured about a page:
+  the replacement-character runs, the garble score, and the OCR
+  recommendation when there is one.
 - Every item's `CollectorSource` is `collector: "pdf"`,
   `model: "pdf-inspector <crate version>"`, `version: <this build's
   version>`, `confidence: <the detection confidence from info>`.
@@ -216,4 +249,5 @@ memory with lopdf; nothing binary is committed.
 
 ## License
 
-Apache-2.0 (this repo). The wrapped `pdf-inspector` crate is MIT.
+Apache-2.0 (this repo). The vendored `pdf-inspector` crate under
+`vendor/pdf-inspector` is MIT, and keeps its own LICENSE file.

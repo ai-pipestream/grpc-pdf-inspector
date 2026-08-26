@@ -562,6 +562,108 @@ pub fn table_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page PDF whose table is drawn with real rules and whose
+/// cells hold prose rather than short aligned tokens.
+///
+/// The rules are the structure: horizontal lines between the rows and
+/// vertical lines between the columns, drawn as path operators. Nothing
+/// about the text says "table" on its own, which is the point. The
+/// alignment-based detector reads a page like this as paragraphs, and only
+/// the line-driven detector sees the grid the document actually drew.
+#[must_use]
+pub fn ruled_table_pdf() -> Vec<u8> {
+    const LEFT: i32 = 72;
+    const MIDDLE: i32 = 220;
+    const RIGHT: i32 = 540;
+    const ROWS: [(&str, &str); 4] = [
+        (
+            "Analytical Engine",
+            "A general purpose machine described in 1837 and never built.",
+        ),
+        (
+            "Difference Engine",
+            "A special purpose calculator for polynomial tables.",
+        ),
+        (
+            "Jacquard loom",
+            "The punched card mechanism both engines borrowed from weaving.",
+        ),
+        (
+            "Notes upon it",
+            "The 1843 translation whose appendix carries the first program.",
+        ),
+    ];
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut content = String::new();
+    // Prose above the table, so the document classifies as text-based and
+    // the table is not the only thing on the page.
+    for line in 0..4 {
+        let y = 760 - 14 * line;
+        content.push_str(&format!(
+            "BT /F1 11 Tf 72 {y} Td (Introductory line {line} of ordinary running prose, set to fill the measure.) Tj ET\n"
+        ));
+    }
+
+    // The rules: one horizontal per row edge, one vertical per column edge.
+    let row_edges: Vec<i32> = (0..=4).map(|row| 700 - 30 * row).collect();
+    for y in &row_edges {
+        content.push_str(&format!("{LEFT} {y} m {RIGHT} {y} l S\n"));
+    }
+    let (top, bottom) = (row_edges[0], row_edges[row_edges.len() - 1]);
+    for x in [LEFT, MIDDLE, RIGHT] {
+        content.push_str(&format!("{x} {bottom} m {x} {top} l S\n"));
+    }
+
+    // The cells, each sitting inside its ruled box.
+    for (row, (label, description)) in ROWS.iter().enumerate() {
+        let y = row_edges[row] - 20;
+        content.push_str(&format!(
+            "BT /F1 10 Tf {} {y} Td ({label}) Tj ET\n",
+            LEFT + 6
+        ));
+        content.push_str(&format!(
+            "BT /F1 10 Tf {} {y} Td ({description}) Tj ET\n",
+            MIDDLE + 6
+        ));
+    }
+
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Build a PDF of `pages` pages, each carrying a running head at the top,
 /// a folio number at the bottom, and a paragraph of body text between them.
 ///
@@ -802,6 +904,168 @@ fn illustrated(link: FigureLink<'_>) -> Vec<u8> {
             "Type" => "Pages",
             "Kids" => kids,
             "Count" => count,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a one-page PDF carrying a paragraph of visible prose and a
+/// watermark drawn with text rendering mode 3.
+///
+/// `3 Tr` selects the neither-fill-nor-stroke rendering mode: the show
+/// operator runs, the text matrix advances, and no glyph is painted. It is
+/// how a scan's OCR layer hides behind its raster and how a watermark is
+/// carried without being printed. A reader sees only the paragraph, and
+/// every extraction this service ever did saw only the paragraph too.
+#[must_use]
+pub fn invisible_text_pdf(watermark: &str) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut content = String::new();
+    for line in 0..6 {
+        let y = 700 - 16 * line;
+        content.push_str(&format!(
+            "BT /F1 11 Tf 72 {y} Td (Visible line {line} of the article a reader actually sees.) Tj ET\n"
+        ));
+    }
+    // The hidden run: its own text block, its own rendering mode, far
+    // enough from the prose that nothing joins it to a visible line.
+    content.push_str(&format!(
+        "BT 3 Tr /F1 30 Tf 140 300 Td ({watermark}) Tj ET\n"
+    ));
+
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Prose long enough for letter statistics to mean anything, one line per
+/// entry.
+const PROSE: [&str; 8] = [
+    "The analytical engine weaves algebraic patterns just as the loom weaves",
+    "flowers and leaves, and the distinctive characteristic of the machine is",
+    "the introduction of the principle which Jacquard devised for regulating,",
+    "by means of punched cards, the most complicated patterns in the fabrication",
+    "of brocaded stuffs. In enabling mechanism to combine together general",
+    "symbols in successions of unlimited variety and extent, a uniting link is",
+    "established between the operations of matter and the abstract mental",
+    "processes of the most abstract branch of mathematical science.",
+];
+
+/// Substitute every letter through a fixed permutation of the alphabet,
+/// alternating case as it goes.
+///
+/// This is what a broken ToUnicode CMap does to a text layer: every
+/// character is mapped through a constant offset, so the output is
+/// printable ASCII with word-like token lengths and no replacement
+/// character anywhere. What gives it away is the letter statistics. The
+/// histogram is a permutation of a natural one, so its shape is unchanged
+/// and its positions are wrong; the vowels starve, because the letters that
+/// land on vowels are rarer than vowels are; and words flip case in the
+/// middle, because a shifted alphabet straddles the ASCII case boundary.
+#[must_use]
+pub fn ciphered(source: &str) -> String {
+    source
+        .chars()
+        .map(|character| {
+            if !character.is_ascii_alphabetic() {
+                return character;
+            }
+            let letter = (character.to_ascii_lowercase() as u8 - b'a' + 13) % 26;
+            if letter.is_multiple_of(2) {
+                (b'A' + letter) as char
+            } else {
+                (b'a' + letter) as char
+            }
+        })
+        .collect()
+}
+
+/// Build a two-page PDF whose first page is ordinary prose and whose second
+/// page is the same prose put through [`ciphered`].
+///
+/// Both pages carry the same number of letters, so the only difference
+/// between them is where those letters fall.
+#[must_use]
+pub fn garbled_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for garble in [false, true] {
+        let mut content = String::new();
+        for (index, line) in PROSE.iter().enumerate() {
+            let y = 700 - 16 * i32::try_from(index).expect("eight lines fit in an i32");
+            let text = if garble {
+                ciphered(line)
+            } else {
+                (*line).to_owned()
+            };
+            content.push_str(&format!("BT /F1 11 Tf 72 {y} Td ({text}) Tj ET\n"));
+        }
+
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => 2,
         }),
     );
     let catalog_id = doc.add_object(dictionary! {

@@ -95,6 +95,23 @@ pub struct PdfOptions {
     /// without the body having to carry it.
     #[prost(bool, tag="9")]
     pub report_furniture: bool,
+    /// Report the text the page drew invisibly, on `PageMarkdown.invisible`.
+    /// Default false.
+    ///
+    /// Text drawn with rendering mode 3 is on the page and cannot be seen: an
+    /// OCR layer sitting behind a scan, a watermark meant not to print, a
+    /// template's hidden field labels. It stays out of the markdown, which is
+    /// right, because it is not content a reader saw. Leaving it out silently
+    /// is not: a document can carry text that nothing downstream ever hears
+    /// about. Setting this streams those runs with their boxes, beside the
+    /// visible ones rather than inside them.
+    ///
+    /// `ParseStatus.has_invisible_text` says whether there was any at all, in
+    /// every FULL call and at no cost. This flag is what turns the runs
+    /// themselves on, and it costs a second walk of the content streams,
+    /// taken only for a document that actually drew invisible text.
+    #[prost(bool, tag="10")]
+    pub report_invisible: bool,
 }
 /// TableCells is one row of a detected table.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -113,9 +130,14 @@ pub struct TableRegion {
     /// boundaries below do not name.
     #[prost(message, optional, tag="1")]
     pub bbox: ::core::option::Option<Rect>,
-    /// Where each column starts, as an x position in page points, ascending.
-    /// One per column: these are the detector's own column positions, not
-    /// fences, so the last column runs to `bbox`'s right edge.
+    /// Where the columns divide, as x positions in page points, ascending.
+    ///
+    /// These are the detector's own numbers and which detector found the
+    /// table decides what they are: a table drawn with rules reports the
+    /// ruled edges, so a two-column grid has three of them, while a table
+    /// found from alignment alone reports where each column's text starts and
+    /// has one per column. `bbox` closes the extent either way, which is what
+    /// makes the last column's far edge knowable in both cases.
     #[prost(double, repeated, tag="2")]
     pub column_boundaries: ::prost::alloc::vec::Vec<f64>,
     /// Where each row sits, as a y position in page points, descending —
@@ -292,7 +314,7 @@ pub struct PdfInfo {
 /// scanned and image-based documents have nothing to extract and produce
 /// none. With the password fallback (see PdfOptions.password) the whole
 /// document's markdown arrives as one event with `page_no` 0.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PageMarkdown {
     /// The 1-indexed page this markdown came from, or 0 for the
     /// whole-document fallback.
@@ -333,6 +355,31 @@ pub struct PageMarkdown {
     /// without putting it back into the body.
     #[prost(string, repeated, tag="6")]
     pub furniture: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The runs this page drew with text rendering mode 3, which paints no
+    /// glyphs: an OCR layer behind a scan, a hidden watermark, a template's
+    /// unfilled labels.
+    ///
+    /// Empty unless `PdfOptions.report_invisible` was set, and empty then too
+    /// for a page that drew none. These runs are never in `markdown`, because
+    /// they are not content a reader saw, and they carry their boxes, so a
+    /// consumer can say where on the page the hidden text sits.
+    #[prost(message, repeated, tag="7")]
+    pub invisible: ::prost::alloc::vec::Vec<TextSpan>,
+    /// How far this page's letter frequencies sit from natural language, 0.0
+    /// for a page whose letters fall where a Latin-script language puts them
+    /// and rising towards 1.0 as they do not.
+    ///
+    /// This is the evidence behind OCR_REASON_SUSPECTED_GARBLED: a broken
+    /// ToUnicode CMap shifts every character by a per-range constant, so
+    /// "Certificate" extracts as "8VceZWZTReV": printable ASCII, word-like
+    /// token lengths, no replacement character anywhere, and a letter
+    /// histogram that is a permutation of a natural one. Ordinary prose
+    /// scores near 0.05; cipher garble scores near 0.47.
+    ///
+    /// Absent when the page carried too few letters for the statistic to mean
+    /// anything, which is the honest answer rather than a reassuring zero.
+    #[prost(double, optional, tag="8")]
+    pub garble_score: ::core::option::Option<f64>,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.
@@ -657,6 +704,16 @@ pub struct ParseStatus {
     /// it stays for callers that only want the routing bit.
     #[prost(message, repeated, tag="6")]
     pub extraction_ocr_reasons: ::prost::alloc::vec::Vec<PageOcrReasons>,
+    /// True when some extracted page drew text with rendering mode 3, which
+    /// paints no glyphs and therefore never reaches the markdown.
+    ///
+    /// Reported in FULL for text-bearing documents whether or not
+    /// `PdfOptions.report_invisible` was set, because it is what the
+    /// extraction pass already knows and a hidden text layer nobody is told
+    /// about is the thing this field exists to prevent. Set the option to see
+    /// the runs themselves on `PageMarkdown.invisible`.
+    #[prost(bool, tag="7")]
+    pub has_invisible_text: bool,
 }
 /// ServerLimits reports the ceilings a server actually enforces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

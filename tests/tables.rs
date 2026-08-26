@@ -65,6 +65,91 @@ async fn a_borderless_table_reaches_the_wire_as_a_grid_with_coordinates() {
 }
 
 #[tokio::test]
+async fn a_ruled_table_the_alignment_detector_misses_reaches_the_wire() {
+    // The alignment detector finds nothing here: the cells are prose, of
+    // every width, and nothing about the text says "table". What says it is
+    // the rules the document drew, and until the vendored crate published
+    // its vector geometry the detector that reads them was unreachable, so
+    // a table with real rules came out worse than a borderless one.
+    let ruled = common::ruled_table_pdf();
+    let items = pdf_inspector::extract_text_with_positions_mem(&ruled).expect("runs");
+    assert!(
+        pdf_inspector::tables::detect_tables(
+            &items,
+            grpc_pdf_inspector::tables::body_font_size(&items),
+            false,
+        )
+        .is_empty(),
+        "the fixture is only interesting while alignment alone misses it"
+    );
+
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &ruled,
+            pb::PdfOptions {
+                emit_tables: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    let pages = common::tables(&events);
+    assert_eq!(pages.len(), 1, "one page, one table event");
+    let table = &pages[0].tables[0];
+    assert_eq!(table.kind, pb::TableKind::Data as i32);
+    assert_eq!(
+        table.column_boundaries,
+        [72.0, 220.0, 540.0],
+        "the boundaries are the rules the document drew, to the point"
+    );
+    let cells: Vec<&str> = table
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter().map(String::as_str))
+        .collect();
+    assert!(
+        cells.contains(&"Analytical Engine"),
+        "the cells are the document's own: {cells:?}"
+    );
+
+    let layout = common::status(&events)
+        .layout
+        .as_ref()
+        .expect("FULL reports layout");
+    assert_eq!(
+        layout.pages_with_tables,
+        [1],
+        "and the layout verdict now comes from the same detector that found it"
+    );
+    assert!(layout.is_complex);
+}
+
+#[tokio::test]
+async fn the_layout_verdict_survives_the_analysis_pass_it_replaced() {
+    // The borderless fixture reached `pages_with_tables` through a separate
+    // analysis pass over the file. It reaches it through the page loop now,
+    // and the answer is the same one.
+    let harness = common::start().await;
+    let events = harness.parse_ok(&common::table_pdf()).await;
+    let layout = common::status(&events)
+        .layout
+        .as_ref()
+        .expect("FULL reports layout");
+    assert_eq!(layout.pages_with_tables, [1]);
+    assert!(layout.pages_with_columns.is_empty());
+    assert!(layout.is_complex);
+
+    let plain = harness.parse_ok(&common::text_pdf(2, 60, "prose")).await;
+    let layout = common::status(&plain)
+        .layout
+        .as_ref()
+        .expect("FULL reports layout");
+    assert!(!layout.is_complex, "and prose is still prose: {layout:?}");
+}
+
+#[tokio::test]
 async fn the_fold_puts_the_grid_in_the_documents_tables_not_in_a_paragraph() {
     let harness = common::start().await;
     let events = harness

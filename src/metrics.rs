@@ -30,6 +30,8 @@ pub struct Metrics {
     bytes_uploaded: AtomicU64,
     /// Markdown bytes emitted across all `page` events.
     markdown_bytes_emitted: AtomicU64,
+    /// Passes over an uploaded document, whichever reader made them.
+    parser_passes: AtomicU64,
 }
 
 /// A consistent-enough read of every counter, for logging and for tests.
@@ -47,6 +49,8 @@ pub struct Snapshot {
     pub bytes_uploaded: u64,
     /// See [`Metrics::markdown_bytes_emitted`].
     pub markdown_bytes_emitted: u64,
+    /// See [`Metrics::parser_passes`].
+    pub parser_passes: u64,
 }
 
 impl Metrics {
@@ -83,6 +87,17 @@ impl Metrics {
         self.bytes_uploaded.fetch_add(bytes, Ordering::Relaxed);
     }
 
+    /// Count one pass over an uploaded document.
+    ///
+    /// A pass is one walk of the buffer by one reader: classification, the
+    /// analysis pass in ANALYZE, the extraction pass, the invisible-layer
+    /// re-walk, the structure-tree read, the metadata read. It is the cost
+    /// this service actually pays per call, and a test can hold it to a
+    /// number instead of trusting a comment.
+    pub fn parser_pass(&self) {
+        self.parser_passes.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Read every counter.
     #[must_use]
     pub fn snapshot(&self) -> Snapshot {
@@ -93,6 +108,7 @@ impl Metrics {
             pages_emitted: self.pages_emitted.load(Ordering::Relaxed),
             bytes_uploaded: self.bytes_uploaded.load(Ordering::Relaxed),
             markdown_bytes_emitted: self.markdown_bytes_emitted.load(Ordering::Relaxed),
+            parser_passes: self.parser_passes.load(Ordering::Relaxed),
         }
     }
 }
@@ -103,13 +119,15 @@ impl std::fmt::Display for Snapshot {
         write!(
             f,
             "grpc-pdf-inspector metrics parses_started={} parses_succeeded={} \
-             parses_failed={} pages_emitted={} bytes_uploaded={} markdown_bytes_emitted={}",
+             parses_failed={} pages_emitted={} bytes_uploaded={} markdown_bytes_emitted={} \
+             parser_passes={}",
             self.parses_started,
             self.parses_succeeded,
             self.parses_failed,
             self.pages_emitted,
             self.bytes_uploaded,
             self.markdown_bytes_emitted,
+            self.parser_passes,
         )
     }
 }
@@ -147,6 +165,8 @@ mod tests {
     fn counters_accumulate_and_render() {
         let metrics = Metrics::new();
         metrics.parse_started();
+        metrics.parser_pass();
+        metrics.parser_pass();
         metrics.page_emitted(512);
         metrics.page_emitted(256);
         metrics.parse_succeeded();
@@ -156,9 +176,11 @@ mod tests {
         assert_eq!(snapshot.pages_emitted, 2);
         assert_eq!(snapshot.markdown_bytes_emitted, 768);
         assert_eq!(snapshot.parses_failed, 0);
+        assert_eq!(snapshot.parser_passes, 2);
 
         let line = snapshot.to_string();
         assert!(line.contains("pages_emitted=2"), "{line}");
         assert!(line.contains("parses_failed=0"), "{line}");
+        assert!(line.contains("parser_passes=2"), "{line}");
     }
 }

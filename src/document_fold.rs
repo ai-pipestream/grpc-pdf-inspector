@@ -35,6 +35,12 @@
 //!   folio numbers are stripped from the body by default and used to
 //!   vanish. When the stream reports them they go into the furniture group
 //!   under `CONTENT_LAYER_FURNITURE`, which is what that layer is for.
+//! - **Invisible text is reported too.** A run drawn with rendering mode 3
+//!   paints no glyphs, so no reader saw it and it is not body text. It
+//!   hangs off the same group under `CONTENT_LAYER_INVISIBLE`, with the
+//!   box the content stream put it at, so a hidden watermark or an OCR
+//!   layer behind a scan becomes an item a coordinator can act on instead
+//!   of text that was simply never mentioned.
 //! - **Metadata is the file's own.** `source_meta`, `outline`,
 //!   `attachments` and `anchors` come from the document's dictionaries
 //!   rather than from its text — an authored outline is better evidence of
@@ -397,6 +403,9 @@ impl DocumentFold {
         for line in &page.furniture {
             self.push_furniture(line, page.page_no);
         }
+        for run in &page.invisible {
+            self.push_invisible(run, page.page_no);
+        }
         self.push_pictures(page.page_no);
         for block in blocks(&page.markdown) {
             match block {
@@ -462,7 +471,9 @@ impl DocumentFold {
     /// decoded to mojibake says so here even when the document as a whole
     /// looked fine to the sampling detection.
     fn on_page_quality(&mut self, page: &pb::PageMarkdown) {
-        if page.page_no == 0 || (!page.needs_ocr && page.replacement_runs == 0) {
+        if page.page_no == 0
+            || (!page.needs_ocr && page.replacement_runs == 0 && page.garble_score.is_none())
+        {
             return;
         }
         let page_no = i32::try_from(page.page_no).unwrap_or(i32::MAX);
@@ -473,6 +484,10 @@ impl DocumentFold {
         });
         let quality = item.quality.get_or_insert_default();
         quality.replacement_runs = Some(i32::try_from(page.replacement_runs).unwrap_or(i32::MAX));
+        // The letter-frequency distance the extraction measured, when the
+        // page carried enough letters to measure it. A page that did not is
+        // left unset rather than reported as clean.
+        quality.garble_score = page.garble_score;
         if page.needs_ocr {
             quality.ocr_recommended = Some(true);
         }
@@ -538,6 +553,43 @@ impl DocumentFold {
                     label: doc::DocItemLabel::Text as i32,
                     orig: text.to_owned(),
                     text: text.to_owned(),
+                    source: vec![doc::SourceType {
+                        source: Some(doc::source_type::Source::Collector(self.source.clone())),
+                    }],
+                    ..doc::TextItemBase::default()
+                }),
+            })),
+        });
+        if let Some(furniture) = self.document.furniture.as_mut() {
+            furniture.children.push(reference(&self_ref));
+        }
+    }
+
+    /// Put one run the page drew invisibly into the invisible layer.
+    ///
+    /// Text drawn with rendering mode 3 paints no glyphs, so it never
+    /// reaches the markdown and no reader ever saw it. It is still text the
+    /// document carries: an OCR layer behind a scan, a watermark, a
+    /// template's hidden labels. `CONTENT_LAYER_INVISIBLE` is the layer for
+    /// exactly that, and the furniture group is where it hangs, because the
+    /// schema's own word for that group is page elements that are not part
+    /// of the semantic body and it names watermarks among them.
+    ///
+    /// The run keeps its box, so a consumer can say where the hidden text
+    /// sits rather than only that it exists.
+    fn push_invisible(&mut self, run: &pb::TextSpan, page_no: u32) {
+        let self_ref = format!("#/texts/{}", self.document.texts.len());
+        self.document.texts.push(doc::BaseTextItem {
+            item: Some(doc::base_text_item::Item::Text(doc::TextItem {
+                base: Some(doc::TextItemBase {
+                    self_ref: self_ref.clone(),
+                    parent: Some(reference(FURNITURE_REF)),
+                    content_layer: doc::ContentLayer::Invisible as i32,
+                    meta: Some(doc::BaseMeta::default()),
+                    prov: provenance(page_no, run.bbox.as_ref().map(bounding_box)),
+                    label: doc::DocItemLabel::Text as i32,
+                    orig: run.text.clone(),
+                    text: run.text.clone(),
                     source: vec![doc::SourceType {
                         source: Some(doc::source_type::Source::Collector(self.source.clone())),
                     }],
@@ -1799,20 +1851,85 @@ mod tests {
             needs_ocr: true,
             ocr_reason: pb::OcrReason::SuspectedGarbled.into(),
             replacement_runs: 7,
+            garble_score: Some(0.47),
             ..pb::PageMarkdown::default()
         }));
         let document = fold.take();
 
         assert!(
             document.pages[&1].quality.is_none(),
-            "a clean page has nothing to report"
+            "a page the reading pass measured nothing on has nothing to report"
         );
         let quality = quality_of(&document, 2);
         assert_eq!(quality.replacement_runs, Some(7));
         assert_eq!(quality.ocr_recommended, Some(true));
+        assert_eq!(
+            quality.garble_score,
+            Some(0.47),
+            "the letter-frequency score arrives measured, not derived here"
+        );
+    }
+
+    #[test]
+    fn a_score_alone_is_enough_to_open_a_pages_quality() {
+        // A clean page still carries a measurement, and a measurement is
+        // what this field is for. It used to take a verdict to open the
+        // block, because there was no number to put in it.
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: "clean text".to_owned(),
+            garble_score: Some(0.04),
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+
+        let quality = quality_of(&document, 1);
+        assert_eq!(quality.garble_score, Some(0.04));
+        assert_eq!(quality.ocr_recommended, None, "measured, not condemned");
+    }
+
+    #[test]
+    fn an_invisible_run_becomes_an_item_in_the_invisible_layer() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: "The visible article.".to_owned(),
+            invisible: vec![pb::TextSpan {
+                text: "CONFIDENTIAL DRAFT".to_owned(),
+                bbox: Some(pb::Rect {
+                    x: 100.0,
+                    y: 400.0,
+                    width: 300.0,
+                    height: 40.0,
+                }),
+                kind: pb::SpanKind::Text.into(),
+                ..pb::TextSpan::default()
+            }],
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+
+        let hidden = document
+            .texts
+            .iter()
+            .map(base_of)
+            .find(|base| base.text == "CONFIDENTIAL DRAFT")
+            .expect("the hidden run is an item, not an absence");
+        assert_eq!(hidden.content_layer, doc::ContentLayer::Invisible as i32);
+        assert_eq!(hidden.parent.as_ref().unwrap().r#ref, FURNITURE_REF);
+        let bbox = hidden.prov[0].bbox.as_ref().expect("its box came with it");
+        assert!((bbox.l - 100.0).abs() < f64::EPSILON);
+        assert!((bbox.b - 400.0).abs() < f64::EPSILON);
         assert!(
-            quality.garble_score.is_none(),
-            "the letter-frequency score is not this pipeline's to give"
+            document
+                .texts
+                .iter()
+                .map(base_of)
+                .any(|base| base.content_layer == doc::ContentLayer::Body as i32),
+            "the visible article is still body"
         );
     }
 
