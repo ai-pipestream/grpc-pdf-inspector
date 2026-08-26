@@ -2,6 +2,9 @@
 # keeps a stale host `target/` (gigabytes, and built against the wrong libc)
 # out of the builder.
 target
+# Building the vendored crate on its own manifest leaves a target tree beside
+# its sources, and the root pattern above does not reach it.
+vendor/*/target
 .git
 .github
 docs
