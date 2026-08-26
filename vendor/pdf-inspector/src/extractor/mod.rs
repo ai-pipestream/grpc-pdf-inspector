@@ -148,7 +148,62 @@ pub fn extract_text_with_positions_and_rects_mem(
     buffer: &[u8],
     page_filter: Option<&HashSet<u32>>,
 ) -> Result<PageExtraction, PdfError> {
-    extract_text_with_positions_mem_and_rects(buffer, page_filter)
+    let (extraction, _skipped_invisible) =
+        extract_text_with_positions_and_rects_mem_with_invisible(buffer, page_filter, false)?;
+    Ok(extraction)
+}
+
+/// [`extract_text_with_positions_and_rects_mem`] with the invisible layer
+/// under the caller's control, reporting what the walk did with it.
+///
+/// Text drawn with rendering mode 3 is invisible on the page: an
+/// OCR-under-image layer behind a scan, a watermark meant not to print, a
+/// template's hidden field labels. The content-stream walker has always
+/// taken a parameter deciding whether to keep it, and every public entry
+/// point passed `false` and dropped the flag saying whether there had been
+/// anything to keep. Both halves are the caller's now.
+///
+/// With `include_invisible` false this returns exactly what
+/// [`extract_text_with_positions_and_rects_mem`] returns, and the flag says
+/// whether some selected page drew invisible runs the walk left out. With
+/// it true those runs are among the items and the flag is false, because
+/// nothing was dropped.
+pub fn extract_text_with_positions_and_rects_mem_with_invisible(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    include_invisible: bool,
+) -> Result<(PageExtraction, bool), PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
+    let (doc, _) = crate::load_document_from_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let (extraction, _thresholds, _gid_pages, skipped_invisible) =
+        extract_positioned_text_from_doc_reporting_invisible(
+            &doc,
+            &font_cmaps,
+            page_filter,
+            include_invisible,
+        )?;
+    Ok((extraction, skipped_invisible))
+}
+
+/// [`extract_text_with_positions_mem_pages`] with the invisible layer under
+/// the caller's control, reporting what the walk did with it.
+///
+/// The items-only sibling of
+/// [`extract_text_with_positions_and_rects_mem_with_invisible`]; see there
+/// for what the flag means.
+pub fn extract_text_with_positions_mem_pages_with_invisible(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    include_invisible: bool,
+) -> Result<(Vec<TextItem>, bool), PdfError> {
+    let ((items, _rects, _lines), skipped_invisible) =
+        extract_text_with_positions_and_rects_mem_with_invisible(
+            buffer,
+            page_filter,
+            include_invisible,
+        )?;
+    Ok((items, skipped_invisible))
 }
 
 /// Extract text with positions and rectangles from memory buffer.
@@ -267,6 +322,28 @@ pub(crate) fn extract_positioned_text_for_document_analysis(
     extract_positioned_text_impl(doc, font_cmaps, None, false, Some(required_pages))
 }
 
+/// [`extract_positioned_text_impl`] keeping the flag it reports about the
+/// invisible layer.
+///
+/// The tuple is the one the wrappers above return, with `skipped_invisible`
+/// appended: true when some page drew text with rendering mode 3 that this
+/// walk left out, which is exactly the evidence that an
+/// `include_invisible` walk would find something.
+pub(crate) fn extract_positioned_text_from_doc_reporting_invisible(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+    include_invisible: bool,
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, bool), PdfError> {
+    extract_positioned_text_impl_reporting_invisible(
+        doc,
+        font_cmaps,
+        page_filter,
+        include_invisible,
+        None,
+    )
+}
+
 fn extract_positioned_text_impl(
     doc: &Document,
     font_cmaps: &FontCMaps,
@@ -274,12 +351,31 @@ fn extract_positioned_text_impl(
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
+    let (extraction, thresholds, gid_pages, _skipped_invisible) =
+        extract_positioned_text_impl_reporting_invisible(
+            doc,
+            font_cmaps,
+            page_filter,
+            include_invisible,
+            required_pages,
+        )?;
+    Ok((extraction, thresholds, gid_pages))
+}
+
+fn extract_positioned_text_impl_reporting_invisible(
+    doc: &Document,
+    font_cmaps: &FontCMaps,
+    page_filter: Option<&HashSet<u32>>,
+    include_invisible: bool,
+    required_pages: Option<&HashSet<u32>>,
+) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, bool), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
+    let mut skipped_invisible_anywhere = false;
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -303,7 +399,7 @@ fn extract_positioned_text_impl(
             &mut style_cache,
             &mut FormWalkBudget::new(),
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, _skipped_invisible) =
+        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, skipped_invisible) =
             match page_result {
                 Ok(extraction) => extraction,
                 Err(error)
@@ -317,6 +413,7 @@ fn extract_positioned_text_impl(
                 }
                 Err(error) => return Err(error),
             };
+        skipped_invisible_anywhere |= skipped_invisible;
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
         // outside the CropBox. Extracting it interleaves invisible text into
@@ -455,6 +552,7 @@ fn extract_positioned_text_impl(
         (all_items, all_rects, all_lines),
         page_thresholds,
         gid_encoded_pages,
+        skipped_invisible_anywhere,
     ))
 }
 

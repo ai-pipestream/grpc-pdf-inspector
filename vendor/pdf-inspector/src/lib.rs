@@ -51,7 +51,8 @@ pub use detector::{
 };
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_and_rects_mem,
-    extract_text_with_positions_mem, extract_text_with_positions_pages,
+    extract_text_with_positions_and_rects_mem_with_invisible, extract_text_with_positions_mem,
+    extract_text_with_positions_mem_pages_with_invisible, extract_text_with_positions_pages,
     extract_text_with_positions_pages_with_password,
 };
 pub use markdown::{
