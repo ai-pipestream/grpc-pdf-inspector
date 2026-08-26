@@ -13,7 +13,7 @@ blocked on nothing but visibility. Each one is data this crate already computes
 and does not return, and each one was reachable only by an upstream change. The
 crate's licence permits making that change here, so it is made here.
 
-The four private APIs, and what each unblocks:
+The private APIs, and what each unblocks:
 
 1. **`include_invisible` and `skipped_invisible`** (`src/extractor/`,
    `src/extractor/content_stream.rs`). The content-stream walker recognises
@@ -35,13 +35,19 @@ The four private APIs, and what each unblocks:
    `ColumnRegion` were `pub(crate)`, so layout complexity could not be
    recomputed from items a caller already holds, and FULL mode had to run a
    whole second read of the file to get the answer.
+5. **The header, footer and folio stripper** (`src/markdown/mod.rs`).
+   `strip_repeated_header_footer_lines` was `pub(crate)`, so a caller could not
+   ask which lines the crate judges to be page furniture. The service renders
+   one page at a time, and the classifier behind that function proves furniture
+   by repetition across pages, so on the service's own calls it can prove
+   nothing: the judgement had to be reachable over the whole document
+   separately from the rendering, or be reinvented outside the parser.
 
 ## How the patches are kept auditable
 
 The copy landed in its own commit, with the tree building and testing
-identically to the registry build, before any API was touched. Each of the four
-patches is a separate commit after it, listed by SHA in
-`docs/capture-deferrals.md`. Every patch is additive: nothing that was public
+identically to the registry build, before any API was touched. Each patch is a
+separate commit after it, listed by SHA in `docs/capture-deferrals.md`. Every patch is additive: nothing that was public
 changed shape, and the crate's own tests are the ones it shipped with.
 
 The crate keeps its own style, its own formatting and its own lint posture.
@@ -49,6 +55,6 @@ Files here are not reformatted to match the service.
 
 ## Re-vendoring a newer release
 
-Copy the new version over this directory, keep this README and re-apply the four
+Copy the new version over this directory, keep this README and re-apply the
 patches by reading the commits named in `docs/capture-deferrals.md`. Do not
 merge the service's style into the crate.

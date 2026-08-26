@@ -1381,7 +1381,7 @@ pub fn to_markdown(text: &str, options: MarkdownOptions) -> String {
 }
 
 /// Applies the document-wide repeated header/footer classifier to grouped lines.
-pub(crate) fn strip_repeated_header_footer_lines(
+pub fn strip_repeated_header_footer_lines(
     lines: Vec<crate::types::TextLine>,
     page_count: u32,
 ) -> Vec<crate::types::TextLine> {
