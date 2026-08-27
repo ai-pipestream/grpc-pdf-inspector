@@ -84,7 +84,10 @@ what the extraction pass already produced. `report_furniture` reports a
 page's chrome (the running head, the footer, the folio, the numbers ruled
 down the margin), which the strippers remove and used to remove silently,
 and reports separately, on `dropped`, the runs the rendering left out,
-which are content rather than chrome and go back into the body.
+which are content rather than chrome and go back into the body. It also
+keeps that chrome out of `markdown`: the verdict is taken before the page
+is rendered and the convicted runs never reach the renderer, so a margin
+line number cannot fuse into the sentence it stands beside.
 `report_invisible` reports the runs a page drew with rendering mode 3, which
 paint no glyphs at all: it costs a second walk of the content streams, and
 only for a document whose first walk found an invisible layer to walk.

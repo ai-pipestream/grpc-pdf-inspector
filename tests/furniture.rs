@@ -148,3 +148,90 @@ async fn page_chrome_lands_in_the_documents_furniture_layer() {
         "the head is furniture, so it is not also a body item: {body_texts:?}"
     );
 }
+
+/// The head the review fixture prints on every page, ruled underneath.
+const REVIEW_HEAD: &str = "Under review as a conference paper";
+
+/// How many rows the review fixture numbers on each page.
+const REVIEW_ROWS: u32 = 40;
+
+/// Parse the review fixture, with the chrome report on or off.
+async fn review_pages(report_furniture: bool) -> Vec<pb::parse_pdf_response::Event> {
+    let harness = common::start().await;
+    harness
+        .parse(
+            &common::review_paper_pdf(11, REVIEW_HEAD),
+            pb::PdfOptions {
+                report_furniture,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse")
+}
+
+#[tokio::test]
+async fn chrome_never_reaches_the_markdown() {
+    let events = review_pages(true).await;
+    let pages = common::pages(&events);
+    assert_eq!(pages.len(), 11);
+
+    for page in pages {
+        assert!(
+            !page.markdown.contains(REVIEW_HEAD),
+            "the head is chrome and the rendering never saw it, page {}",
+            page.page_no
+        );
+        assert!(
+            !page.markdown.contains("**"),
+            "a margin number set in bold prints `**001**` when it fuses into a \
+             line; page {} has one: {:?}",
+            page.page_no,
+            page.markdown.chars().take(120).collect::<String>()
+        );
+        for row in 0..REVIEW_ROWS {
+            let number = format!("{:03}", (page.page_no - 1) * REVIEW_ROWS + row);
+            assert!(
+                !page.markdown.contains(&number),
+                "the margin number {number} is chrome and is not in the body text \
+                 of page {}",
+                page.page_no
+            );
+        }
+        // Every sentence starts a line or follows a space. A number fused
+        // into the line lands immediately before one of them, and this is
+        // what that reads like from a consumer's side.
+        for (at, _) in page.markdown.match_indices("Body row") {
+            let before = page.markdown[..at].chars().next_back();
+            assert!(
+                before.is_none_or(char::is_whitespace),
+                "page {} glued something onto a sentence: {:?}",
+                page.page_no,
+                page.markdown[at.saturating_sub(12)..at].to_owned()
+            );
+        }
+        assert!(
+            page.markdown.contains("Body row 0 of page"),
+            "the prose itself survived on page {}",
+            page.page_no
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_fusion_is_real_and_the_report_is_what_prevents_it() {
+    // The same fixture with no chrome verdict asked for: the margin
+    // numbers share their rows' baselines, the renderer assembles a line
+    // from the runs that share one, and the numbers come back inside the
+    // body text. Removing them from the rendering's input is the only
+    // thing that separates them, which is why the verdict has to be taken
+    // before the page is rendered rather than after.
+    let events = review_pages(false).await;
+    let page = common::pages(&events)[1];
+    assert!(
+        page.markdown.contains("**040**"),
+        "with no verdict to filter by, the number is in the sentence: {:?}",
+        page.markdown.chars().take(120).collect::<String>()
+    );
+    assert!(page.markdown.contains(REVIEW_HEAD), "and so is the head");
+}

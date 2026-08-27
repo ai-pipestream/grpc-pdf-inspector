@@ -514,13 +514,26 @@ fn parse(
                     )?;
                 }
 
-                // This page's chrome, and the content runs it is not. Both
-                // are taken before the renderer consumes the items.
-                let furniture: Vec<String> = page_items
+                // The page's chrome comes out of the page before the
+                // renderer is given it, and this is the only order that
+                // works. The renderer assembles a line from the runs
+                // sharing its baseline, and a margin line number shares the
+                // baseline of the line it stands beside, so a number left
+                // in the input is not a run the rendering omits or keeps:
+                // it is fused into the middle of the body text, arriving
+                // glued to a word with no space. No verdict taken on the
+                // output can separate them again. Taking the runs out of
+                // the input is what keeps a page's body text the body's,
+                // in the markdown and in every item folded from it.
+                let (chrome_runs, page_items): (Vec<_>, Vec<_>) = page_items
+                    .into_iter()
+                    .partition(|item| chrome.convicts(item));
+                let furniture: Vec<String> = chrome_runs
                     .iter()
-                    .filter(|item| chrome.convicts(item))
                     .map(|item| item.text.trim().to_owned())
                     .collect();
+                // What is left is content, and what the rendering does with
+                // it is what `dropped` answers for.
                 let content: Vec<pb::TextSpan> = if events.wanted(options.report_furniture) {
                     page_items
                         .iter()
@@ -531,7 +544,6 @@ fn parse(
                                     | pdf_inspector::types::ItemType::FormField
                             )
                         })
-                        .filter(|item| !chrome.convicts(item))
                         .map(spans::span)
                         .collect()
                 } else {

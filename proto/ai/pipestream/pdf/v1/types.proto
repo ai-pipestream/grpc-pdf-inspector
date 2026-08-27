@@ -134,6 +134,15 @@ message PdfOptions {
   // layout pass for reasons no option reaches. Setting this names both,
   // separately, so the removal is visible without the body having to carry
   // its chrome and without its content being filed as chrome.
+  //
+  // It also decides what `markdown` is rendered from. The chrome verdict
+  // is taken over the whole document before any page is rendered, and the
+  // runs it convicts are held out of the rendering's input, so a margin
+  // line number cannot fuse into the line it stands beside. Without the
+  // verdict there is nothing to hold out: the renderer assembles a line
+  // from the runs sharing its baseline, a margin number shares one, and it
+  // arrives inside the sentence. The verdict costs a pass over the runs in
+  // memory, which is why it is asked for rather than always taken.
   bool report_furniture = 9;
 
   // Report the text the page drew invisibly, on `PageMarkdown.invisible`.

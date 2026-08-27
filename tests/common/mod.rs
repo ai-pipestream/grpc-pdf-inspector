@@ -831,6 +831,14 @@ pub fn review_paper_pdf(pages: u32, head: &str) -> Vec<u8> {
         "Subtype" => "Type1",
         "BaseFont" => "Helvetica",
     });
+    // The margin numbers are set in a bold face, as the review templates
+    // set them. It is what the renderer prints `**001**` for when the
+    // number fuses into the line beside it.
+    let number_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica-Bold",
+    });
 
     let mut kids = Vec::new();
     for page in 1..=pages {
@@ -842,7 +850,10 @@ pub fn review_paper_pdf(pages: u32, head: &str) -> Vec<u8> {
         for row in 0..ROWS {
             let y = 690 - 16 * row;
             let number = (i32::try_from(page).expect("a page number fits") - 1) * ROWS + row;
-            content.push_str(&format!("BT /F1 7 Tf 45 {y} Td ({number:03}) Tj ET\n"));
+            // Drawn on the row's own baseline, which is the fusion
+            // trigger: the renderer assembles a line from the runs that
+            // share it, so a number left in its input joins the sentence.
+            content.push_str(&format!("BT /F2 7 Tf 45 {y} Td ({number:03}) Tj ET\n"));
             content.push_str(&format!(
                 "BT /F1 10 Tf 72 {y} Td (Body row {row} of page {page} carrying ordinary prose about the method.) Tj ET\n"
             ));
@@ -855,7 +866,7 @@ pub fn review_paper_pdf(pages: u32, head: &str) -> Vec<u8> {
             "Parent" => pages_id,
             "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
             "Resources" => dictionary! {
-                "Font" => dictionary! { "F1" => font_id },
+                "Font" => dictionary! { "F1" => font_id, "F2" => number_id },
             },
             "Contents" => content_id,
         });

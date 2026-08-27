@@ -189,6 +189,18 @@ markdown looked fine.
   and `common::assert_layers_and_parents_agree`, which states the invariant
   the whole plane rests on: an item's layer and the group it hangs under
   say the same thing, and the body walk reaches exactly the body layer.
+- *And the verdict is taken before the rendering, not after it.* The paper
+  numbers every line, and a margin number shares the baseline of the line
+  it stands beside. The renderer assembles a line from the runs sharing
+  one, so a number left in its input is not a run the rendering omits or
+  keeps: it is fused into the middle of the sentence, printed `**001**`
+  from the bold face the template sets it in and glued to the word after
+  it. Five hundred and fifty-six of them read as body text on the real
+  paper. Nothing decided about the output can separate them again, so the
+  convicted runs are held out of the input `markdown` is rendered from,
+  which is also the input every body item's text is folded from.
+  `tests/furniture.rs` asserts both halves: no chrome in the rendering with
+  the verdict, and the fusion itself without it.
 
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page
