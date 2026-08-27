@@ -131,8 +131,10 @@ async fn an_authored_heading_beats_the_markdown_guess() {
     assert_eq!(prose.style_name.as_deref(), Some("P"));
     assert_eq!(
         prose.parent.as_ref().expect("a parent").r#ref,
-        "#/texts/0",
-        "the prose hangs off the heading the tagging found"
+        "#/body",
+        "the prose is the body's own child, beside the heading rather than \
+         under it: what the tagging settled is the header's depth, not who \
+         owns the paragraph"
     );
 }
 

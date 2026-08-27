@@ -173,6 +173,17 @@ impl PageRuns {
             .collect()
     }
 
+    /// Where `run` sits among this page's runs, when it is one of them.
+    ///
+    /// Identity is the box: both this index and the run being looked up
+    /// were built from the same extraction, so the same run has the same
+    /// four numbers on both sides.
+    #[must_use]
+    pub fn index_of(&self, run: &pb::TextSpan) -> Option<usize> {
+        let wanted = bounding_box(run.bbox.as_ref());
+        self.boxes.iter().position(|box_| *box_ == wanted)
+    }
+
     /// The box enclosing the runs that produced `text`, when they can be
     /// found.
     ///
@@ -213,6 +224,7 @@ impl PageRuns {
             bbox: self.union(at, end),
             spans,
             role: self.role(at, end),
+            first_run: self.owners.get(at).copied(),
         }
     }
 
@@ -334,6 +346,9 @@ pub struct Located {
     /// The role the document gave the block, and the name it used, when the
     /// document is tagged.
     pub role: Option<(pb::StructureRole, String)>,
+    /// Which of the page's runs the block starts on, which is where it
+    /// stands in the order the page was drawn in.
+    pub first_run: Option<usize>,
 }
 
 /// For each run, the role of the marked-content region it sits in.

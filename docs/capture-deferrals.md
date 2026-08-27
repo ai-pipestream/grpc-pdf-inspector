@@ -24,7 +24,8 @@ Three reasons appear below and they are not interchangeable:
 | S2 / D17 link annotations | `InlineSpan.hyperlink` over the anchored words, plus item-level `hyperlink` when a block is entirely one link |
 | S10 whole-stream verdict on the Document plane | `PageItem.quality` per page |
 | D1 / D2 per-page OCR verdicts | `PageMarkdown.needs_ocr` / `.ocr_reason`, `ParseStatus.extraction_ocr_reasons` |
-| D6 / D22 stripped furniture | `PageMarkdown.furniture`, and the furniture group under `CONTENT_LAYER_FURNITURE` |
+| D6 / D22 stripped furniture | `PageMarkdown.furniture`, and the furniture group under `CONTENT_LAYER_FURNITURE`, on chrome evidence only |
+| Runs the rendering left out | `PageMarkdown.dropped`, folded back into `#/body` where the page drew them |
 | D8 per-run geometry | `TextSpan.bbox`, and `ProvenanceItem.bbox` on every located item |
 | D9 page dimensions | `PageGeometry.media_box` / `.crop_box`, `PageItem.size` |
 | D10 font identity and size | `TextSpan.font_family` / `.font_tag` / `.font_size` |
@@ -61,7 +62,9 @@ Three reasons appear below and they are not interchangeable:
 
 Four asks stood here, and each one was data the parser crate computes and
 returns through no public API. They were recorded as needing an upstream
-change because there was no way to fix them from the service side.
+change because there was no way to fix them from the service side. A fifth
+ask arrived later, from a regression rather than from the audit, and is
+below with them.
 
 There was a way. The crate is MIT licensed, so it is vendored under
 `vendor/pdf-inspector` and the four APIs are public there. The copy landed
@@ -141,6 +144,34 @@ file for a verdict its own runs already contained.
 - *Tests*: `tests/passes.rs` counts the reads through
   `Metrics::parser_pass`, so a pass coming back fails a test.
 
+**The furniture verdict itself.** The first version of the furniture report
+compared a page's runs against its markdown and named everything missing.
+That conflates two facts: the strippers judged this run to be chrome, and
+the renderer did not emit it. On a two-column paper the second happens to
+most of the page, because the renderer reads one column at a time and a
+scan of its output in reading order finds nothing where it expects it: 1181 of
+one conference paper's 1291 runs were filed as furniture, leaving 110 in
+the body. Consumers that walk the body saw an empty paper while the
+markdown looked fine.
+
+- *Patch* `a3527ad`: `markdown::strip_repeated_header_footer_lines` is
+  public. The classifier behind it proves furniture by repetition across
+  pages, and this service renders one page at a time, so on the service's
+  own calls it can prove nothing; asking it over the whole document is the
+  only way to hear the parser's own verdict.
+- *Wired*: `src/furniture.rs` weighs three kinds of chrome evidence over
+  the whole document (the parser's verdict, a line repeating at the same
+  isolated page edge with its digits read as a shape, and a column of short
+  numbers standing outside the text block), and `PageMarkdown.furniture`
+  carries what they convict. What the renderer left out with no chrome
+  evidence behind it is content, and goes out on `PageMarkdown.dropped`
+  with its box, to be folded back into the body at the place the page drew
+  it.
+- *Tests*: `tests/body_reachability.rs`, over a two-column fixture with a
+  running head and a line number beside every row, asserting that only the
+  chrome is furniture, that every body-layer item is reachable from
+  `#/body`, and that nothing is in both layers.
+
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page
 statistics, which are collapsed into one of four reason strings and several
@@ -168,7 +199,7 @@ canonical schema and is wired: `DocumentMeta.format_version`, `.structured`,
 `PageItem.page_label`, `.media_size` and `.user_unit`;
 `PictureItem.hyperlink` and `.target`.
 
-Nothing is deferred on reachability either. The four asks above are wired,
+Nothing is deferred on reachability either. The asks above are wired,
 and what remains below is deliberate: things that are reachable and homed
 and not worth doing yet.
 

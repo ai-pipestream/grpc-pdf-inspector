@@ -31,10 +31,14 @@
 //!   annotation over that box becomes its `hyperlink` when it leads out of
 //!   the document and its `target` when it leads back into one. Its bytes
 //!   are not decoded, so `image` stays unset.
-//! - **Furniture is reported, not deleted.** Repeated headers, footers and
-//!   folio numbers are stripped from the body by default and used to
-//!   vanish. When the stream reports them they go into the furniture group
-//!   under `CONTENT_LAYER_FURNITURE`, which is what that layer is for.
+//! - **Furniture is reported, not deleted, and only chrome is furniture.**
+//!   Running heads, footers, folios and margin numbering are stripped from
+//!   the body by default and used to vanish. When the stream reports them
+//!   they go into the furniture group under `CONTENT_LAYER_FURNITURE`,
+//!   which is what that layer is for. What the markdown renderer left out
+//!   for its own reasons is not chrome and does not go there: it arrives on
+//!   `PageMarkdown.dropped` and is folded back into the body at the place
+//!   the page drew it.
 //! - **Invisible text is reported too.** A run drawn with rendering mode 3
 //!   paints no glyphs, so no reader saw it and it is not body text. It
 //!   hangs off the same group under `CONTENT_LAYER_INVISIBLE`, with the
@@ -53,10 +57,15 @@
 //!   boxes as its `bbox`. This used to be a `meta.custom_fields["pdf.page"]`
 //!   number on the side, which is the untyped shape of the same fact;
 //!   `prov[].page_no` is the typed one and costs nothing.
-//! - **A self-contained fragment.** Refs are dense and local (`#/texts/0`),
-//!   every item's `parent` is the section header it sits under (or
-//!   `#/body`), and every parent lists the item in its `children`, so the
+//! - **A self-contained fragment, and a flat one.** Refs are dense and
+//!   local (`#/texts/0`), every item's `parent` is `#/body` or a group this
+//!   fold opened, and every parent lists the item in its `children`, so the
 //!   coordinator's additive merge can renumber the fragment mechanically.
+//!   No text item is another text item's parent: a section header is a
+//!   sibling of the prose under it, carrying its depth on
+//!   `SectionHeaderItem.level`, and everything in the body layer is
+//!   therefore reachable by walking `#/body` through groups. A consumer
+//!   that walks the body is the point of the body.
 //!
 //! Every item's `CollectorSource` names this service ([`COLLECTOR`]), the
 //! parser and its version ([`PARSER`]) as `model`, this build's version
@@ -108,10 +117,6 @@ pub struct DocumentFold {
     document: doc::Document,
     /// Attribution every item carries. `confidence` arrives with `info`.
     source: doc::CollectorSource,
-    /// The open section headers, outermost first: the level of each and the
-    /// self ref content under it names as its parent. Empty means the body
-    /// is the parent.
-    headings: Vec<(i32, String)>,
     /// The positioned runs of the page being folded, when the stream
     /// carried them. They arrive on the `spans` event immediately before
     /// the `page` event they belong to, and are dropped when the next one
@@ -173,7 +178,6 @@ impl DocumentFold {
                 raw_score_kind: None,
                 raw_score_samples: None,
             },
-            headings: Vec::new(),
             runs: None,
             internal_links: HashMap::new(),
             structure: None,
@@ -217,7 +221,6 @@ impl DocumentFold {
 
     /// Finish the fragment and take it. The fold is empty afterwards.
     pub fn take(&mut self) -> doc::Document {
-        self.headings.clear();
         self.runs = None;
         self.structure = None;
         self.detected_tables.clear();
@@ -407,15 +410,42 @@ impl DocumentFold {
             self.push_invisible(run, page.page_no);
         }
         self.push_pictures(page.page_no);
+
+        // The page's chrome, by its letters, so a block of markdown the
+        // renderer kept and the chrome report claimed is not folded into
+        // the body as well. Nothing is in both layers.
+        let claimed: Vec<String> = page.furniture.iter().map(|line| letters(line)).collect();
+
+        // The runs the rendering left out, in the order the page drew
+        // them. They are content, so they go into the body, and they go in
+        // where the page put them rather than after everything else.
+        let mut dropped: Vec<(usize, &pb::TextSpan)> = page
+            .dropped
+            .iter()
+            .map(|run| (self.run_index(run, page.page_no), run))
+            .collect();
+        dropped.sort_by_key(|(index, _)| *index);
+        let mut dropped = dropped.into_iter().peekable();
+
         for block in blocks(&page.markdown) {
+            let located = self.locate(block.text(), page.page_no);
+            if claimed.contains(&letters(block.text())) {
+                continue;
+            }
+            while dropped
+                .peek()
+                .is_some_and(|(index, _)| located.first_run.is_some_and(|first| *index < first))
+            {
+                let (_, run) = dropped.next().expect("peeked");
+                self.push_dropped(run, page.page_no);
+            }
             match block {
-                Block::Table(text) => self.on_table(&text, page.page_no),
+                Block::Table(text) => self.on_table(&text, page.page_no, located),
                 Block::ListItem {
                     marker,
                     enumerated,
                     text,
                 } => {
-                    let located = self.locate(&text, page.page_no);
                     self.open_list(enumerated);
                     self.push_text(
                         &text,
@@ -426,7 +456,6 @@ impl DocumentFold {
                 }
                 Block::Code { language, text } => {
                     self.close_list();
-                    let located = self.locate(&text, page.page_no);
                     self.push_code(&text, page.page_no, language.as_deref(), located);
                 }
                 block => {
@@ -437,7 +466,6 @@ impl DocumentFold {
                         // The arms above handled every other variant.
                         _ => continue,
                     };
-                    let located = self.locate(&text, page.page_no);
                     // The document's own word for the block beats the
                     // markdown renderer's guess at it. The renderer inferred
                     // heading depth from type size; a tagged document states
@@ -447,22 +475,54 @@ impl DocumentFold {
                         .as_ref()
                         .and_then(|(role, _)| structure::heading_level(*role));
                     let level = authored.or(guessed);
-                    if let Some(level) = level {
-                        // A header opens a level on the ladder before it is
-                        // placed, so it is parented to the header enclosing
-                        // it rather than to the one it closes.
-                        self.close_headings(level);
-                    }
                     let kind = level.map_or(Kind::Paragraph, Kind::Heading);
-                    let self_ref = self.push_text(&text, page.page_no, kind, located);
-                    if let Some(level) = level {
-                        self.headings.push((level, self_ref));
-                    }
+                    self.push_text(&text, page.page_no, kind, located);
                 }
             }
         }
+        // Whatever the page drew after its last rendered block.
+        for (_, run) in dropped {
+            self.push_dropped(run, page.page_no);
+        }
         // A page ends whatever it was in the middle of.
         self.close_list();
+    }
+
+    /// Where a run sits among the page's runs, when the page's runs
+    /// arrived. A run that cannot be placed sorts last rather than first:
+    /// the end of the page is the conservative place for text whose
+    /// position is unknown.
+    fn run_index(&self, run: &pb::TextSpan, page_no: u32) -> usize {
+        self.runs
+            .as_ref()
+            .filter(|runs| runs.page_no() == page_no)
+            .and_then(|runs| runs.index_of(run))
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Put one run the rendering left out back into the body.
+    ///
+    /// The renderer reads a page one column at a time and does not always
+    /// emit every run it read. What it leaves behind is text a reader saw:
+    /// a figure's label, the tail of a column, a line that fell between two
+    /// regions. It is body content, it keeps the box the page drew it at,
+    /// and the only thing lost is the block it would have been part of.
+    fn push_dropped(&mut self, run: &pb::TextSpan, page_no: u32) {
+        let text = run.text.trim();
+        if text.is_empty() {
+            return;
+        }
+        // A run the renderer never emitted was in no list of its own.
+        self.close_list();
+        self.push_text(
+            text,
+            page_no,
+            Kind::Paragraph,
+            Located {
+                bbox: run.bbox.as_ref().map(bounding_box),
+                ..Located::default()
+            },
+        );
     }
 
     /// Record what the reading pass measured about a page.
@@ -608,9 +668,8 @@ impl DocumentFold {
     /// this puts the grid back. When no grid was detected for this block —
     /// because the caller's stream carried none — the pipe characters are
     /// kept as a paragraph, which is what they were before.
-    fn on_table(&mut self, text: &str, page_no: u32) {
+    fn on_table(&mut self, text: &str, page_no: u32, located: Located) {
         self.close_list();
-        let located = self.locate(text, page_no);
         let Some(region) = self.detected_tables.pop() else {
             self.push_text(text, page_no, Kind::Paragraph, located);
             return;
@@ -768,30 +827,28 @@ impl DocumentFold {
             .map_or_else(Located::default, |runs| runs.locate(text))
     }
 
-    /// The ref new content parents to: the innermost open section header,
-    /// or the body when no header has opened yet. Content before the first
-    /// heading sits on the body, as it does upstream.
+    /// The ref new content parents to: the body.
+    ///
+    /// A section header is a sibling of the content under it, not its
+    /// parent. A heading ladder that hung each paragraph off the header
+    /// above it made every text item after the first heading unreachable
+    /// from `#/body` for any consumer that walks children and expects to
+    /// find groups, which is every consumer of this plane. The header's
+    /// depth is on `SectionHeaderItem.level`, where the dialect keeps it
+    /// anyway, and the reading order is the arena order.
+    #[expect(
+        clippy::unused_self,
+        reason = "the parent is a property of the fold, and a list group will be one"
+    )]
     fn current_parent(&self) -> String {
-        self.headings
-            .last()
-            .map_or_else(|| BODY_REF.to_owned(), |(_, self_ref)| self_ref.clone())
-    }
-
-    /// Close every open header a level-`level` header ends, so that the
-    /// next heading is nested under the nearest header of a lower level. A
-    /// header of the same level closes the one before it: siblings, not
-    /// parent and child.
-    fn close_headings(&mut self, level: i32) {
-        while self.headings.last().is_some_and(|(open, _)| *open >= level) {
-            self.headings.pop();
-        }
+        BODY_REF.to_owned()
     }
 
     /// Both halves of the parent link: the item names its parent, and the
     /// parent lists the item.
     ///
-    /// The only parents this fold makes are the body and section headers,
-    /// so a ref that is neither is a bug in the caller rather than
+    /// The only parents this fold makes are the body and the groups it
+    /// opens, so a ref that is neither is a bug in the caller rather than
     /// something to resolve generically.
     fn link_child(&mut self, parent: &str, child: &str) {
         if parent == BODY_REF {
@@ -801,21 +858,9 @@ impl DocumentFold {
         } else if let Some(index) = parent
             .strip_prefix("#/groups/")
             .and_then(|rest| rest.parse::<usize>().ok())
+            && let Some(group) = self.document.groups.get_mut(index)
         {
-            if let Some(group) = self.document.groups.get_mut(index) {
-                group.children.push(reference(child));
-            }
-        } else if let Some(base) = self.heading_base(parent) {
-            base.children.push(reference(child));
-        }
-    }
-
-    /// The base of the section header at a `#/texts/N` ref.
-    fn heading_base(&mut self, self_ref: &str) -> Option<&mut doc::TextItemBase> {
-        let index: usize = self_ref.strip_prefix("#/texts/")?.parse().ok()?;
-        match self.document.texts.get_mut(index)?.item.as_mut()? {
-            doc::base_text_item::Item::SectionHeader(header) => header.base.as_mut(),
-            _ => None,
+            group.children.push(reference(child));
         }
     }
 }
@@ -958,6 +1003,19 @@ enum Block {
     Table(String),
     /// Prose.
     Paragraph(String),
+}
+
+impl Block {
+    /// The block's own text, whichever kind of block it is.
+    const fn text(&self) -> &String {
+        match self {
+            Self::Heading { text, .. }
+            | Self::ListItem { text, .. }
+            | Self::Code { text, .. }
+            | Self::Table(text)
+            | Self::Paragraph(text) => text,
+        }
+    }
 }
 
 /// Split page markdown into blocks.
@@ -1172,6 +1230,16 @@ fn protection(encryption: &pb::EncryptionInfo) -> doc::Protection {
         allows_extraction: encryption.allows_extraction,
         allows_printing: encryption.allows_printing,
     }
+}
+
+/// A string reduced to its lower-case letters and digits, which is what
+/// two spellings of the same line have in common: the renderer joins runs
+/// with spaces and adds markdown punctuation, and neither changes a letter.
+fn letters(text: &str) -> String {
+    text.chars()
+        .filter(|character| character.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
 }
 
 /// A value, unless it is empty.
@@ -1478,19 +1546,29 @@ mod tests {
             other => panic!("the second heading is a section header: {other:?}"),
         }
 
-        // The heading ladder: "second para" hangs off "Two", which hangs
-        // off "One", which hangs off the body.
+        // Flat: every one of them is the body's own child, in the order
+        // the page read. A header states its depth; it does not own the
+        // prose under it, because a text item that parents another text
+        // item is unreachable to a consumer walking `#/body` through its
+        // groups.
+        for item in &document.texts {
+            assert_eq!(
+                base_of(item).parent.as_ref().unwrap().r#ref,
+                BODY_REF,
+                "{:?}",
+                base_of(item).text
+            );
+        }
         assert_eq!(
-            base_of(&document.texts[0]).parent.as_ref().unwrap().r#ref,
-            BODY_REF
-        );
-        assert_eq!(
-            base_of(&document.texts[2]).parent.as_ref().unwrap().r#ref,
-            "#/texts/0"
-        );
-        assert_eq!(
-            base_of(&document.texts[3]).parent.as_ref().unwrap().r#ref,
-            "#/texts/2"
+            document
+                .body
+                .as_ref()
+                .expect("a body")
+                .children
+                .iter()
+                .map(|child| child.r#ref.as_str())
+                .collect::<Vec<_>>(),
+            ["#/texts/0", "#/texts/1", "#/texts/2", "#/texts/3"]
         );
         assert_sound(&document);
     }
@@ -1833,6 +1911,108 @@ mod tests {
         // And the body is still the body.
         let body = base_of(&document.texts[2]);
         assert_eq!(body.content_layer, doc::ContentLayer::Body as i32);
+        assert_sound(&document);
+    }
+
+    /// One run of the fixture's `spans` helper, as the `dropped` report
+    /// spells it: the same box, so the fold can tell which run it is.
+    fn dropped(text: &str, index: usize) -> pb::TextSpan {
+        pb::TextSpan {
+            text: text.to_owned(),
+            bbox: Some(pb::Rect {
+                x: 72.0,
+                y: 700.0 - 20.0 * index as f64,
+                width: 400.0,
+                height: 12.0,
+            }),
+            kind: pb::SpanKind::Text.into(),
+            ..pb::TextSpan::default()
+        }
+    }
+
+    #[test]
+    fn a_run_the_rendering_left_out_is_body_where_the_page_drew_it() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&spans(1, &["first block", "left behind", "second block"]));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: "first block\n\nsecond block\n".to_owned(),
+            dropped: vec![dropped("left behind", 1)],
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+
+        let texts: Vec<&str> = document
+            .texts
+            .iter()
+            .map(|item| base_of(item).text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["first block", "left behind", "second block"],
+            "the run goes back where the page drew it, not after everything"
+        );
+        for item in &document.texts {
+            let base = base_of(item);
+            assert_eq!(base.content_layer, doc::ContentLayer::Body as i32);
+            assert_eq!(base.parent.as_ref().unwrap().r#ref, BODY_REF);
+        }
+        let box_of = base_of(&document.texts[1]).prov[0]
+            .bbox
+            .as_ref()
+            .expect("the run brought its box");
+        assert!((box_of.b - 680.0).abs() < f64::EPSILON, "{box_of:?}");
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_dropped_run_the_page_cannot_place_goes_last() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: "the rendered block\n".to_owned(),
+            // No `spans` event arrived, so nothing says where this run
+            // stood. The end of the page is the honest place for it.
+            dropped: vec![dropped("unplaceable", 4)],
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+        let texts: Vec<&str> = document
+            .texts
+            .iter()
+            .map(|item| base_of(item).text.as_str())
+            .collect();
+        assert_eq!(texts, ["the rendered block", "unplaceable"]);
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_block_the_chrome_report_claimed_is_not_folded_into_the_body_as_well() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            // The renderer is shown one page at a time and one page
+            // repeats nothing, so the head it could not prove is chrome
+            // stays in the markdown. The report proved it over the whole
+            // document.
+            markdown: "A Running Head\n\nthe body of the page\n".to_owned(),
+            furniture: vec!["A Running Head".to_owned()],
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+
+        let head = base_of(&document.texts[0]);
+        assert_eq!(head.text, "A Running Head");
+        assert_eq!(head.content_layer, doc::ContentLayer::Furniture as i32);
+        assert_eq!(
+            document.texts.len(),
+            2,
+            "the head is one item, not one per layer"
+        );
+        assert_eq!(base_of(&document.texts[1]).text, "the body of the page");
         assert_sound(&document);
     }
 

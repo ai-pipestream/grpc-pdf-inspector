@@ -7,10 +7,10 @@ features only: pure Rust, lopdf + rayon, no models) behind the ai-pipestream
 fleet's collector conventions.
 
 The crate is vendored under `vendor/pdf-inspector` and patched there, because
-four things this service must capture are computed inside it and returned by
+five things this service must capture are computed inside it and returned by
 none of its public API: the invisible text layer, the per-page garble score,
-the vector rectangles and line segments the ruled-table detectors run on, and
-the column detector. `vendor/pdf-inspector/README.md` names each patch and
+the vector rectangles and line segments the ruled-table detectors run on, the
+column detector, and the header, footer and folio stripper's own verdicts. `vendor/pdf-inspector/README.md` names each patch and
 `docs/capture-deferrals.md` records the commit that made it.
 
 It is the fleet's cheap routing answer for PDF:
@@ -80,9 +80,11 @@ markdown), `FULL` (classification + per-page markdown; the default).
 Every event class above `page` is off by default and costs nothing when
 off. `emit_metadata` and `emit_structure` each cost one more read of the
 file; `emit_spans` and `emit_tables` cost only the bandwidth of sending
-what the extraction pass already produced. `report_furniture` reports the
-runs a page drew that its markdown does not contain — the headers, footers
-and folio numbers the strippers remove, which used to vanish silently.
+what the extraction pass already produced. `report_furniture` reports a
+page's chrome (the running head, the footer, the folio, the numbers ruled
+down the margin), which the strippers remove and used to remove silently,
+and reports separately, on `dropped`, the runs the rendering left out,
+which are content rather than chrome and go back into the body.
 `report_invisible` reports the runs a page drew with rendering mode 3, which
 paint no glyphs at all: it costs a second walk of the content streams, and
 only for a document whose first walk found an invisible layer to walk.
@@ -156,19 +158,24 @@ collector's parse of the same document:
   beside them, instead of `**` and `<u>` inside the text.
 - Every image the page drew becomes a `PictureItem` with the box the
   content stream placed it at.
-- Runs the markdown dropped go into the furniture group under
+- A page's chrome goes into the furniture group under
   `CONTENT_LAYER_FURNITURE` when `report_furniture` is set, and runs the
   page drew invisibly go into the same group under
   `CONTENT_LAYER_INVISIBLE`, with their boxes. A hidden watermark is an
   item a coordinator can act on rather than text nobody was told about.
+  Runs the markdown renderer left out are not chrome: they are folded back
+  into the body at the place the page drew them.
 - `PageItem.quality` carries what the reading pass measured about a page:
   the replacement-character runs, the garble score, and the OCR
   recommendation when there is one.
 - Every item's `CollectorSource` is `collector: "pdf"`,
   `model: "pdf-inspector <crate version>"`, `version: <this build's
   version>`, `confidence: <the detection confidence from info>`.
-- Item refs are dense and local (`#/texts/0`), with headings as parents,
-  so refs renumber mechanically on merge.
+- Item refs are dense and local (`#/texts/0`), and the fragment is flat:
+  every item's parent is `#/body` or a group, never another text item, so
+  a consumer walking `#/body` through its groups reaches every body item
+  and refs renumber mechanically on merge. A section header carries its
+  depth on `level` rather than by owning the prose beneath it.
 - Default off costs nothing: no fold is built and no markdown is
   retained.
 

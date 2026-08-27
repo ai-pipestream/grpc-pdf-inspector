@@ -85,14 +85,14 @@ pub struct PdfOptions {
     /// beyond the extraction pass that is already running.
     #[prost(bool, tag="8")]
     pub emit_tables: bool,
-    /// Report the page's text runs that did not survive into its markdown,
-    /// on `PageMarkdown.furniture`. Default false.
+    /// Report the page's chrome on `PageMarkdown.furniture`, and the body
+    /// runs the rendering left out on `PageMarkdown.dropped`. Default false.
     ///
-    /// Headers, footers and folio numbers are identified and deleted before
-    /// anything sees them, and other runs are discarded by the layout pass
-    /// for reasons no option reaches. Setting this compares the runs against
-    /// the rendering and names what is missing, so the removal is visible
-    /// without the body having to carry it.
+    /// Headers, footers, folios and margin numbering are identified and
+    /// deleted before anything sees them, and other runs are discarded by the
+    /// layout pass for reasons no option reaches. Setting this names both,
+    /// separately, so the removal is visible without the body having to carry
+    /// its chrome and without its content being filed as chrome.
     #[prost(bool, tag="9")]
     pub report_furniture: bool,
     /// Report the text the page drew invisibly, on `PageMarkdown.invisible`.
@@ -345,14 +345,21 @@ pub struct PageMarkdown {
     /// difference is what decides whether re-routing to OCR is worth it.
     #[prost(uint32, tag="5")]
     pub replacement_runs: u32,
-    /// The text runs that were on the page and are not in `markdown`:
-    /// repeated headers, footers, standalone folio numbers, and anything else
-    /// the layout pass discarded.
+    /// The page's chrome: its running head, its footer, its folio, the line
+    /// numbers ruled down its margin.
     ///
     /// Empty unless `PdfOptions.report_furniture` was set. Page chrome is
     /// identified and deleted by default and the deletion used to be silent,
     /// so it was neither visible nor auditable; this reports what went,
     /// without putting it back into the body.
+    ///
+    /// Every line here is named on chrome evidence: the parser's own header,
+    /// footer and folio verdicts, repetition at the same page edge across
+    /// pages, or a column of short numbers standing outside the text block. A
+    /// run missing from `markdown` is not evidence of anything on its own,
+    /// because the renderer reads a multi-column page column by column and
+    /// leaves out genuine content; such runs are reported on `dropped`
+    /// instead.
     #[prost(string, repeated, tag="6")]
     pub furniture: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// The runs this page drew with text rendering mode 3, which paints no
@@ -380,6 +387,22 @@ pub struct PageMarkdown {
     /// anything, which is the honest answer rather than a reassuring zero.
     #[prost(double, optional, tag="8")]
     pub garble_score: ::core::option::Option<f64>,
+    /// The runs the rendering left out that no chrome evidence convicts:
+    /// body content, with the boxes the page drew it at.
+    ///
+    /// Empty unless `PdfOptions.report_furniture` was set, and empty then too
+    /// for a page whose every run reached the markdown. The markdown renderer
+    /// reads a page's columns one after another and does not always emit
+    /// every run it read; what it leaves behind is text a reader saw, and it
+    /// belongs in the body rather than in `furniture`. A consumer folding
+    /// this stream into a document puts these back into reading order.
+    ///
+    /// A run is named here only when its letters appear nowhere in
+    /// `markdown`. A run the renderer merely moved is not missing, and a run
+    /// of one or two characters is not looked for at all: it would match
+    /// somewhere by accident and the report would say it survived.
+    #[prost(message, repeated, tag="9")]
+    pub dropped: ::prost::alloc::vec::Vec<TextSpan>,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.

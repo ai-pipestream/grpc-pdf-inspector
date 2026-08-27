@@ -69,6 +69,7 @@ use tokio::sync::mpsc;
 use tonic::Status;
 
 use crate::document_fold::DocumentFold;
+use crate::furniture;
 use crate::metrics::Metrics;
 use crate::proto::v1 as pb;
 use crate::spans;
@@ -359,6 +360,9 @@ fn parse(
                     // event is not a page anyway.
                     invisible: Vec::new(),
                     garble_score: None,
+                    // No per-page runs came back either, so there is
+                    // nothing to say a rendering left out.
+                    dropped: Vec::new(),
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -423,6 +427,15 @@ fn parse(
                 spans::by_page(spans::only_invisible(&items, kept))
             } else {
                 BTreeMap::new()
+            };
+
+            // Which runs are page chrome, weighed over the whole document
+            // before it is split into pages. Repetition is most of the
+            // evidence and no single page carries any.
+            let chrome = if events.wanted(options.report_furniture) {
+                furniture::Chrome::detect(&items, detected.page_count)
+            } else {
+                furniture::Chrome::none()
             };
 
             let mut by_page = spans::by_page(items);
@@ -501,10 +514,14 @@ fn parse(
                     )?;
                 }
 
-                // What the page had, kept aside so the rendering can be
-                // compared against it. The runs are about to be consumed by
-                // the renderer, and their text is all the comparison needs.
-                let drawn: Vec<String> = if events.wanted(options.report_furniture) {
+                // This page's chrome, and the content runs it is not. Both
+                // are taken before the renderer consumes the items.
+                let furniture: Vec<String> = page_items
+                    .iter()
+                    .filter(|item| chrome.convicts(item))
+                    .map(|item| item.text.trim().to_owned())
+                    .collect();
+                let content: Vec<pb::TextSpan> = if events.wanted(options.report_furniture) {
                     page_items
                         .iter()
                         .filter(|item| {
@@ -514,7 +531,8 @@ fn parse(
                                     | pdf_inspector::types::ItemType::FormField
                             )
                         })
-                        .map(|item| item.text.clone())
+                        .filter(|item| !chrome.convicts(item))
+                        .map(spans::span)
                         .collect()
                 } else {
                     Vec::new()
@@ -527,7 +545,7 @@ fn parse(
                     detected.page_count,
                 );
                 let markdown = markdown.trim().to_owned();
-                let furniture = dropped_runs(&drawn, &markdown);
+                let dropped = absent_from(content, &markdown);
                 let markdown_bytes = markdown.len() as u64;
                 let reasons = verdicts.get(&page_no);
                 let needs_ocr = reasons.is_some();
@@ -554,6 +572,7 @@ fn parse(
                         .map(spans::span)
                         .collect(),
                     garble_score: garble_score(&quality, page_no),
+                    dropped,
                 }))?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -588,45 +607,41 @@ fn parse(
     Ok(())
 }
 
-/// The runs the page drew that its markdown does not contain.
-///
-/// Comparing the runs against the rendering, rather than one rendering
-/// against another, is what makes this complete: a header the stripper
-/// removed and a folio the layout pass discarded for reasons no option
-/// reaches are both simply text that was on the page and is not in the
-/// output.
+/// The content runs the rendering left out.
 ///
 /// The comparison is on letters and digits only, because the renderer joins
 /// runs with spaces, repairs hyphenation across line ends and adds markdown
-/// punctuation — none of which changes a letter. A run with no letters at
-/// all (a rule, a bullet glyph) is not reported: there would be nothing to
-/// report.
+/// punctuation, none of which changes a letter.
 ///
-/// It walks forwards through the rendering rather than searching all of it
-/// for each run, which is what keeps a one-character folio from matching
-/// the digit in a body line above it. The cost is that a run the renderer
-/// moved backwards past another run reads as dropped; reading order is
-/// what both sides are in, and a page that reorders is a page whose
-/// furniture report is approximate.
-fn dropped_runs(drawn: &[String], markdown: &str) -> Vec<String> {
-    if drawn.is_empty() {
+/// A run is looked for in the whole rendering rather than forwards from
+/// where the last one was found. Reading order is not what a rendering is
+/// in: the renderer reads a multi-column page one column at a time, so runs
+/// the page drew side by side come out pages apart in its output, and a
+/// forward scan reads every one of them as missing. That is exactly the
+/// mistake that filed a two-column paper's second column as page
+/// furniture. Searching the whole rendering costs a page-sized scan per run
+/// and answers the question that was actually asked: is this text in the
+/// output at all.
+///
+/// Short runs are not looked for. A run of one or two letters occurs
+/// somewhere in any page of prose by accident, so reporting on it would be
+/// noise in whichever direction the accident fell.
+fn absent_from(runs: Vec<pb::TextSpan>, markdown: &str) -> Vec<pb::TextSpan> {
+    if runs.is_empty() {
         return Vec::new();
     }
     let rendered = letters(markdown);
-    let mut cursor = 0;
-    let mut dropped = Vec::new();
-    for run in drawn {
-        let needle = letters(run);
-        if needle.is_empty() {
-            continue;
-        }
-        match rendered.get(cursor..).and_then(|rest| rest.find(&needle)) {
-            Some(at) => cursor += at + needle.len(),
-            None => dropped.push(run.trim().to_owned()),
-        }
-    }
-    dropped
+    runs.into_iter()
+        .filter(|run| {
+            let needle = letters(&run.text);
+            needle.chars().count() >= MIN_DROPPED_LETTERS && !rendered.contains(&needle)
+        })
+        .collect()
 }
+
+/// How many letters a run needs before its absence from the rendering
+/// means anything.
+const MIN_DROPPED_LETTERS: usize = 3;
 
 /// A string reduced to its lower-case letters and digits.
 fn letters(text: &str) -> String {
@@ -832,5 +847,65 @@ fn layout_proto(complexity: &pdf_inspector::LayoutComplexity) -> pb::LayoutCompl
         is_complex: complexity.is_complex,
         pages_with_tables: complexity.pages_with_tables.clone(),
         pages_with_columns: complexity.pages_with_columns.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One run of a page, with the text a rendering may or may not carry.
+    fn run(text: &str) -> pb::TextSpan {
+        pb::TextSpan {
+            text: text.to_owned(),
+            kind: pb::SpanKind::Text.into(),
+            ..pb::TextSpan::default()
+        }
+    }
+
+    /// The text of the runs a rendering left out.
+    fn missing(runs: &[&str], markdown: &str) -> Vec<String> {
+        absent_from(runs.iter().copied().map(run).collect(), markdown)
+            .into_iter()
+            .map(|run| run.text)
+            .collect()
+    }
+
+    #[test]
+    fn a_run_the_renderer_only_moved_is_not_missing() {
+        // The rendering carries both columns, second one first. Under a
+        // forward scan every run of the first column reads as dropped,
+        // which is how a paper's body ended up in its furniture.
+        let dropped = missing(
+            &["left one", "right one", "left two", "right two"],
+            "right one right two\n\nleft one left two",
+        );
+        assert!(dropped.is_empty(), "{dropped:?}");
+    }
+
+    #[test]
+    fn a_run_that_is_nowhere_in_the_rendering_is_missing() {
+        assert_eq!(
+            missing(&["kept prose", "left behind entirely"], "kept prose"),
+            ["left behind entirely"]
+        );
+    }
+
+    #[test]
+    fn markdown_punctuation_does_not_make_a_run_missing() {
+        assert!(missing(&["A Heading"], "## **A Heading**").is_empty());
+    }
+
+    #[test]
+    fn a_run_too_short_to_look_for_is_never_reported() {
+        // Two letters occur somewhere in any page of prose, so their
+        // absence cannot be established either way.
+        assert!(missing(&["7", "of"], "a page of prose about nothing").is_empty());
+        assert!(missing(&["7", "of"], "").is_empty());
+    }
+
+    #[test]
+    fn nothing_is_reported_for_a_page_with_no_runs_to_report_on() {
+        assert!(missing(&[], "some markdown").is_empty());
     }
 }

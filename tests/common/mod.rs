@@ -724,6 +724,88 @@ pub fn furniture_pdf(pages: u32, head: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build a `pages`-page PDF laid out in two columns, with a running head
+/// at the top of every page and a line number in the left margin of every
+/// row.
+///
+/// This is the shape a conference paper has, and the shape that starved the
+/// body. The rows are drawn left cell then right cell, so extraction order
+/// interleaves the columns and the markdown renderer, which reads a page
+/// column by column, cannot emit every run in the order it was drawn.
+/// Whatever it leaves out is content, because the columns are prose, while
+/// the running head and the margin numbers are the only chrome on the page.
+///
+/// The head repeats verbatim and the margin numbers repeat as a set, which
+/// is what cross-page repetition evidence is made of; the columns say
+/// something different on every row of every page, which is what it is not.
+#[must_use]
+pub fn two_column_pdf(pages: u32, head: &str) -> Vec<u8> {
+    const ROWS: u32 = 18;
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let mut content = String::new();
+        content.push_str(&format!("BT /F1 8 Tf 72 770 Td ({head}) Tj ET\n"));
+        // A section heading, set larger than the columns so the renderer
+        // reads it as one, and far enough below the running head that the
+        // head stands alone at the page edge.
+        content.push_str(&format!(
+            "BT /F1 14 Tf 72 730 Td (Section {page}. Findings) Tj ET\n"
+        ));
+        for row in 1..=ROWS {
+            let y = 700 - 16 * (row - 1);
+            // The margin number, outside the text block and set smaller:
+            // the shape a line-numbered manuscript has.
+            content.push_str(&format!("BT /F1 7 Tf 40 {y} Td ({row}) Tj ET\n"));
+            content.push_str(&format!(
+                "BT /F1 9 Tf 72 {y} Td (Method note {row} of page {page} on the setup.) Tj ET\n"
+            ));
+            content.push_str(&format!(
+                "BT /F1 9 Tf 320 {y} Td (Result note {row} of page {page} on the yield.) Tj ET\n"
+            ));
+        }
+        content.push_str(&format!("BT /F1 8 Tf 300 40 Td ({page}) Tj ET"));
+
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Build a one-page PDF whose middle line is set in a bold face and whose
 /// surrounding lines are not.
 ///
