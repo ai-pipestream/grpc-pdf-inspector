@@ -74,6 +74,7 @@
 
 use std::collections::HashMap;
 
+use crate::emphasis;
 use crate::page_runs::{Located, PageRuns, page_ref};
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
@@ -428,7 +429,22 @@ impl DocumentFold {
         let mut dropped = dropped.into_iter().peekable();
 
         for block in blocks(&page.markdown) {
-            let located = self.locate(block.text(), page.page_no);
+            // The renderer's emphasis markers come off the text here, before
+            // anything measures it: the runs are located by the plain
+            // characters, so the ranges they report index the text the item
+            // carries, and the markers' own report of the emphasis is the
+            // fallback for a block no run could be found for.
+            let lifted = block.lift();
+            let mut located = self.locate(&lifted.text, page.page_no);
+            // The runs' own account of the emphasis, when they were found
+            // and they give one, is the richer report: it carries the face
+            // and the size and it says bold-and-underlined where the
+            // markers could only say one. Otherwise the markers' account
+            // stands beside whatever else the runs said.
+            if !located.spans.iter().any(|span| span.formatting.is_some()) {
+                located.spans.extend(lifted.spans);
+            }
+            let block = block.with_text(lifted.text);
             if claimed.contains(&letters(block.text())) {
                 continue;
             }
@@ -606,8 +622,13 @@ impl DocumentFold {
     /// into it; they go here, which is what `CONTENT_LAYER_FURNITURE` and
     /// the furniture group are for and why both existed empty.
     fn push_furniture(&mut self, text: &str, page_no: u32) {
+        // The stripper reports the line as the renderer printed it,
+        // markers included; a running head set in an underlined face is
+        // still the words it shows.
+        let lifted = emphasis::lift(text);
         self.push_off_body(
-            text,
+            &lifted.text,
+            lifted.spans,
             doc::ContentLayer::Furniture,
             // Which of header, footer or folio this was is not reported by
             // the stripper, so it is not claimed here.
@@ -630,6 +651,7 @@ impl DocumentFold {
     fn push_invisible(&mut self, run: &pb::TextSpan, page_no: u32) {
         self.push_off_body(
             &run.text,
+            Vec::new(),
             doc::ContentLayer::Invisible,
             provenance(page_no, run.bbox.as_ref().map(bounding_box)),
         );
@@ -647,6 +669,7 @@ impl DocumentFold {
     fn push_off_body(
         &mut self,
         text: &str,
+        spans: Vec<doc::InlineSpan>,
         layer: doc::ContentLayer,
         prov: Vec<doc::ProvenanceItem>,
     ) {
@@ -663,6 +686,7 @@ impl DocumentFold {
                     content_layer: layer as i32,
                     meta: Some(doc::BaseMeta::default()),
                     prov,
+                    spans,
                     label: doc::DocItemLabel::Text as i32,
                     orig: text.to_owned(),
                     text: text.to_owned(),
@@ -1022,6 +1046,37 @@ enum Block {
 }
 
 impl Block {
+    /// The block's text with the renderer's emphasis markers lifted off.
+    ///
+    /// Code is the exception: inside a fence the renderer prints the
+    /// source verbatim, and an asterisk there is an operator.
+    fn lift(&self) -> emphasis::Lifted {
+        match self {
+            Self::Code { text, .. } | Self::Table(text) => emphasis::Lifted {
+                text: text.clone(),
+                spans: Vec::new(),
+            },
+            block => emphasis::lift(block.text()),
+        }
+    }
+
+    /// This block carrying `text` instead of its own.
+    fn with_text(self, text: String) -> Self {
+        match self {
+            Self::Heading { level, .. } => Self::Heading { level, text },
+            Self::ListItem {
+                marker, enumerated, ..
+            } => Self::ListItem {
+                marker,
+                enumerated,
+                text,
+            },
+            Self::Code { language, .. } => Self::Code { language, text },
+            Self::Table(_) => Self::Table(text),
+            Self::Paragraph(_) => Self::Paragraph(text),
+        }
+    }
+
     /// The block's own text, whichever kind of block it is.
     const fn text(&self) -> &String {
         match self {
@@ -1384,6 +1439,141 @@ mod tests {
                 })
                 .collect(),
         })
+    }
+
+    fn text_of(item: &doc::BaseTextItem) -> (&str, &[doc::InlineSpan]) {
+        match item.item.as_ref().expect("an item") {
+            doc::base_text_item::Item::Text(text) => {
+                let base = text.base.as_ref().expect("a base");
+                (&base.text, &base.spans)
+            }
+            doc::base_text_item::Item::SectionHeader(heading) => {
+                let base = heading.base.as_ref().expect("a base");
+                (&base.text, &base.spans)
+            }
+            other => panic!("unexpected item {other:?}"),
+        }
+    }
+
+    fn formatted(spans: &[doc::InlineSpan], text: &str) -> Vec<(String, bool, bool, bool)> {
+        spans
+            .iter()
+            .filter_map(|span| {
+                let formatting = span.formatting.as_ref()?;
+                let range = span.range.as_ref().expect("a range");
+                let covered: String = text
+                    .chars()
+                    .skip(range.start as usize)
+                    .take((range.end - range.start) as usize)
+                    .collect();
+                Some((
+                    covered,
+                    formatting.bold,
+                    formatting.italic,
+                    formatting.underline,
+                ))
+            })
+            .collect()
+    }
+
+    /// The renderer's emphasis markers never reach the item's text: with
+    /// no runs to locate the block on, the markers themselves say which
+    /// characters were emphasized, and the ranges index the plain text.
+    #[test]
+    fn markers_lift_onto_spans_when_no_run_locates_the_block() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        fold.consume(&page(
+            1,
+            "### <u>Your receipt from GEEK SHOP</u>\n\nPlease **click here** to follow *the* steps. Card *2000",
+        ));
+        let document = fold.take();
+        assert_sound(&document);
+        let (heading, heading_spans) = text_of(&document.texts[0]);
+        assert_eq!(heading, "Your receipt from GEEK SHOP");
+        assert_eq!(
+            formatted(heading_spans, heading),
+            vec![("Your receipt from GEEK SHOP".to_owned(), false, false, true)]
+        );
+        let (prose, prose_spans) = text_of(&document.texts[1]);
+        assert_eq!(prose, "Please click here to follow the steps. Card *2000");
+        assert_eq!(
+            formatted(prose_spans, prose),
+            vec![
+                ("click here".to_owned(), true, false, false),
+                ("the".to_owned(), false, true, false),
+            ]
+        );
+    }
+
+    /// When the runs are found and they state the emphasis, theirs is the
+    /// account the item carries — measured against the plain text, so the
+    /// range covers the words and not the asterisks around them.
+    #[test]
+    fn located_runs_report_the_emphasis_over_the_plain_text() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        let run = |text: &str, bold: bool, x: f64| pb::TextSpan {
+            text: text.to_owned(),
+            bold,
+            font_family: "Liberation".to_owned(),
+            font_size: 10.0,
+            bbox: Some(pb::Rect {
+                x,
+                y: 700.0,
+                width: 100.0,
+                height: 12.0,
+            }),
+            kind: pb::SpanKind::Text.into(),
+            ..pb::TextSpan::default()
+        };
+        fold.consume(&pb::parse_pdf_response::Event::Spans(pb::PageSpans {
+            page_no: 1,
+            spans: vec![
+                run("Please ", false, 72.0),
+                run("click here", true, 172.0),
+                run(" to follow", false, 272.0),
+            ],
+        }));
+        fold.consume(&page(1, "Please **click here** to follow"));
+        let document = fold.take();
+        let (prose, spans) = text_of(&document.texts[0]);
+        assert_eq!(prose, "Please click here to follow");
+        assert_eq!(
+            formatted(spans, prose),
+            vec![("click here".to_owned(), true, false, false)]
+        );
+        assert_eq!(
+            spans[0].font_family.as_deref(),
+            Some("Liberation"),
+            "the runs' account carries the face the markers could not"
+        );
+        assert_eq!(spans.len(), 1, "one account of the emphasis, not two");
+    }
+
+    /// A running head the stripper reports with the renderer's underline
+    /// tags is the words it shows, in the furniture layer.
+    #[test]
+    fn furniture_lines_lift_their_markers_too() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: "body text".to_owned(),
+            furniture: vec!["<u>A Running Head</u>".to_owned()],
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+        let head = document
+            .texts
+            .iter()
+            .map(text_of)
+            .find(|(text, _)| *text == "A Running Head")
+            .expect("the head is in the document as its words");
+        assert_eq!(
+            formatted(head.1, head.0),
+            vec![("A Running Head".to_owned(), false, false, true)]
+        );
     }
 
     /// The merge contract as a check: every ref dense, at its arena

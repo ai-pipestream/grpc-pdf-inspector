@@ -22,6 +22,7 @@
 //!   `INTERNAL` status, never a wedged stream.
 
 pub mod document_fold;
+pub mod emphasis;
 pub mod furniture;
 pub mod limits;
 pub mod metadata;
