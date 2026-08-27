@@ -80,6 +80,10 @@ pub struct PageRuns {
     roles: Vec<Option<(pb::StructureRole, String)>>,
     /// Which runs are image placements, in page order.
     images: Vec<usize>,
+    /// The runs the page's chrome report claimed, in page order, each with
+    /// its trimmed text: the furniture lines of the page event are these
+    /// runs' texts in this order.
+    chrome: Vec<(String, usize)>,
     /// How far into `letters` the fold has already matched. Blocks are
     /// folded in reading order, so a search normally succeeds at the
     /// cursor and never revisits the page.
@@ -123,6 +127,13 @@ impl PageRuns {
             .filter(|(_, span)| pb::SpanKind::try_from(span.kind) == Ok(pb::SpanKind::Image))
             .map(|(index, _)| index)
             .collect();
+        let chrome = spans
+            .spans
+            .iter()
+            .enumerate()
+            .filter(|(_, span)| span.chrome)
+            .map(|(index, span)| (span.text.trim().to_owned(), index))
+            .collect();
         Self {
             page_no: spans.page_no,
             letters,
@@ -131,8 +142,20 @@ impl PageRuns {
             styles,
             roles,
             images,
+            chrome,
             cursor: 0,
         }
+    }
+
+    /// The `ordinal`-th chrome run of the page: its trimmed text and its
+    /// box. The page event lists its furniture lines in the order the
+    /// chrome runs were drawn, so the line and the run pair by position;
+    /// the text is returned so the caller can check that they do.
+    #[must_use]
+    pub fn chrome_run(&self, ordinal: usize) -> Option<(&str, doc::BoundingBox)> {
+        self.chrome
+            .get(ordinal)
+            .map(|(text, index)| (text.as_str(), self.boxes[*index].clone()))
     }
 
     /// The page these runs came from.
@@ -542,11 +565,15 @@ fn anchor_targets(
 }
 
 /// Whether a run's text is part of what the markdown renderer emitted.
+/// Whether a run's letters are part of the page's rendering. Image
+/// placeholders and link annotations never are; neither is chrome, which
+/// was taken out of the page before the renderer saw it.
 fn contributes_text(span: &pb::TextSpan) -> bool {
-    matches!(
-        pb::SpanKind::try_from(span.kind),
-        Ok(pb::SpanKind::Text | pb::SpanKind::FormField)
-    )
+    !span.chrome
+        && matches!(
+            pb::SpanKind::try_from(span.kind),
+            Ok(pb::SpanKind::Text | pb::SpanKind::FormField)
+        )
 }
 
 /// A wire rectangle as a schema bounding box.
@@ -607,6 +634,43 @@ mod tests {
 
     fn page(spans: Vec<pb::TextSpan>) -> pb::PageSpans {
         pb::PageSpans { page_no: 1, spans }
+    }
+
+    fn chrome_run(text: &str, y: f64) -> pb::TextSpan {
+        pb::TextSpan {
+            chrome: true,
+            ..span(text, 20.0, y, pb::SpanKind::Text)
+        }
+    }
+
+    /// A margin number drawn on a body line's baseline sits between that
+    /// line's letters and the next line's in page order. The chrome flag
+    /// keeps it out of the letters, so the block the renderer made of the
+    /// two lines still matches, and its box is the two lines' box, not the
+    /// margin's.
+    #[test]
+    fn chrome_runs_contribute_no_letters() {
+        let mut runs = PageRuns::new(
+            &page(vec![
+                chrome_run("000", 700.0),
+                span("Diffusion for", 72.0, 700.0, pb::SpanKind::Text),
+                chrome_run("001", 680.0),
+                span("code generates", 72.0, 680.0, pb::SpanKind::Text),
+            ]),
+            &[],
+            None,
+        );
+        let located = runs.locate("Diffusion for code generates");
+        let bbox = located
+            .bbox
+            .expect("the block is found across the margin numbers");
+        assert!(
+            bbox.l >= 72.0,
+            "the margin number's box is not in the union: {bbox:?}"
+        );
+        assert_eq!(runs.chrome_run(0).map(|(text, _)| text), Some("000"));
+        assert_eq!(runs.chrome_run(1).map(|(text, _)| text), Some("001"));
+        assert!(runs.chrome_run(2).is_none());
     }
 
     /// One page's runs indexed with no internal links, which is every case

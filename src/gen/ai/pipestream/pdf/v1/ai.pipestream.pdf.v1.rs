@@ -242,6 +242,13 @@ pub struct TextSpan {
     /// For SPAN_KIND_LINK, the annotation's target. Empty otherwise.
     #[prost(string, tag="12")]
     pub link_uri: ::prost::alloc::string::String,
+    /// Whether the run is page chrome: a running head, a folio, a margin line
+    /// number. Chrome is taken out of the page before the markdown is rendered
+    /// and is reported on the page event's `furniture` list, so a consumer
+    /// joining the rendering back to the runs skips these. Set only when
+    /// `report_furniture` was requested; otherwise nothing is chrome.
+    #[prost(bool, tag="13")]
+    pub chrome: bool,
 }
 /// PageSpans carries one page's positioned runs, in extraction order.
 ///

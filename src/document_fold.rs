@@ -404,8 +404,18 @@ impl DocumentFold {
     /// Fold one page's markdown into items.
     fn on_page(&mut self, page: &pb::PageMarkdown) {
         self.on_page_quality(page);
-        for line in &page.furniture {
-            self.push_furniture(line, page.page_no);
+        // The furniture lines are the page's chrome runs in the order they
+        // were drawn, and the runs came with their boxes; the text is
+        // checked so a line and a run only pair when they are the same.
+        for (ordinal, line) in page.furniture.iter().enumerate() {
+            let bbox = self
+                .runs
+                .as_ref()
+                .filter(|runs| runs.page_no() == page.page_no)
+                .and_then(|runs| runs.chrome_run(ordinal))
+                .filter(|(text, _)| *text == line.trim())
+                .map(|(_, bbox)| bbox);
+            self.push_furniture(line, page.page_no, bbox);
         }
         for run in &page.invisible {
             self.push_invisible(run, page.page_no);
@@ -621,7 +631,7 @@ impl DocumentFold {
     /// and deletes them. They are not body text and they do not go back
     /// into it; they go here, which is what `CONTENT_LAYER_FURNITURE` and
     /// the furniture group are for and why both existed empty.
-    fn push_furniture(&mut self, text: &str, page_no: u32) {
+    fn push_furniture(&mut self, text: &str, page_no: u32, bbox: Option<doc::BoundingBox>) {
         // The stripper reports the line as the renderer printed it,
         // markers included; a running head set in an underlined face is
         // still the words it shows.
@@ -631,8 +641,9 @@ impl DocumentFold {
             lifted.spans,
             doc::ContentLayer::Furniture,
             // Which of header, footer or folio this was is not reported by
-            // the stripper, so it is not claimed here.
-            provenance(page_no, None),
+            // the stripper, so it is not claimed here; where it sat is,
+            // when its run was found.
+            provenance(page_no, bbox),
         );
     }
 
@@ -1549,6 +1560,64 @@ mod tests {
             "the runs' account carries the face the markers could not"
         );
         assert_eq!(spans.len(), 1, "one account of the emphasis, not two");
+    }
+
+    /// A furniture line is the chrome run it came from, so it keeps that
+    /// run's box; a line whose run is not the one at its position gets no
+    /// box rather than a wrong one.
+    #[test]
+    fn furniture_lines_keep_their_runs_boxes() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        let run = |text: &str, chrome: bool, y: f64| pb::TextSpan {
+            text: text.to_owned(),
+            chrome,
+            bbox: Some(pb::Rect {
+                x: 20.0,
+                y,
+                width: 30.0,
+                height: 10.0,
+            }),
+            kind: pb::SpanKind::Text.into(),
+            ..pb::TextSpan::default()
+        };
+        fold.consume(&pb::parse_pdf_response::Event::Spans(pb::PageSpans {
+            page_no: 1,
+            spans: vec![
+                run("A Running Head", true, 760.0),
+                run("body text", false, 700.0),
+                run("7", true, 40.0),
+            ],
+        }));
+        fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: "body text".to_owned(),
+            furniture: vec!["A Running Head".to_owned(), "not the folio".to_owned()],
+            ..pb::PageMarkdown::default()
+        }));
+        let document = fold.take();
+        let prov_of = |wanted: &str| {
+            document
+                .texts
+                .iter()
+                .find_map(|item| match item.item.as_ref() {
+                    Some(doc::base_text_item::Item::Text(text)) => {
+                        let base = text.base.as_ref().expect("a base");
+                        (base.text == wanted).then(|| base.prov.clone())
+                    }
+                    _ => None,
+                })
+                .expect("the line is in the document")
+        };
+        let head = prov_of("A Running Head");
+        let bbox = head[0].bbox.as_ref().expect("the head keeps its run's box");
+        assert_eq!(bbox.l, 20.0);
+        assert_eq!(bbox.t, 770.0, "the box is the run's, top-left up");
+        let mismatch = prov_of("not the folio");
+        assert!(
+            mismatch[0].bbox.is_none(),
+            "a line that is not its run's text takes no box"
+        );
     }
 
     /// A running head the stripper reports with the renderer's underline

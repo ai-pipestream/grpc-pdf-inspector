@@ -235,3 +235,80 @@ async fn the_fusion_is_real_and_the_report_is_what_prevents_it() {
     );
     assert!(page.markdown.contains(REVIEW_HEAD), "and so is the head");
 }
+
+/// The point of taking the chrome out of the letters: every body block of
+/// a line-numbered page locates, so every body item carries its box, and
+/// the chrome lines carry theirs, so the page can be painted whole.
+#[tokio::test]
+async fn every_item_of_a_line_numbered_page_has_its_box() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::review_paper_pdf(3, REVIEW_HEAD),
+            pb::PdfOptions {
+                report_furniture: true,
+                emit_document: true,
+                emit_spans: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+    for page in common::spans(&events) {
+        let chrome = page.spans.iter().filter(|span| span.chrome).count();
+        assert!(
+            chrome >= REVIEW_ROWS as usize,
+            "page {} marks its margin numbers as chrome on the wire, found {chrome}",
+            page.page_no
+        );
+    }
+    let document = common::documents(&events)
+        .pop()
+        .expect("the document event");
+    let mut body = 0;
+    let mut furniture = 0;
+    let mut boxless = Vec::new();
+    for item in &document.texts {
+        let (base_text, layer, has_box) = match item.item.as_ref().expect("a variant") {
+            grpc_pdf_inspector::proto::ai::pipestream::document::v1::base_text_item::Item::Code(
+                code,
+            ) => (
+                code.text.clone(),
+                code.content_layer,
+                code.prov.iter().any(|prov| prov.bbox.is_some()),
+            ),
+            other => {
+                let base = match other {
+                    grpc_pdf_inspector::proto::ai::pipestream::document::v1::base_text_item::Item::Text(text) => text.base.as_ref(),
+                    grpc_pdf_inspector::proto::ai::pipestream::document::v1::base_text_item::Item::SectionHeader(header) => header.base.as_ref(),
+                    grpc_pdf_inspector::proto::ai::pipestream::document::v1::base_text_item::Item::ListItem(item) => item.base.as_ref(),
+                    other => panic!("this fold makes no {other:?}"),
+                }
+                .expect("a base");
+                (
+                    base.text.clone(),
+                    base.content_layer,
+                    base.prov.iter().any(|prov| prov.bbox.is_some()),
+                )
+            }
+        };
+        if layer
+            == grpc_pdf_inspector::proto::ai::pipestream::document::v1::ContentLayer::Body as i32
+        {
+            body += 1;
+        } else {
+            furniture += 1;
+        }
+        if !has_box {
+            boxless.push(base_text);
+        }
+    }
+    assert!(body > 0 && furniture > 0, "the fixture has both layers");
+    assert!(
+        boxless.is_empty(),
+        "{} of {} items have no box: {:?}",
+        boxless.len(),
+        body + furniture,
+        boxless.iter().take(5).collect::<Vec<_>>()
+    );
+}

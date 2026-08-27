@@ -90,9 +90,27 @@ fn key(item: &TextItem) -> Key {
 /// One page's runs as the wire message.
 #[must_use]
 pub fn page_spans(page_no: u32, items: &[TextItem]) -> pb::PageSpans {
+    page_spans_marking(page_no, items, |_| false)
+}
+
+/// One page's runs as the wire message, the ones `is_chrome` names flagged
+/// as page chrome. Every run goes out, chrome included: the event is the
+/// page as drawn, and the flag is what says which runs the rendering was
+/// not given.
+pub fn page_spans_marking(
+    page_no: u32,
+    items: &[TextItem],
+    is_chrome: impl Fn(&TextItem) -> bool,
+) -> pb::PageSpans {
     pb::PageSpans {
         page_no,
-        spans: items.iter().map(span).collect(),
+        spans: items
+            .iter()
+            .map(|item| pb::TextSpan {
+                chrome: is_chrome(item),
+                ..span(item)
+            })
+            .collect(),
     }
 }
 
@@ -125,6 +143,9 @@ pub fn span(item: &TextItem) -> pb::TextSpan {
             ItemType::Link(uri) => uri.clone(),
             _ => String::new(),
         },
+        // Chrome is a verdict over the whole document, taken by the caller
+        // that has it; one run on its own is never chrome.
+        chrome: false,
     }
 }
 

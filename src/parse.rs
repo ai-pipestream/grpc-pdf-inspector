@@ -506,8 +506,15 @@ fn parse(
                 // The runs go out before the rendering they produced, so a
                 // consumer reading both never has to buffer one to
                 // interpret the other.
+                // The chrome verdicts ride the runs: the fold joins the
+                // rendering back to the runs by their letters, and a margin
+                // number sharing a baseline with a body line would otherwise
+                // sit in the middle of that line's letters, where no block
+                // of the rendering can match across it.
                 if events.wanted(options.emit_spans) {
-                    let spans = spans::page_spans(page_no, &page_items);
+                    let spans = spans::page_spans_marking(page_no, &page_items, |item| {
+                        chrome.convicts(item)
+                    });
                     events.route(
                         pb::parse_pdf_response::Event::Spans(spans),
                         options.emit_spans,
