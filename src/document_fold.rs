@@ -507,6 +507,13 @@ impl DocumentFold {
     /// a figure's label, the tail of a column, a line that fell between two
     /// regions. It is body content, it keeps the box the page drew it at,
     /// and the only thing lost is the block it would have been part of.
+    ///
+    /// Body content goes in through [`Self::push_text`], which is what
+    /// hangs it off the body. The run arrived on the same event as the
+    /// chrome report and it is not chrome; nothing about where the report
+    /// came from follows it here, because an item that declares the body
+    /// layer and hangs off the furniture group is body content no body walk
+    /// can reach. `tests/dropped_runs.rs` is where that is asserted.
     fn push_dropped(&mut self, run: &pb::TextSpan, page_no: u32) {
         let text = run.text.trim();
         if text.is_empty() {
@@ -599,30 +606,13 @@ impl DocumentFold {
     /// into it; they go here, which is what `CONTENT_LAYER_FURNITURE` and
     /// the furniture group are for and why both existed empty.
     fn push_furniture(&mut self, text: &str, page_no: u32) {
-        let self_ref = format!("#/texts/{}", self.document.texts.len());
-        self.document.texts.push(doc::BaseTextItem {
-            item: Some(doc::base_text_item::Item::Text(doc::TextItem {
-                base: Some(doc::TextItemBase {
-                    self_ref: self_ref.clone(),
-                    parent: Some(reference(FURNITURE_REF)),
-                    content_layer: doc::ContentLayer::Furniture as i32,
-                    meta: Some(doc::BaseMeta::default()),
-                    prov: provenance(page_no, None),
-                    // Which of header, footer or folio this was is not
-                    // reported by the stripper, so it is not claimed here.
-                    label: doc::DocItemLabel::Text as i32,
-                    orig: text.to_owned(),
-                    text: text.to_owned(),
-                    source: vec![doc::SourceType {
-                        source: Some(doc::source_type::Source::Collector(self.source.clone())),
-                    }],
-                    ..doc::TextItemBase::default()
-                }),
-            })),
-        });
-        if let Some(furniture) = self.document.furniture.as_mut() {
-            furniture.children.push(reference(&self_ref));
-        }
+        self.push_off_body(
+            text,
+            doc::ContentLayer::Furniture,
+            // Which of header, footer or folio this was is not reported by
+            // the stripper, so it is not claimed here.
+            provenance(page_no, None),
+        );
     }
 
     /// Put one run the page drew invisibly into the invisible layer.
@@ -638,18 +628,44 @@ impl DocumentFold {
     /// The run keeps its box, so a consumer can say where the hidden text
     /// sits rather than only that it exists.
     fn push_invisible(&mut self, run: &pb::TextSpan, page_no: u32) {
+        self.push_off_body(
+            &run.text,
+            doc::ContentLayer::Invisible,
+            provenance(page_no, run.bbox.as_ref().map(bounding_box)),
+        );
+    }
+
+    /// Append one text item that is not body content.
+    ///
+    /// Every such item goes in through here, and here is the only place
+    /// that writes a parent of `#/furniture`, because the layer and the
+    /// group have to agree: an item in the body layer is reachable from
+    /// `#/body` and an item that is not is reachable from `#/furniture`,
+    /// and the two facts are one decision. Writing them in two places is
+    /// how an item comes to say it is body while hanging off the furniture
+    /// group, which is a body item no body walk can reach.
+    fn push_off_body(
+        &mut self,
+        text: &str,
+        layer: doc::ContentLayer,
+        prov: Vec<doc::ProvenanceItem>,
+    ) {
+        debug_assert!(
+            layer != doc::ContentLayer::Body,
+            "body content hangs off the body"
+        );
         let self_ref = format!("#/texts/{}", self.document.texts.len());
         self.document.texts.push(doc::BaseTextItem {
             item: Some(doc::base_text_item::Item::Text(doc::TextItem {
                 base: Some(doc::TextItemBase {
                     self_ref: self_ref.clone(),
                     parent: Some(reference(FURNITURE_REF)),
-                    content_layer: doc::ContentLayer::Invisible as i32,
+                    content_layer: layer as i32,
                     meta: Some(doc::BaseMeta::default()),
-                    prov: provenance(page_no, run.bbox.as_ref().map(bounding_box)),
+                    prov,
                     label: doc::DocItemLabel::Text as i32,
-                    orig: run.text.clone(),
-                    text: run.text.clone(),
+                    orig: text.to_owned(),
+                    text: text.to_owned(),
                     source: vec![doc::SourceType {
                         source: Some(doc::source_type::Source::Collector(self.source.clone())),
                     }],
@@ -1235,11 +1251,52 @@ fn protection(encryption: &pb::EncryptionInfo) -> doc::Protection {
 /// A string reduced to its lower-case letters and digits, which is what
 /// two spellings of the same line have in common: the renderer joins runs
 /// with spaces and adds markdown punctuation, and neither changes a letter.
+///
+/// Except that two of the renderer's decorations are spelled with letters.
+/// A run it considers underlined comes back as `<u>text</u>` and a struck
+/// one as `<s>text</s>`, and those tags put letters into the block that
+/// the run they came from does not have. A running head with a rule under
+/// it is exactly that case, and it is the one that matters: the chrome
+/// report named it, the comparison here missed it by two characters, and
+/// the head was filed as furniture and folded into the body as well. Tags
+/// are dropped before the letters are counted, and only tags: a short span
+/// of letters, digits and slashes between angle brackets. Prose that says
+/// `a < b` keeps every letter it has.
 fn letters(text: &str) -> String {
+    let mut letters = String::new();
+    let mut rest = text;
+    while let Some(open) = rest.find('<') {
+        letters.extend(alphanumeric(&rest[..open]));
+        let after = &rest[open + 1..];
+        match after.find('>') {
+            Some(close) if is_tag(&after[..close]) => rest = &after[close + 1..],
+            _ => {
+                // Not markup: the bracket itself contributes nothing, and
+                // what follows is read as text.
+                rest = after;
+            }
+        }
+    }
+    letters.extend(alphanumeric(rest));
+    letters
+}
+
+/// Whether the span between two angle brackets is a markup tag rather than
+/// a piece of a sentence.
+fn is_tag(inside: &str) -> bool {
+    /// The longest a tag's name can be before the angle brackets around it
+    /// are punctuation in a sentence rather than markup.
+    const MAX_TAG: usize = 8;
+
+    let name = inside.strip_prefix('/').unwrap_or(inside);
+    !name.is_empty() && name.chars().count() <= MAX_TAG && name.chars().all(char::is_alphanumeric)
+}
+
+/// The lower-case letters and digits of a string.
+fn alphanumeric(text: &str) -> impl Iterator<Item = char> + '_ {
     text.chars()
         .filter(|character| character.is_alphanumeric())
         .flat_map(char::to_lowercase)
-        .collect()
 }
 
 /// A value, unless it is empty.
@@ -2014,6 +2071,23 @@ mod tests {
         );
         assert_eq!(base_of(&document.texts[1]).text, "the body of the page");
         assert_sound(&document);
+    }
+
+    #[test]
+    fn markup_tags_are_not_letters_and_a_less_than_sign_in_prose_still_is() {
+        // The renderer spells an underlined run `<u>text</u>` and a struck
+        // one `<s>text</s>`; those tags carry letters the run does not,
+        // which is how a chrome line the report had named was matched
+        // against its own rendering and missed.
+        assert_eq!(letters("<u>A Running Head</u>"), letters("A Running Head"));
+        assert_eq!(letters("<s>struck</s>"), letters("struck"));
+        assert_eq!(letters("## **A Heading**"), letters("A Heading"));
+        assert_eq!(letters("a < b and c > d"), "abandcd");
+        assert_eq!(
+            letters("<notatagitistoolong>x"),
+            letters("notatagitistoolongx"),
+            "a long bracketed span is prose about brackets"
+        );
     }
 
     #[test]

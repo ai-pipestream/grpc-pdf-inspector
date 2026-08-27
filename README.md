@@ -175,7 +175,10 @@ collector's parse of the same document:
   every item's parent is `#/body` or a group, never another text item, so
   a consumer walking `#/body` through its groups reaches every body item
   and refs renumber mechanically on merge. A section header carries its
-  depth on `level` rather than by owning the prose beneath it.
+  depth on `level` rather than by owning the prose beneath it. An item's
+  layer and the group it hangs under always agree: `CONTENT_LAYER_BODY`
+  hangs under `#/body`, everything else under `#/furniture`, so the body
+  walk reaches exactly the body.
 - Default off costs nothing: no fold is built and no markdown is
   retained.
 

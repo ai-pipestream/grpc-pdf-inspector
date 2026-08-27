@@ -18,10 +18,15 @@
 //! - Every body-layer item is reachable from `#/body`, walking groups. A
 //!   text item is never another text item's parent, so there is no branch
 //!   of the fragment a body walk cannot get to.
+//! - An item's layer and the group it hangs under say the same thing. An
+//!   item that declares the body layer and hangs off `#/furniture` is body
+//!   content no body walk can reach, and it is exactly what a fold that
+//!   decides the layer in one place and the parent in another produces.
+//!   `common::assert_layers_and_parents_agree` states it once and both
+//!   fixtures here are held to it, as is every hand-built fragment in
+//!   `tests/dropped_runs.rs`.
 
 mod common;
-
-use std::collections::HashSet;
 
 use grpc_pdf_inspector::proto::ai::pipestream::document::v1 as doc;
 use grpc_pdf_inspector::proto::v1 as pb;
@@ -41,42 +46,6 @@ fn base_of(item: &doc::BaseTextItem) -> Option<&doc::TextItemBase> {
         doc::base_text_item::Item::ListItem(list_item) => list_item.base.as_ref(),
         _ => None,
     }
-}
-
-/// Every ref reachable from `#/body`, recursing through groups and through
-/// any children an item lists.
-fn reachable(document: &doc::Document) -> HashSet<String> {
-    let mut found = HashSet::new();
-    let mut queue: Vec<String> = document
-        .body
-        .as_ref()
-        .expect("a body")
-        .children
-        .iter()
-        .map(|child| child.r#ref.clone())
-        .collect();
-    while let Some(self_ref) = queue.pop() {
-        if !found.insert(self_ref.clone()) {
-            continue;
-        }
-        let children: Vec<doc::RefItem> = if let Some(index) = self_ref
-            .strip_prefix("#/groups/")
-            .and_then(|rest| rest.parse::<usize>().ok())
-        {
-            document.groups[index].children.clone()
-        } else if let Some(index) = self_ref
-            .strip_prefix("#/texts/")
-            .and_then(|rest| rest.parse::<usize>().ok())
-        {
-            base_of(&document.texts[index])
-                .map(|base| base.children.clone())
-                .unwrap_or_default()
-        } else {
-            Vec::new()
-        };
-        queue.extend(children.into_iter().map(|child| child.r#ref));
-    }
-    found
 }
 
 /// Parse the fixture with the furniture report and the Document on.
@@ -132,7 +101,7 @@ async fn only_the_head_the_folio_and_the_margin_numbers_are_furniture() {
 async fn every_body_item_is_reachable_from_the_body() {
     let events = parse().await;
     let document = common::documents(&events)[0];
-    let reached = reachable(document);
+    let reached = common::reachable_from_body(document);
 
     for (index, item) in document.texts.iter().enumerate() {
         let Some(base) = base_of(item) else { continue };
@@ -185,7 +154,7 @@ async fn no_text_item_is_another_text_items_parent() {
 async fn the_columns_are_body_and_the_chrome_is_not_in_them() {
     let events = parse().await;
     let document = common::documents(&events)[0];
-    let reached = reachable(document);
+    let reached = common::reachable_from_body(document);
 
     // Every reachable body item's text, joined: the columns are rendered
     // as one block per column, so a run of the page is in the body when the
@@ -235,4 +204,76 @@ async fn the_columns_are_body_and_the_chrome_is_not_in_them() {
         }),
         "the running head is furniture, so it is not also body"
     );
+}
+
+#[tokio::test]
+async fn every_items_layer_and_parent_say_the_same_thing() {
+    let events = parse().await;
+    common::assert_layers_and_parents_agree(common::documents(&events)[0]);
+}
+
+/// The review format, which is where the remaining faults were found: an
+/// underlined running head one ordinary line above the body, and a line
+/// number in the margin of every row.
+async fn review_paper() -> Vec<pb::parse_pdf_response::Event> {
+    let harness = common::start().await;
+    harness
+        .parse(
+            &common::review_paper_pdf(11, "Under review as a conference paper"),
+            pb::PdfOptions {
+                report_furniture: true,
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse")
+}
+
+#[tokio::test]
+async fn a_review_papers_head_and_line_numbers_are_chrome_and_its_prose_is_not() {
+    let events = review_paper().await;
+    for page in common::pages(&events) {
+        assert!(
+            page.furniture
+                .iter()
+                .any(|line| line == "Under review as a conference paper"),
+            "the head is chrome on page {}, rule under it or not: {:?}",
+            page.page_no,
+            page.furniture
+        );
+        assert_eq!(
+            page.furniture
+                .iter()
+                .filter(|line| line.chars().all(|c| c.is_ascii_digit()))
+                .count(),
+            41,
+            "forty margin numbers and a folio, page {}",
+            page.page_no
+        );
+        assert!(
+            !page.furniture.iter().any(|line| line.contains("Body row")),
+            "prose is never chrome, page {}",
+            page.page_no
+        );
+    }
+
+    let document = common::documents(&events)[0];
+    let body: Vec<String> = common::placed(document)
+        .into_iter()
+        .filter(|item| item.layer == doc::ContentLayer::Body as i32)
+        .map(|item| item.text)
+        .collect();
+    assert!(
+        !body.iter().any(|text| text.contains("Under review")),
+        "the head is chrome, so it is not also body: {body:?}"
+    );
+    for page in 1..=11 {
+        assert!(
+            body.iter()
+                .any(|text| text.contains(&format!("Body row 0 of page {page}"))),
+            "page {page}'s prose is in the body"
+        );
+    }
+    common::assert_layers_and_parents_agree(document);
 }

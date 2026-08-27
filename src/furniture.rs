@@ -65,6 +65,15 @@ const EDGE_DRIFT: f32 = 4.0;
 /// How far outside the text block a run must sit to be in the margin.
 const MARGIN_GAP: f32 = 2.0;
 
+/// How much smaller than the body a face must be for its size alone to
+/// mark an edge line as chrome. The parser's own policy uses the same
+/// fraction, which is a hair under equal: a head is set smaller, not
+/// nearly the same.
+const SMALL_FACE: f32 = 0.98;
+
+/// The body size assumed for a page whose runs report none.
+const DEFAULT_BODY_SIZE: f32 = 12.0;
+
 /// The most characters a margin line number can have.
 const MAX_MARGIN_NUMBER: usize = 4;
 
@@ -238,12 +247,22 @@ enum Edge {
     Bottom,
 }
 
-/// The heights of the isolated block at each edge of a page.
+/// The heights of the block at each edge of a page that could be chrome.
 ///
-/// A page's furniture is set off from its body by white space, so the block
-/// at each edge qualifies only when a clear gap separates it from the next
-/// line inward. A block that runs on into the body is the body starting at
-/// the top of the page, which is what a page of prose looks like.
+/// A page's furniture is set off from its body one of two ways, and both
+/// count here, because a real paper uses whichever its template chose:
+///
+/// - **By white space.** The block at the edge qualifies when a clear gap
+///   separates it from the next line inward. A block that runs on into the
+///   body is the body starting at the top of the page.
+/// - **By type size.** A head set in a smaller face than the page's body
+///   is chrome even when it sits an ordinary line's distance above the
+///   first line of text, which is how a review template that numbers every
+///   line sets its head. This is the parser's own short-document evidence,
+///   used here for the same judgement.
+///
+/// Neither one convicts on its own: the caller still requires the line to
+/// repeat, at the same height, on page after page.
 fn edges(items: &[&TextItem]) -> Vec<(Edge, Vec<f32>)> {
     let mut heights: Vec<f32> = Vec::new();
     for item in items {
@@ -265,15 +284,59 @@ fn edges(items: &[&TextItem]) -> Vec<(Edge, Vec<f32>)> {
     let leading = steps.get(steps.len() / 2).copied().unwrap_or(12.0);
     let isolation = leading * ISOLATION_FACTOR;
 
+    let body = body_size(items);
     let mut bands = Vec::new();
-    if let Some(band) = edge_block(&heights, isolation) {
+    if let Some(band) =
+        edge_block(&heights, isolation).or_else(|| small_face_line(&heights, items, body))
+    {
         bands.push((Edge::Top, band));
     }
     let from_bottom: Vec<f32> = heights.iter().rev().copied().collect();
-    if let Some(band) = edge_block(&from_bottom, isolation) {
+    if let Some(band) =
+        edge_block(&from_bottom, isolation).or_else(|| small_face_line(&from_bottom, items, body))
+    {
         bands.push((Edge::Bottom, band));
     }
     bands
+}
+
+/// The outermost line of `heights`, when every run on it is set smaller
+/// than the page's body text.
+///
+/// Same-size edge lines are content that merely sits at the margin: a
+/// section heading above its heading gap, an affiliation block, a
+/// continuing paragraph. The parser's own policy draws the line in the
+/// same place and for the same reason.
+fn small_face_line(heights: &[f32], items: &[&TextItem], body: f32) -> Option<Vec<f32>> {
+    let y = *heights.first()?;
+    let mut on_the_line = items
+        .iter()
+        .filter(|item| (item.y - y).abs() < SAME_LINE)
+        .peekable();
+    on_the_line.peek()?;
+    on_the_line
+        .all(|item| item.font_size < body * SMALL_FACE)
+        .then(|| vec![y])
+}
+
+/// The size the page's body text is set in: the median font size weighted
+/// by how many characters are set in it, which is the parser's own measure
+/// of the same thing.
+fn body_size(items: &[&TextItem]) -> f32 {
+    let mut sizes: Vec<(f32, usize)> = items
+        .iter()
+        .map(|item| (item.font_size, item.text.chars().count()))
+        .collect();
+    sizes.sort_by(|left, right| left.0.total_cmp(&right.0));
+    let total: usize = sizes.iter().map(|(_, chars)| chars).sum();
+    let mut running = 0usize;
+    for (size, chars) in &sizes {
+        running += chars;
+        if running * 2 >= total {
+            return *size;
+        }
+    }
+    DEFAULT_BODY_SIZE
 }
 
 /// The block at the near end of `heights`, when a gap of `isolation` or
@@ -513,6 +576,68 @@ mod tests {
                 run.page
             );
         }
+    }
+
+    /// Pages whose running head sits one ordinary line above the body, so
+    /// no white space isolates it: only its type size sets it apart.
+    ///
+    /// The head prints the page's own number in the middle of itself, so it
+    /// is not the same line twice and the parser's verbatim-repetition
+    /// classifier has nothing to say about it. What repeats is its shape,
+    /// its height and its face, which is what this rule reads.
+    fn tight_head_pages(head_size: f32) -> Vec<TextItem> {
+        let mut items = Vec::new();
+        for page in 1..=4u32 {
+            let mut head = item(
+                page,
+                &format!("Under review {page} at the conference"),
+                72.0,
+                716.0,
+            );
+            head.font_size = head_size;
+            items.push(head);
+            for row in 0..12u8 {
+                let mut line = item(
+                    page,
+                    &format!("body row {row} of page {page} with ordinary words"),
+                    72.0,
+                    700.0 - 16.0 * f32::from(row),
+                );
+                line.font_size = 10.0;
+                items.push(line);
+            }
+        }
+        items
+    }
+
+    #[test]
+    fn a_repeated_head_in_a_smaller_face_is_chrome_without_a_gap_to_prove_it() {
+        // The review templates that number every line set the head close
+        // enough to the body that no gap isolates it. The face does.
+        let items = tight_head_pages(8.0);
+        let chrome = Chrome::detect(&items, 4);
+        for run in &items {
+            assert_eq!(
+                chrome.convicts(run),
+                run.text.starts_with("Under review"),
+                "{:?} on page {}",
+                run.text,
+                run.page
+            );
+        }
+    }
+
+    #[test]
+    fn a_repeated_line_in_the_body_face_is_not_chrome_on_position_alone() {
+        // The same line, set at body size: a heading that repeats, an
+        // affiliation block, a continued paragraph. Nothing here is
+        // evidence of chrome.
+        let items = tight_head_pages(10.0);
+        let chrome = Chrome::detect(&items, 4);
+        assert!(
+            !items.iter().any(|run| chrome.convicts(run)),
+            "same-size edge lines are content that sits at the margin"
+        );
     }
 
     #[test]

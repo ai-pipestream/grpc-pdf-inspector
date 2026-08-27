@@ -171,6 +171,24 @@ markdown looked fine.
   running head and a line number beside every row, asserting that only the
   chrome is furniture, that every body-layer item is reachable from
   `#/body`, and that nothing is in both layers.
+- *Then measured against the paper itself*, which found two more faults
+  that no fixture here reproduced. Its running head is ruled underneath,
+  and the renderer spells an underlined run `<u>text</u>`; the fold matched
+  a rendered block against the chrome report on letters alone, the tags put
+  two letters into the block that the run did not have, and a head the
+  report had already filed as furniture was folded into the body as well,
+  on every page. And the head sits an ordinary line above the first line of
+  text, so no white space isolates it and the repetition evidence never
+  looked at it: on a document of three pages or more the parser's own
+  classifier keeps the first occurrence of a running head, so page one's
+  head stayed in the body. Tags are now dropped before letters are counted,
+  and a line at a page edge set in a smaller face than the body is an edge
+  line whether or not a gap proves it.
+- *Held by*: `tests/dropped_runs.rs`, which drives the fold by hand because
+  the renderer will not drop a run on any fixture this suite can author,
+  and `common::assert_layers_and_parents_agree`, which states the invariant
+  the whole plane rests on: an item's layer and the group it hangs under
+  say the same thing, and the body walk reaches exactly the body layer.
 
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page
