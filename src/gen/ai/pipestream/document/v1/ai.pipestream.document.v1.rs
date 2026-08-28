@@ -127,6 +127,13 @@ pub struct Document {
     /// Pivot table definitions a spreadsheet declares.
     #[prost(message, repeated, tag="27")]
     pub pivots: ::prost::alloc::vec::Vec<PivotSpec>,
+    /// Every collector's own document-level account, kept whole beside the
+    /// resolved view above. Where two collectors answered one field, the
+    /// resolved field carries the winner and names it in `field_sources`;
+    /// the loser's answer is here, under its collector, not lost. Extension
+    /// beyond the upstream dialect.
+    #[prost(message, repeated, tag="28")]
+    pub claims: ::prost::alloc::vec::Vec<CollectorClaim>,
 }
 /// DocumentOrigin contains metadata about the source document file.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -150,6 +157,14 @@ pub struct DocumentOrigin {
     /// The source's own file identifier (a PDF /ID), hex-encoded.
     #[prost(string, optional, tag="6")]
     pub source_id: ::core::option::Option<::prost::alloc::string::String>,
+    /// What the mimetype claim rests on (extension, sniffed magic, declared
+    /// header), when the producer records it.
+    #[prost(string, optional, tag="7")]
+    pub mimetype_evidence: ::core::option::Option<::prost::alloc::string::String>,
+    /// Which collector's answer each resolved singular field carries.
+    /// Extension beyond the upstream dialect.
+    #[prost(message, repeated, tag="8")]
+    pub field_sources: ::prost::alloc::vec::Vec<FieldSource>,
 }
 /// GroupItem represents a logical grouping of document elements.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -268,6 +283,37 @@ pub struct CollectorSource {
     /// three-thousand-token mean stay distinguishable.
     #[prost(uint64, optional, tag="7")]
     pub raw_score_samples: ::core::option::Option<u64>,
+}
+/// FieldSource names the collector whose answer a resolved singular field
+/// carries. `field` is the field's name on the message that holds this
+/// list, dotted through nested messages ("web.canonical_uri"); it is a
+/// schema identifier, never free text. Extension beyond the upstream
+/// dialect.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct FieldSource {
+    #[prost(string, tag="1")]
+    pub field: ::prost::alloc::string::String,
+    #[prost(message, optional, tag="2")]
+    pub source: ::core::option::Option<CollectorSource>,
+}
+/// CollectorClaim is one collector's whole document-level account, kept
+/// beside the resolved view so a value that lost the resolution is still
+/// on the wire under the collector that gave it. Extension beyond the
+/// upstream dialect.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct CollectorClaim {
+    #[prost(message, optional, tag="1")]
+    pub source: ::core::option::Option<CollectorSource>,
+    #[prost(message, optional, tag="2")]
+    pub source_meta: ::core::option::Option<DocumentMeta>,
+    #[prost(message, optional, tag="3")]
+    pub origin: ::core::option::Option<DocumentOrigin>,
+    #[prost(message, repeated, tag="4")]
+    pub page_styles: ::prost::alloc::vec::Vec<PageStyle>,
+    #[prost(message, optional, tag="5")]
+    pub email: ::core::option::Option<EmailMeta>,
+    #[prost(message, optional, tag="6")]
+    pub media: ::core::option::Option<MediaMeta>,
 }
 /// SourceType is a union of possible source descriptors.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -500,6 +546,16 @@ pub struct TextItemBase {
     /// Index attribution when this item heads a generated index.
     #[prost(message, optional, tag="21")]
     pub index_meta: ::core::option::Option<IndexMeta>,
+    /// The item's raw source form where `text` is a projection (a passed-
+    /// through markup block), the block-level twin of InlineSpan.raw.
+    #[prost(string, optional, tag="22")]
+    pub raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source element this item came from, for markup sources that keep
+    /// that identity.
+    #[prost(string, optional, tag="23")]
+    pub source_element_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="24")]
+    pub source_namespace: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// TitleItem represents a document title or major heading.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -595,6 +651,12 @@ pub struct CodeItem {
     /// Raw label fallback for forward-compatibility with newer label vocabularies.
     #[prost(string, optional, tag="20")]
     pub label_raw: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source element this item came from, mirroring TextItemBase; this
+    /// item kind inlines its base fields, so the mirror is stated here.
+    #[prost(string, optional, tag="21")]
+    pub source_element_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="22")]
+    pub source_namespace: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// FormulaItem represents a mathematical formula or equation.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -634,6 +696,18 @@ pub struct ProvenanceItem {
     /// axis-aligned hull.
     #[prost(message, repeated, tag="7")]
     pub polygon: ::prost::alloc::vec::Vec<Point>,
+    /// Where the content sits in the source text, by line (1-based,
+    /// half-open), for line-addressed sources.
+    #[prost(message, optional, tag="8")]
+    pub line_range: ::core::option::Option<LineSpan>,
+}
+/// LineSpan is a half-open 1-based source line range.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct LineSpan {
+    #[prost(uint32, tag="1")]
+    pub start: u32,
+    #[prost(uint32, tag="2")]
+    pub end: u32,
 }
 /// BoundingBox defines a rectangular region in page coordinates.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -663,6 +737,10 @@ pub struct ImageRef {
     pub size: ::core::option::Option<Size>,
     #[prost(string, tag="4")]
     pub uri: ::prost::alloc::string::String,
+    /// The size as the source spelled it when it is not a bare number pair
+    /// (20%, 5cm, 0.8 of the text width); `size` stays unset then.
+    #[prost(string, optional, tag="5")]
+    pub size_raw: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Size represents 2D dimensions (width and height).
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -957,6 +1035,11 @@ pub struct PictureItem {
     /// the upstream dialect).
     #[prost(message, optional, tag="19")]
     pub chart: ::core::option::Option<ChartMeta>,
+    /// The source element this picture came from, mirroring TextItemBase.
+    #[prost(string, optional, tag="20")]
+    pub source_element_name: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="21")]
+    pub source_namespace: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// ChartMeta records where a rendered chart's data came from.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1528,6 +1611,9 @@ pub struct InlineSpan {
     /// Highlight color as #rrggbb, when the source states one.
     #[prost(string, optional, tag="15")]
     pub highlight_color: ::core::option::Option<::prost::alloc::string::String>,
+    /// Interlinear annotation over the run (ruby text).
+    #[prost(string, optional, tag="16")]
+    pub annotation: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// DocumentMeta carries the metadata the source declares about itself.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1625,6 +1711,10 @@ pub struct DocumentMeta {
     pub trapped: ::core::option::Option<i32>,
     /// Source metadata that is genuinely open vocabulary. Data whose shape the
     /// fleet knows gets a typed field, never an entry here.
+    /// Which collector's answer each resolved singular field carries.
+    /// Extension beyond the upstream dialect.
+    #[prost(message, repeated, tag="35")]
+    pub field_sources: ::prost::alloc::vec::Vec<FieldSource>,
     #[prost(map="string, string", tag="100")]
     pub extra: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
