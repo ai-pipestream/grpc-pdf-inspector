@@ -150,3 +150,153 @@ async fn a_document_that_draws_no_images_has_no_pictures() {
         .expect("the document should parse");
     assert!(common::documents(&events)[0].pictures.is_empty());
 }
+
+#[tokio::test]
+async fn a_figure_drawn_as_a_form_reaches_the_wire_as_a_placed_run() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::vector_figure_pdf(),
+            pb::PdfOptions {
+                emit_spans: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    let spans = common::spans(&events);
+    let form = spans[0]
+        .spans
+        .iter()
+        .find(|span| span.kind == pb::SpanKind::Form as i32)
+        .expect("the page invoked a form");
+    assert_eq!(form.text, "[Form: Fx1]");
+    let bbox = form.bbox.as_ref().expect("with a box");
+    assert!((bbox.x - 72.0).abs() < 1e-3, "{bbox:?}");
+    assert!((bbox.y - 400.0).abs() < 1e-3, "{bbox:?}");
+    assert!((bbox.width - 400.0).abs() < 1e-3, "{bbox:?}");
+    assert!((bbox.height - 200.0).abs() < 1e-3, "{bbox:?}");
+    assert!(
+        !spans[0]
+            .spans
+            .iter()
+            .any(|span| span.kind == pb::SpanKind::Image as i32),
+        "vector art is not an image"
+    );
+    // The form's own label is a run in its own right, at its placed
+    // position, and the markdown still renders from the runs alone.
+    assert!(
+        spans[0]
+            .spans
+            .iter()
+            .any(|span| span.text.trim() == "yield"),
+        "the figure's label is a run"
+    );
+    assert!(
+        !common::pages(&events)[0].markdown.contains("[Form"),
+        "the placement is not text"
+    );
+}
+
+#[tokio::test]
+async fn the_fold_makes_the_form_a_picture_between_the_paragraphs_around_it() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::vector_figure_pdf(),
+            pb::PdfOptions {
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    let document = common::documents(&events)[0];
+    assert_eq!(document.pictures.len(), 1, "one form, one picture");
+    let picture = &document.pictures[0];
+    let bbox = picture.prov[0].bbox.as_ref().expect("a placed box");
+    assert!((bbox.l - 72.0).abs() < 1e-3, "{bbox:?}");
+    assert!((bbox.b - 400.0).abs() < 1e-3, "{bbox:?}");
+    assert!((bbox.r - 472.0).abs() < 1e-3, "{bbox:?}");
+    assert!((bbox.t - 600.0).abs() < 1e-3, "{bbox:?}");
+
+    // Reading order: the prose above, the picture, its caption, the prose
+    // below. The picture is placed where the page put it, not at the top
+    // of the page.
+    let order: Vec<String> = document
+        .body
+        .as_ref()
+        .expect("a body")
+        .children
+        .iter()
+        .map(|child| {
+            child
+                .r#ref
+                .strip_prefix("#/texts/")
+                .and_then(|index| index.parse::<usize>().ok())
+                .and_then(|index| document.texts.get(index))
+                .map_or_else(
+                    || child.r#ref.clone(),
+                    |item| match item.item.as_ref() {
+                        Some(doc::base_text_item::Item::Text(text)) => text
+                            .base
+                            .as_ref()
+                            .map_or_else(String::new, |base| base.text.clone()),
+                        _ => String::new(),
+                    },
+                )
+        })
+        .collect();
+    let position = |needle: &str| {
+        order
+            .iter()
+            .position(|text| text.starts_with(needle))
+            .unwrap_or_else(|| panic!("{needle:?} in {order:?}"))
+    };
+    let above = position("Prose above");
+    let figure = position("#/pictures/0");
+    let caption = position("Figure 1");
+    let below = position("Prose below");
+    assert!(above < figure, "{order:?}");
+    assert!(figure < caption, "{order:?}");
+    assert!(caption < below, "{order:?}");
+    common::assert_layers_and_parents_agree(document);
+}
+
+#[tokio::test]
+async fn a_page_drawn_through_one_form_has_no_picture() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::wrapped_page_pdf(),
+            pb::PdfOptions {
+                emit_document: true,
+                emit_spans: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+    let spans = common::spans(&events);
+    assert!(
+        spans[0]
+            .spans
+            .iter()
+            .any(|span| span.kind == pb::SpanKind::Form as i32),
+        "the wrapper is on the wire, because it was drawn"
+    );
+    let document = common::documents(&events)[0];
+    assert!(
+        document.pictures.is_empty(),
+        "the page's own wrapper is not a figure: {:?}",
+        document.pictures
+    );
+    assert!(
+        common::placed(document)
+            .iter()
+            .any(|placed| placed.text.starts_with("A page drawn")),
+        "the form's text is the page's text"
+    );
+}

@@ -142,7 +142,7 @@ optional = true
 default-features = false
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.lopdf]
-version = "0.42.0"
+version = "0.44.0"
 features = ["rayon"]
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies.oar-ocr]
@@ -177,6 +177,6 @@ default-features = false
 version = "0.7"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies.lopdf]
-version = "0.42.0"
+version = "0.44.0"
 features = ["wasm_js"]
 default-features = false

@@ -22,9 +22,8 @@ syntax = "proto3";
 
 package ai.pipestream.pdf.v1;
 
-import "ai/pipestream/pdf/v1/types.proto";
-
 import "ai/pipestream/document/v1/document.proto";
+import "ai/pipestream/pdf/v1/types.proto";
 
 option java_multiple_files = true;
 option java_outer_classname = "PdfServiceProto";

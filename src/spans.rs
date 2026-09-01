@@ -15,8 +15,8 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use pdf_inspector::TextItem;
 use pdf_inspector::types::ItemType;
+use pdf_inspector::{PdfForm, TextItem};
 
 use crate::proto::v1 as pb;
 
@@ -32,6 +32,40 @@ pub fn by_page(items: Vec<TextItem>) -> BTreeMap<u32, Vec<TextItem>> {
         pages.entry(item.page).or_default().push(item);
     }
     pages
+}
+
+/// Group the document's Form XObject placements by their 1-indexed page.
+#[must_use]
+pub fn forms_by_page(forms: Vec<PdfForm>) -> BTreeMap<u32, Vec<PdfForm>> {
+    let mut pages: BTreeMap<u32, Vec<PdfForm>> = BTreeMap::new();
+    for form in forms {
+        pages.entry(form.page).or_default().push(form);
+    }
+    pages
+}
+
+/// A Form XObject placement as the wire message.
+///
+/// The text is a placeholder naming the resource, as an image run's is;
+/// the box is the form's own bounding box under the transformation the
+/// page invoked it with. A form has no face and no glyphs of its own, so
+/// nothing else is said about it: its text, when it has any, arrives as
+/// runs in its own right.
+#[must_use]
+pub fn form_span(form: &PdfForm) -> pb::TextSpan {
+    let (x, width) = normalize(form.x, form.width);
+    let (y, height) = normalize(form.y, form.height);
+    pb::TextSpan {
+        text: format!("[Form: {}]", form.name),
+        bbox: Some(pb::Rect {
+            x: f64::from(x),
+            y: f64::from(y),
+            width: f64::from(width),
+            height: f64::from(height),
+        }),
+        kind: pb::SpanKind::Form.into(),
+        ..pb::TextSpan::default()
+    }
 }
 
 /// The runs an invisible-inclusive extraction produced that the visible one
@@ -90,9 +124,27 @@ fn key(item: &TextItem) -> Key {
 /// One page's runs as the wire message.
 #[must_use]
 pub fn page_spans(page_no: u32, items: &[TextItem]) -> pb::PageSpans {
+    page_spans_marking(page_no, items, |_| false)
+}
+
+/// One page's runs as the wire message, the ones `is_chrome` names flagged
+/// as page chrome. Every run goes out, chrome included: the event is the
+/// page as drawn, and the flag is what says which runs the rendering was
+/// not given.
+pub fn page_spans_marking(
+    page_no: u32,
+    items: &[TextItem],
+    is_chrome: impl Fn(&TextItem) -> bool,
+) -> pb::PageSpans {
     pb::PageSpans {
         page_no,
-        spans: items.iter().map(span).collect(),
+        spans: items
+            .iter()
+            .map(|item| pb::TextSpan {
+                chrome: is_chrome(item),
+                ..span(item)
+            })
+            .collect(),
     }
 }
 
@@ -125,6 +177,9 @@ pub fn span(item: &TextItem) -> pb::TextSpan {
             ItemType::Link(uri) => uri.clone(),
             _ => String::new(),
         },
+        // Chrome is a verdict over the whole document, taken by the caller
+        // that has it; one run on its own is never chrome.
+        chrome: false,
     }
 }
 
@@ -204,6 +259,44 @@ mod tests {
         let span = span(&link);
         assert_eq!(span.kind, pb::SpanKind::Link as i32);
         assert_eq!(span.link_uri, "https://example.invalid/x");
+    }
+
+    #[test]
+    fn a_form_placement_is_a_placed_run_with_no_face() {
+        let span = form_span(&PdfForm {
+            name: "Im3".to_owned(),
+            x: 345.6,
+            y: 447.9,
+            width: 158.4,
+            height: 116.1,
+            page: 4,
+        });
+        assert_eq!(span.kind, pb::SpanKind::Form as i32);
+        assert_eq!(span.text, "[Form: Im3]");
+        let bbox = span.bbox.as_ref().expect("a box");
+        assert!((bbox.x - 345.6).abs() < 1e-3);
+        assert!((bbox.height - 116.1).abs() < 1e-3);
+        assert!(span.font_family.is_empty());
+        assert_eq!(span.font_size, 0.0);
+        let pages = forms_by_page(vec![
+            PdfForm {
+                name: "A".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                page: 2,
+            },
+            PdfForm {
+                name: "B".to_owned(),
+                x: 0.0,
+                y: 0.0,
+                width: 1.0,
+                height: 1.0,
+                page: 1,
+            },
+        ]);
+        assert_eq!(pages.keys().copied().collect::<Vec<_>>(), [1, 2]);
     }
 
     #[test]

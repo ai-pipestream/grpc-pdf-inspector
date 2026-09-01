@@ -93,6 +93,23 @@ pub struct PdfRect {
     pub page: u32,
 }
 
+/// A Form XObject invocation: the page-space box a `Do` placed the form's
+/// `/BBox` at, carried through the form's `/Matrix` and the CTM in force.
+///
+/// A vector figure included as a form draws no image XObject, so this is
+/// the only record of where it sits. Nested invocations are reported too,
+/// each with its own box.
+#[derive(Debug, Clone)]
+pub struct PdfForm {
+    /// The resource name the invoking stream used (`Im3`, `Fm0`).
+    pub name: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+    pub page: u32,
+}
+
 /// A text item with position information
 #[derive(Debug, Clone)]
 pub struct TextItem {

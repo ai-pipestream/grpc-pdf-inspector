@@ -54,6 +54,7 @@ pub use extractor::{
     extract_text_with_positions_and_rects_mem_with_invisible, extract_text_with_positions_mem,
     extract_text_with_positions_mem_pages_with_invisible, extract_text_with_positions_pages,
     extract_text_with_positions_pages_with_password,
+    extract_text_with_positions_rects_and_forms_mem_with_invisible,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -64,7 +65,7 @@ pub use text_quality::{
     analyze_text_quality, detect_encoding_issues, LetterFrequencyScore, TextQualityReport,
     MIN_LETTERS_FOR_GARBLE_SCORE,
 };
-pub use types::{LayoutComplexity, PageExtraction, PdfLine, PdfRect, TextItem};
+pub use types::{LayoutComplexity, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};

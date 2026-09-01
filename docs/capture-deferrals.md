@@ -24,7 +24,8 @@ Three reasons appear below and they are not interchangeable:
 | S2 / D17 link annotations | `InlineSpan.hyperlink` over the anchored words, plus item-level `hyperlink` when a block is entirely one link |
 | S10 whole-stream verdict on the Document plane | `PageItem.quality` per page |
 | D1 / D2 per-page OCR verdicts | `PageMarkdown.needs_ocr` / `.ocr_reason`, `ParseStatus.extraction_ocr_reasons` |
-| D6 / D22 stripped furniture | `PageMarkdown.furniture`, and the furniture group under `CONTENT_LAYER_FURNITURE` |
+| D6 / D22 stripped furniture | `PageMarkdown.furniture`, and the furniture group under `CONTENT_LAYER_FURNITURE`, on chrome evidence only |
+| Runs the rendering left out | `PageMarkdown.dropped`, folded back into `#/body` where the page drew them |
 | D8 per-run geometry | `TextSpan.bbox`, and `ProvenanceItem.bbox` on every located item |
 | D9 page dimensions | `PageGeometry.media_box` / `.crop_box`, `PageItem.size` |
 | D10 font identity and size | `TextSpan.font_family` / `.font_tag` / `.font_size` |
@@ -47,6 +48,7 @@ Three reasons appear below and they are not interchangeable:
 | U24 file identifier | `PdfMetadata.file_id`, `DocumentOrigin.source_id` |
 | S3 formatting | `TextSpan` flags, `InlineSpan.formatting` / `.font_family` / `.font_size_pt` over the characters they cover |
 | D7 image placements | `SPAN_KIND_IMAGE` runs, `Document.pictures[]` with their boxes |
+| Figures drawn as Form XObjects | `SPAN_KIND_FORM` runs, `Document.pictures[]` with the form's placed box, each picture in reading order after the text above it |
 | Links over non-text regions | `PictureItem.hyperlink` for external targets, `PictureItem.target` for internal ones |
 | U8 / U13 / U16 posture and identity, on the Document plane | `DocumentMeta.format_version` / `.structured` / `.authoring_tool` / `.subject` / `.protection` / `.raw_metadata` |
 | U15 / U23 page geometry and labels, on the Document plane | `PageItem.page_label` / `.media_size` / `.user_unit` |
@@ -61,7 +63,9 @@ Three reasons appear below and they are not interchangeable:
 
 Four asks stood here, and each one was data the parser crate computes and
 returns through no public API. They were recorded as needing an upstream
-change because there was no way to fix them from the service side.
+change because there was no way to fix them from the service side. A fifth
+ask arrived later, from a regression rather than from the audit, and is
+below with them.
 
 There was a way. The crate is MIT licensed, so it is vendored under
 `vendor/pdf-inspector` and the four APIs are public there. The copy landed
@@ -141,6 +145,93 @@ file for a verdict its own runs already contained.
 - *Tests*: `tests/passes.rs` counts the reads through
   `Metrics::parser_pass`, so a pass coming back fails a test.
 
+**The furniture verdict itself.** The first version of the furniture report
+compared a page's runs against its markdown and named everything missing.
+That conflates two facts: the strippers judged this run to be chrome, and
+the renderer did not emit it. On a two-column paper the second happens to
+most of the page, because the renderer reads one column at a time and a
+scan of its output in reading order finds nothing where it expects it: 1181 of
+one conference paper's 1291 runs were filed as furniture, leaving 110 in
+the body. Consumers that walk the body saw an empty paper while the
+markdown looked fine.
+
+- *Patch* `a3527ad`: `markdown::strip_repeated_header_footer_lines` is
+  public. The classifier behind it proves furniture by repetition across
+  pages, and this service renders one page at a time, so on the service's
+  own calls it can prove nothing; asking it over the whole document is the
+  only way to hear the parser's own verdict.
+- *Wired*: `src/furniture.rs` weighs three kinds of chrome evidence over
+  the whole document (the parser's verdict, a line repeating at the same
+  isolated page edge with its digits read as a shape, and a column of short
+  numbers standing outside the text block), and `PageMarkdown.furniture`
+  carries what they convict. What the renderer left out with no chrome
+  evidence behind it is content, and goes out on `PageMarkdown.dropped`
+  with its box, to be folded back into the body at the place the page drew
+  it.
+- *Tests*: `tests/body_reachability.rs`, over a two-column fixture with a
+  running head and a line number beside every row, asserting that only the
+  chrome is furniture, that every body-layer item is reachable from
+  `#/body`, and that nothing is in both layers.
+- *Then measured against the paper itself*, which found two more faults
+  that no fixture here reproduced. Its running head is ruled underneath,
+  and the renderer spells an underlined run `<u>text</u>`; the fold matched
+  a rendered block against the chrome report on letters alone, the tags put
+  two letters into the block that the run did not have, and a head the
+  report had already filed as furniture was folded into the body as well,
+  on every page. And the head sits an ordinary line above the first line of
+  text, so no white space isolates it and the repetition evidence never
+  looked at it: on a document of three pages or more the parser's own
+  classifier keeps the first occurrence of a running head, so page one's
+  head stayed in the body. Tags are now dropped before letters are counted,
+  and a line at a page edge set in a smaller face than the body is an edge
+  line whether or not a gap proves it.
+- *Held by*: `tests/dropped_runs.rs`, which drives the fold by hand because
+  the renderer will not drop a run on any fixture this suite can author,
+  and `common::assert_layers_and_parents_agree`, which states the invariant
+  the whole plane rests on: an item's layer and the group it hangs under
+  say the same thing, and the body walk reaches exactly the body layer.
+- *And the verdict is taken before the rendering, not after it.* The paper
+  numbers every line, and a margin number shares the baseline of the line
+  it stands beside. The renderer assembles a line from the runs sharing
+  one, so a number left in its input is not a run the rendering omits or
+  keeps: it is fused into the middle of the sentence, printed `**001**`
+  from the bold face the template sets it in and glued to the word after
+  it. Five hundred and fifty-six of them read as body text on the real
+  paper. Nothing decided about the output can separate them again, so the
+  convicted runs are held out of the input `markdown` is rendered from,
+  which is also the input every body item's text is folded from.
+  `tests/furniture.rs` asserts both halves: no chrome in the rendering with
+  the verdict, and the fusion itself without it.
+
+**Form XObject placements.** A figure included from another PDF, which
+is how a paper's plots are set, is a Form XObject: paths and a few
+labels, no image anywhere. The walker entered every form to read its text
+and knew, at the `Do`, the form's `/BBox` and the transformation in
+force, and reported neither; the paper's second and third figures
+therefore had no picture item, only their captions.
+
+- *Patch* `6606929`:
+  `extract_text_with_positions_rects_and_forms_mem_with_invisible` returns
+  the runs, rectangles and lines of its sibling and, beside them, a
+  `PdfForm` per invocation: the resource name and the `/BBox` carried
+  through the form's `/Matrix` and the CTM at the call, page-level and
+  nested alike, clipped and rotated exactly as the rectangles are. The
+  sibling entry points return what they returned; the page walker gained a
+  `_with_forms` twin and the old name is a wrapper that drops the forms.
+- *Wired*: `SPAN_KIND_FORM` runs on the `spans` event, after the page's
+  runs, with the placeholder `[Form: name]` and the placed box; the runs
+  the renderer sees do not include them, so the markdown is unchanged.
+  The fold makes a picture of a form that is a region of the page and not
+  the page: not the wrapper a print-to-PDF producer draws the whole page
+  through, judged against the page size the metadata pass measured; not a
+  glyph or rule drawn as a form; not a form inside a form that already
+  counts; and not a form whose content is an image the page reports
+  already. The picture is placed in reading order, before the first
+  located block below it that shares its width.
+- *Tests*: `tests/pictures.rs`, over a fixture whose figure is a form of
+  paths and one label placed between two paragraphs, and over a page drawn
+  entirely through one form.
+
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page
 statistics, which are collapsed into one of four reason strings and several
@@ -168,7 +259,7 @@ canonical schema and is wired: `DocumentMeta.format_version`, `.structured`,
 `PageItem.page_label`, `.media_size` and `.user_unit`;
 `PictureItem.hyperlink` and `.target`.
 
-Nothing is deferred on reachability either. The four asks above are wired,
+Nothing is deferred on reachability either. The asks above are wired,
 and what remains below is deliberate: things that are reachable and homed
 and not worth doing yet.
 
@@ -249,21 +340,74 @@ the one to be careful with.
   need does reach this service now, so the job is no longer blocked; it is
   just still a job.
 - **Locating a block among its runs.** The fold matches a block of markdown
-  to the runs behind it by comparing letters and digits, forwards through
-  the page. A page whose renderer reorders runs — multi-column layouts
-  especially — can leave a block unlocated, and an unlocated block gets a
-  page-only provenance entry rather than a wrong box.
-- **Where a picture sits.** A picture is placed under whatever heading is
-  open when its page begins, because the image runs are folded before the
-  page's own blocks are read. Its box is exact; its position in the
-  hierarchy is reading order at page granularity.
-- **The furniture report.** It names runs the markdown does not contain, in
-  reading order. A run the renderer moved backwards past another reads as
-  dropped. The report is approximate on reordering pages and exact on
-  ordinary ones.
+  to the runs behind it by following its letters and digits from run to
+  run, so a paragraph whose lines the extractor interleaved with the
+  neighbouring column's is found as a chain rather than missed as a
+  stretch. A run is offered to one block only, from its unclaimed
+  beginning first, so two identical lines match their own runs and a
+  short label does not take letters out of a paragraph that contains the
+  same word. What still goes unlocated is a block whose letters the
+  rendering changed, or a chain the search could not finish inside its
+  budget, and an unlocated block gets a page-only provenance entry rather
+  than a wrong box.
+- **Blocks set side by side.** The renderer assembles a line from the runs
+  sharing a baseline, so a caption beside the prose wrapped around its
+  figure comes out of it as one block whose words alternate between the
+  two. The fold cuts such a block back onto the runs that drew each side
+  when a gutter no run crosses separates them and their lines alternate,
+  and each side keeps the renderer's own characters in the renderer's own
+  order. Two blocks whose lines never alternate, a marker beside the first
+  line of its item or a label beside a one-line value, stay one block, as
+  does anything the renderer assembled across a gutter narrower than six
+  points.
+- **Where a picture sits.** A picture is placed in reading order before the
+  first located block below it that shares its width, so a figure between
+  two paragraphs of its column stands between them. On a page whose blocks
+  could not be located, or below the last block of its column, it stands
+  at the end of the page. Its box is exact either way.
+- **Form XObjects as figures.** A form is a picture when it is a region of
+  the page and not the page's own wrapper, is no smaller than a figure,
+  sits inside no form that already counts, and holds no image the page
+  reports already. A text box drawn as a form passes those tests too, and
+  becomes a picture beside the text it holds, which still arrives as text.
+  With no page size to judge by, the largest form on a page stands.
+- **The furniture report.** The parser's own stripper is heard only on a
+  page's edge lines: the outermost lines set off by white space or by a
+  smaller face. A page whose body repeats page after page, a form printed
+  many times over or a sample of one page copied, is convicted whole by a
+  classifier that proves chrome by repetition, and the verdict on its body
+  is set aside. A same-face first line with no gap under it is body text,
+  whatever it says.
+- **Grids trimmed to their rules.** The line detector takes the nearest
+  rule above a grid as its top, and a page that underlines its title puts a
+  rule there, so the paragraph between the title and the table became the
+  table's first row. A leading or trailing row whose boundary lies beyond
+  every vertical rule of the grid, and whose cells are all but one empty,
+  is dropped and its runs go back to the page. A header populated across
+  its columns above an open-edged grid stays, because that is the shape
+  the detector accepts it for; a title row over a ruled grid with one cell
+  filled would stay too, and is not one this corpus has.
+- **Glued list markers.** A list set tight enough that the number and the
+  first word of an item came out of the extractor as one run is printed by
+  the renderer as the run had it, `2.minimize`, and the fold reads that as
+  a marker when the line before or after it carries one too. A single such
+  line is prose, which is what a version string or a sentence beginning
+  with a number is.
 - **Per-page rendering and document-wide stripping.** Markdown is rendered
   one page at a time, which is what keeps the stream a stream. The
   cross-page repetition classifier behind the header and footer stripper
   has no cross-page evidence in that mode, so it fires less than it would
   on a whole-document render. Less silent deletion, and the same
   `report_furniture` names whatever still goes.
+
+## Vendored dependency moves (owner decisions, not re-vendors)
+
+- *Patch* (lopdf 0.44, 2026-09-02): the vendored crate's lopdf moved from
+  0.42.0 to 0.44.0 at the owner's request, ahead of upstream pdf-inspector.
+  One call site changed: `Document::get_page_content` lost a `Result` that
+  was vestigial (in 0.42 the body already skipped unreadable stream objects
+  and used raw bytes when a decode failed; the only error path was
+  `write_all` into a `Vec`, which cannot fail), so
+  `extractor/content_stream.rs` no longer maps an error that could not
+  happen. Same bytes out; the crate suite keeps 1015 passed / 14
+  fixture-missing and the service suite keeps 228.

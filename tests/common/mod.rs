@@ -724,6 +724,174 @@ pub fn furniture_pdf(pages: u32, head: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build a `pages`-page PDF laid out in two columns, with a running head
+/// at the top of every page and a line number in the left margin of every
+/// row.
+///
+/// This is the shape a conference paper has, and the shape that starved the
+/// body. The rows are drawn left cell then right cell, so extraction order
+/// interleaves the columns and the markdown renderer, which reads a page
+/// column by column, cannot emit every run in the order it was drawn.
+/// Whatever it leaves out is content, because the columns are prose, while
+/// the running head and the margin numbers are the only chrome on the page.
+///
+/// The head repeats verbatim and the margin numbers repeat as a set, which
+/// is what cross-page repetition evidence is made of; the columns say
+/// something different on every row of every page, which is what it is not.
+#[must_use]
+pub fn two_column_pdf(pages: u32, head: &str) -> Vec<u8> {
+    const ROWS: u32 = 18;
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let mut content = String::new();
+        content.push_str(&format!("BT /F1 8 Tf 72 770 Td ({head}) Tj ET\n"));
+        // A section heading, set larger than the columns so the renderer
+        // reads it as one, and far enough below the running head that the
+        // head stands alone at the page edge.
+        content.push_str(&format!(
+            "BT /F1 14 Tf 72 730 Td (Section {page}. Findings) Tj ET\n"
+        ));
+        for row in 1..=ROWS {
+            let y = 700 - 16 * (row - 1);
+            // The margin number, outside the text block and set smaller:
+            // the shape a line-numbered manuscript has.
+            content.push_str(&format!("BT /F1 7 Tf 40 {y} Td ({row}) Tj ET\n"));
+            content.push_str(&format!(
+                "BT /F1 9 Tf 72 {y} Td (Method note {row} of page {page} on the setup.) Tj ET\n"
+            ));
+            content.push_str(&format!(
+                "BT /F1 9 Tf 320 {y} Td (Result note {row} of page {page} on the yield.) Tj ET\n"
+            ));
+        }
+        content.push_str(&format!("BT /F1 8 Tf 300 40 Td ({page}) Tj ET"));
+
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a `pages`-page paper in the review format: a running head with a
+/// rule under it, a line number in the left margin of every row, dense body
+/// prose, and a folio at the foot.
+///
+/// This is the shape of the document that found the last two faults. The
+/// head is *underlined*, which matters: the renderer spells an underlined
+/// run `<u>text</u>`, and those tags carry letters, so a chrome report
+/// matched against the rendered block on letters alone missed it and the
+/// head was filed as furniture and folded into the body as well. The head
+/// also sits one ordinary line above the body rather than off on its own,
+/// so no white space isolates it and only its type size sets it apart.
+///
+/// The margin numbers count on across the pages, so no two are the same
+/// text and only their shape and their position repeat.
+#[must_use]
+pub fn review_paper_pdf(pages: u32, head: &str) -> Vec<u8> {
+    const ROWS: i32 = 40;
+
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    // The margin numbers are set in a bold face, as the review templates
+    // set them. It is what the renderer prints `**001**` for when the
+    // number fuses into the line beside it.
+    let number_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica-Bold",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let mut content = String::new();
+        content.push_str(&format!("BT /F1 9 Tf 72 716 Td ({head}) Tj ET\n"));
+        // The rule under the head: what makes the extractor call it
+        // underlined and the renderer print tags around it.
+        content.push_str("0.6 w 72 713 m 400 713 l S\n");
+        for row in 0..ROWS {
+            let y = 690 - 16 * row;
+            let number = (i32::try_from(page).expect("a page number fits") - 1) * ROWS + row;
+            // Drawn on the row's own baseline, which is the fusion
+            // trigger: the renderer assembles a line from the runs that
+            // share it, so a number left in its input joins the sentence.
+            content.push_str(&format!("BT /F2 7 Tf 45 {y} Td ({number:03}) Tj ET\n"));
+            content.push_str(&format!(
+                "BT /F1 10 Tf 72 {y} Td (Body row {row} of page {page} carrying ordinary prose about the method.) Tj ET\n"
+            ));
+        }
+        content.push_str(&format!("BT /F1 9 Tf 300 60 Td ({page}) Tj ET"));
+
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id, "F2" => number_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Build a one-page PDF whose middle line is set in a bold face and whose
 /// surrounding lines are not.
 ///
@@ -758,6 +926,128 @@ pub fn styled_pdf() -> Vec<u8> {
         "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
         "Resources" => dictionary! {
             "Font" => dictionary! { "F1" => regular_id, "F2" => bold_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a one-page PDF whose figure is drawn as vector art through a
+/// Form XObject, placed between two paragraphs, with a caption under it.
+///
+/// A figure included from another PDF, which is how a paper's plots are
+/// set, is a form: paths and a few labels, no image XObject anywhere. The
+/// walker used to report nothing for it, so the paper's figures had no
+/// picture items. The form's `/BBox` is 200 by 100 and the page draws it
+/// scaled by two at (72, 400), so its placed box is 400 by 200 with its
+/// top at 600.
+#[must_use]
+pub fn vector_figure_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    // The figure: a frame, a curve, and a label set in its own font.
+    let figure_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 200.into(), 100.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+        },
+        b"0.5 w 5 5 190 90 re S 10 20 m 60 80 120 10 190 70 c S \
+          BT /F1 6 Tf 20 8 Td (yield) Tj ET"
+            .to_vec(),
+    ));
+    let content = "BT /F1 11 Tf 72 700 Td (Prose above the figure describes the method in some detail.) Tj ET\n\
+                   BT /F1 11 Tf 72 686 Td (It continues for a second line before the figure.) Tj ET\n\
+                   q 2 0 0 2 72 400 cm /Fx1 Do Q\n\
+                   BT /F1 9 Tf 72 385 Td (Figure 1: A vector drawing of the yield.) Tj ET\n\
+                   BT /F1 11 Tf 72 340 Td (Prose below the figure discusses what it shows.) Tj ET\n\
+                   BT /F1 11 Tf 72 326 Td (It also runs to a second line.) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+            "XObject" => dictionary! { "Fx1" => figure_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a one-page PDF whose whole content is drawn through one Form
+/// XObject, the shape print-to-PDF producers emit: the page stream is a
+/// single `Do`, and everything a reader sees is inside the form.
+#[must_use]
+pub fn wrapped_page_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let wrapper_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+        },
+        b"BT /F1 12 Tf 72 700 Td (A page drawn entirely through one form.) Tj ET \
+          BT /F1 12 Tf 72 686 Td (Nothing here is a figure.) Tj ET"
+            .to_vec(),
+    ));
+    let content_id = doc.add_object(Stream::new(dictionary! {}, b"q /X1 Do Q".to_vec()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "XObject" => dictionary! { "X1" => wrapper_id },
         },
         "Contents" => content_id,
     });
@@ -1305,4 +1595,200 @@ pub fn documents(
             _ => None,
         })
         .collect()
+}
+
+// --- Reading a folded Document --------------------------------------------
+
+use std::collections::HashSet;
+
+use grpc_pdf_inspector::proto::ai::pipestream::document::v1 as doc;
+
+/// Self ref of the group every body item hangs under.
+pub const BODY: &str = "#/body";
+
+/// Self ref of the group every item that is not body hangs under.
+pub const FURNITURE: &str = "#/furniture";
+
+/// One item of a folded fragment, whichever arena it lives in: what it is
+/// called, what it hangs off, which layer it declares, and what it lists as
+/// its own children.
+pub struct Placed {
+    /// The item's own ref.
+    pub self_ref: String,
+    /// The ref it names as its parent.
+    pub parent: String,
+    /// The content layer it declares.
+    pub layer: i32,
+    /// The refs it lists as its children.
+    pub children: Vec<String>,
+    /// Its text, when it has any, for a readable assertion message.
+    pub text: String,
+}
+
+/// Every item of a folded fragment, from every arena.
+///
+/// The two root groups are not included: they are where the walk starts,
+/// not things placed in it.
+#[must_use]
+pub fn placed(document: &doc::Document) -> Vec<Placed> {
+    let mut items = Vec::new();
+    for item in &document.texts {
+        let (self_ref, parent, layer, children, text) = match item.item.as_ref().expect("a variant")
+        {
+            doc::base_text_item::Item::Code(code) => (
+                code.self_ref.clone(),
+                code.parent.clone(),
+                code.content_layer,
+                code.children.clone(),
+                code.text.clone(),
+            ),
+            other => {
+                let base = match other {
+                    doc::base_text_item::Item::Text(text) => text.base.as_ref(),
+                    doc::base_text_item::Item::SectionHeader(header) => header.base.as_ref(),
+                    doc::base_text_item::Item::ListItem(list_item) => list_item.base.as_ref(),
+                    other => panic!("this fold makes no {other:?}"),
+                }
+                .expect("a base");
+                (
+                    base.self_ref.clone(),
+                    base.parent.clone(),
+                    base.content_layer,
+                    base.children.clone(),
+                    base.text.clone(),
+                )
+            }
+        };
+        items.push(Placed {
+            self_ref,
+            parent: parent.expect("a parent").r#ref,
+            layer,
+            children: children.into_iter().map(|child| child.r#ref).collect(),
+            text,
+        });
+    }
+    for group in &document.groups {
+        items.push(Placed {
+            self_ref: group.self_ref.clone(),
+            parent: group.parent.as_ref().expect("a parent").r#ref.clone(),
+            layer: group.content_layer,
+            children: group
+                .children
+                .iter()
+                .map(|child| child.r#ref.clone())
+                .collect(),
+            text: group.name.clone().unwrap_or_default(),
+        });
+    }
+    for table in &document.tables {
+        items.push(Placed {
+            self_ref: table.self_ref.clone(),
+            parent: table.parent.as_ref().expect("a parent").r#ref.clone(),
+            layer: table.content_layer,
+            children: table
+                .children
+                .iter()
+                .map(|child| child.r#ref.clone())
+                .collect(),
+            text: String::from("<table>"),
+        });
+    }
+    for picture in &document.pictures {
+        items.push(Placed {
+            self_ref: picture.self_ref.clone(),
+            parent: picture.parent.as_ref().expect("a parent").r#ref.clone(),
+            layer: picture.content_layer,
+            children: picture
+                .children
+                .iter()
+                .map(|child| child.r#ref.clone())
+                .collect(),
+            text: String::from("<picture>"),
+        });
+    }
+    items
+}
+
+/// Every ref reachable from `#/body`, following children through groups and
+/// through anything else that lists them.
+#[must_use]
+pub fn reachable_from_body(document: &doc::Document) -> HashSet<String> {
+    let items = placed(document);
+    let mut found = HashSet::new();
+    let mut queue: Vec<String> = document
+        .body
+        .as_ref()
+        .expect("a body")
+        .children
+        .iter()
+        .map(|child| child.r#ref.clone())
+        .collect();
+    while let Some(self_ref) = queue.pop() {
+        if !found.insert(self_ref.clone()) {
+            continue;
+        }
+        if let Some(item) = items.iter().find(|item| item.self_ref == self_ref) {
+            queue.extend(item.children.iter().cloned());
+        }
+    }
+    found
+}
+
+/// The root group an item hangs under, following its parents up.
+///
+/// `None` when the chain does not end at a root, which is a fragment no
+/// consumer can walk.
+#[must_use]
+pub fn root_of(document: &doc::Document, self_ref: &str) -> Option<String> {
+    let items = placed(document);
+    let mut at = self_ref.to_owned();
+    // A fragment is a tree; the bound is what stops a cycle from hanging
+    // the test instead of failing it.
+    for _ in 0..=items.len() {
+        let item = items.iter().find(|item| item.self_ref == at)?;
+        if item.parent == BODY || item.parent == FURNITURE {
+            return Some(item.parent.clone());
+        }
+        at = item.parent.clone();
+    }
+    None
+}
+
+/// The invariant every consumer of this plane relies on: an item's layer
+/// and the group it hangs under say the same thing, and the body walk
+/// reaches exactly the body.
+///
+/// An item in the body layer that hangs off `#/furniture` is body content
+/// no body walk can reach, which is the shape of a fold that decides the
+/// layer in one place and the parent in another.
+pub fn assert_layers_and_parents_agree(document: &doc::Document) {
+    let body_layer = doc::ContentLayer::Body as i32;
+    let reached = reachable_from_body(document);
+    for item in placed(document) {
+        let root = root_of(document, &item.self_ref)
+            .unwrap_or_else(|| panic!("{} hangs off nothing: {:?}", item.self_ref, item.text));
+        let expected = if item.layer == body_layer {
+            BODY
+        } else {
+            FURNITURE
+        };
+        assert_eq!(
+            root, expected,
+            "{} declares layer {} and hangs under {root}: {:?}",
+            item.self_ref, item.layer, item.text
+        );
+        assert_eq!(
+            reached.contains(&item.self_ref),
+            item.layer == body_layer,
+            "{} declares layer {} and the body walk {} it: {:?}",
+            item.self_ref,
+            item.layer,
+            if reached.contains(&item.self_ref) {
+                "reaches"
+            } else {
+                "does not reach"
+            },
+            item.text
+        );
+    }
 }

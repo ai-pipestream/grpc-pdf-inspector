@@ -13,7 +13,7 @@ blocked on nothing but visibility. Each one is data this crate already computes
 and does not return, and each one was reachable only by an upstream change. The
 crate's licence permits making that change here, so it is made here.
 
-The four private APIs, and what each unblocks:
+The private APIs, and what each unblocks:
 
 1. **`include_invisible` and `skipped_invisible`** (`src/extractor/`,
    `src/extractor/content_stream.rs`). The content-stream walker recognises
@@ -35,20 +35,39 @@ The four private APIs, and what each unblocks:
    `ColumnRegion` were `pub(crate)`, so layout complexity could not be
    recomputed from items a caller already holds, and FULL mode had to run a
    whole second read of the file to get the answer.
+5. **The header, footer and folio stripper** (`src/markdown/mod.rs`).
+   `strip_repeated_header_footer_lines` was `pub(crate)`, so a caller could not
+   ask which lines the crate judges to be page furniture. The service renders
+   one page at a time, and the classifier behind that function proves furniture
+   by repetition across pages, so on the service's own calls it can prove
+   nothing: the judgement had to be reachable over the whole document
+   separately from the rendering, or be reinvented outside the parser.
+6. **Form XObject placements** (`src/extractor/xobjects.rs`,
+   `src/extractor/content_stream.rs`, `src/extractor/mod.rs`). The walker
+   entered every Form XObject to read its text and knew, at the `Do`, the
+   form's `/BBox` and the transformation in force, and reported neither. A
+   figure included from another PDF is a form of paths with no image in it,
+   so nothing said where it was drawn.
+   `extract_text_with_positions_rects_and_forms_mem_with_invisible` returns a
+   `PdfForm` per invocation beside the runs, rectangles and lines its sibling
+   returns; the sibling entry points and the page walker's old name return
+   exactly what they did.
 
 ## How the patches are kept auditable
 
 The copy landed in its own commit, with the tree building and testing
-identically to the registry build, before any API was touched. Each of the four
-patches is a separate commit after it, listed by SHA in
-`docs/capture-deferrals.md`. Every patch is additive: nothing that was public
-changed shape, and the crate's own tests are the ones it shipped with.
+identically to the registry build, before any API was touched. Each patch is a
+separate commit after it, listed by SHA in `docs/capture-deferrals.md`. Every patch is additive: nothing that was public
+changed shape, and the crate's own tests are the ones it shipped with. One
+exception is listed there under "Vendored dependency moves": the lopdf
+dependency moved ahead of upstream at the owner's request, with the one call
+site the API change reached.
 
 The crate keeps its own style, its own formatting and its own lint posture.
 Files here are not reformatted to match the service.
 
 ## Re-vendoring a newer release
 
-Copy the new version over this directory, keep this README and re-apply the four
+Copy the new version over this directory, keep this README and re-apply the
 patches by reading the commits named in `docs/capture-deferrals.md`. Do not
 merge the service's style into the crate.

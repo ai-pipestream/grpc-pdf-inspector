@@ -85,14 +85,23 @@ pub struct PdfOptions {
     /// beyond the extraction pass that is already running.
     #[prost(bool, tag="8")]
     pub emit_tables: bool,
-    /// Report the page's text runs that did not survive into its markdown,
-    /// on `PageMarkdown.furniture`. Default false.
+    /// Report the page's chrome on `PageMarkdown.furniture`, and the body
+    /// runs the rendering left out on `PageMarkdown.dropped`. Default false.
     ///
-    /// Headers, footers and folio numbers are identified and deleted before
-    /// anything sees them, and other runs are discarded by the layout pass
-    /// for reasons no option reaches. Setting this compares the runs against
-    /// the rendering and names what is missing, so the removal is visible
-    /// without the body having to carry it.
+    /// Headers, footers, folios and margin numbering are identified and
+    /// deleted before anything sees them, and other runs are discarded by the
+    /// layout pass for reasons no option reaches. Setting this names both,
+    /// separately, so the removal is visible without the body having to carry
+    /// its chrome and without its content being filed as chrome.
+    ///
+    /// It also decides what `markdown` is rendered from. The chrome verdict
+    /// is taken over the whole document before any page is rendered, and the
+    /// runs it convicts are held out of the rendering's input, so a margin
+    /// line number cannot fuse into the line it stands beside. Without the
+    /// verdict there is nothing to hold out: the renderer assembles a line
+    /// from the runs sharing its baseline, a margin number shares one, and it
+    /// arrives inside the sentence. The verdict costs a pass over the runs in
+    /// memory, which is why it is asked for rather than always taken.
     #[prost(bool, tag="9")]
     pub report_furniture: bool,
     /// Report the text the page drew invisibly, on `PageMarkdown.invisible`.
@@ -233,6 +242,13 @@ pub struct TextSpan {
     /// For SPAN_KIND_LINK, the annotation's target. Empty otherwise.
     #[prost(string, tag="12")]
     pub link_uri: ::prost::alloc::string::String,
+    /// Whether the run is page chrome: a running head, a folio, a margin line
+    /// number. Chrome is taken out of the page before the markdown is rendered
+    /// and is reported on the page event's `furniture` list, so a consumer
+    /// joining the rendering back to the runs skips these. Set only when
+    /// `report_furniture` was requested; otherwise nothing is chrome.
+    #[prost(bool, tag="13")]
+    pub chrome: bool,
 }
 /// PageSpans carries one page's positioned runs, in extraction order.
 ///
@@ -345,14 +361,21 @@ pub struct PageMarkdown {
     /// difference is what decides whether re-routing to OCR is worth it.
     #[prost(uint32, tag="5")]
     pub replacement_runs: u32,
-    /// The text runs that were on the page and are not in `markdown`:
-    /// repeated headers, footers, standalone folio numbers, and anything else
-    /// the layout pass discarded.
+    /// The page's chrome: its running head, its footer, its folio, the line
+    /// numbers ruled down its margin.
     ///
     /// Empty unless `PdfOptions.report_furniture` was set. Page chrome is
     /// identified and deleted by default and the deletion used to be silent,
     /// so it was neither visible nor auditable; this reports what went,
     /// without putting it back into the body.
+    ///
+    /// Every line here is named on chrome evidence: the parser's own header,
+    /// footer and folio verdicts, repetition at the same page edge across
+    /// pages, or a column of short numbers standing outside the text block. A
+    /// run missing from `markdown` is not evidence of anything on its own,
+    /// because the renderer reads a multi-column page column by column and
+    /// leaves out genuine content; such runs are reported on `dropped`
+    /// instead.
     #[prost(string, repeated, tag="6")]
     pub furniture: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
     /// The runs this page drew with text rendering mode 3, which paints no
@@ -380,6 +403,22 @@ pub struct PageMarkdown {
     /// anything, which is the honest answer rather than a reassuring zero.
     #[prost(double, optional, tag="8")]
     pub garble_score: ::core::option::Option<f64>,
+    /// The runs the rendering left out that no chrome evidence convicts:
+    /// body content, with the boxes the page drew it at.
+    ///
+    /// Empty unless `PdfOptions.report_furniture` was set, and empty then too
+    /// for a page whose every run reached the markdown. The markdown renderer
+    /// reads a page's columns one after another and does not always emit
+    /// every run it read; what it leaves behind is text a reader saw, and it
+    /// belongs in the body rather than in `furniture`. A consumer folding
+    /// this stream into a document puts these back into reading order.
+    ///
+    /// A run is named here only when its letters appear nowhere in
+    /// `markdown`. A run the renderer merely moved is not missing, and a run
+    /// of one or two characters is not looked for at all: it would match
+    /// somewhere by accident and the report would say it survived.
+    #[prost(message, repeated, tag="9")]
+    pub dropped: ::prost::alloc::vec::Vec<TextSpan>,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.
@@ -816,9 +855,9 @@ impl TableKind {
 }
 /// SpanKind names what a positioned run actually is.
 ///
-/// The extractor emits more than glyphs: an image XObject contributes its
-/// placement box, a link annotation contributes its rectangle and target,
-/// and an AcroForm field contributes its value.
+/// The extractor emits more than glyphs: an image or form XObject
+/// contributes its placement box, a link annotation contributes its
+/// rectangle and target, and an AcroForm field contributes its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SpanKind {
@@ -833,6 +872,13 @@ pub enum SpanKind {
     Link = 3,
     /// An AcroForm field's value.
     FormField = 4,
+    /// A Form XObject's placement box: the form's own bounding box carried
+    /// through its matrix and the transformation in force when the page
+    /// invoked it. A vector figure included as a form draws no image
+    /// XObject, and this is the only record of where it sits. `text` is a
+    /// placeholder naming the resource, not content; the form's own text
+    /// runs arrive as SPAN_KIND_TEXT in their own right.
+    Form = 5,
 }
 impl SpanKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -846,6 +892,7 @@ impl SpanKind {
             Self::Image => "SPAN_KIND_IMAGE",
             Self::Link => "SPAN_KIND_LINK",
             Self::FormField => "SPAN_KIND_FORM_FIELD",
+            Self::Form => "SPAN_KIND_FORM",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -856,6 +903,7 @@ impl SpanKind {
             "SPAN_KIND_IMAGE" => Some(Self::Image),
             "SPAN_KIND_LINK" => Some(Self::Link),
             "SPAN_KIND_FORM_FIELD" => Some(Self::FormField),
+            "SPAN_KIND_FORM" => Some(Self::Form),
             _ => None,
         }
     }

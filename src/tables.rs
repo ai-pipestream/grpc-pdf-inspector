@@ -51,7 +51,10 @@ pub fn page_tables(
         .filter(|item| !matches!(item.item_type, ItemType::Image))
         .cloned()
         .collect();
-    let detected = detect(page_no, &laid_out, rects, lines);
+    let mut detected = detect(page_no, &laid_out, rects, lines);
+    for table in &mut detected {
+        trim_rows_outside_the_rules(table, &laid_out, lines, page_no);
+    }
     let tables: Vec<pb::TableRegion> = detected
         .iter()
         .map(|table| region(table, &laid_out))
@@ -88,6 +91,100 @@ fn detect(page_no: u32, items: &[TextItem], rects: &[PdfRect], lines: &[PdfLine]
         .into_iter()
         .find(|tables| !tables.is_empty())
         .unwrap_or_default()
+}
+
+/// How far a row boundary may sit past the end of the vertical rules and
+/// still be inside the grid they draw.
+const RULE_TOLERANCE: f32 = 3.0;
+
+/// How far a vertical stroke may lean, in points end to end, and still be
+/// a rule.
+const RULE_LEAN: f32 = 1.0;
+
+/// The shortest vertical stroke that counts as a rule of a grid.
+const MIN_RULE_LENGTH: f32 = 10.0;
+
+/// Drop the rows a ruled grid does not reach.
+///
+/// The line detector takes the nearest horizontal rule above a grid as the
+/// grid's top, and a page that underlines its title puts a rule there: the
+/// paragraph between the title and the table then reads as the table's
+/// first row, with one cell of prose and the rest empty. The vertical
+/// rules say where the grid is. A leading or trailing row whose boundary
+/// lies beyond every vertical rule of the table, and whose cells hold
+/// content in no column but the first, is outside the grid, and its runs
+/// go back to the page: that is the shape a paragraph makes when it spills
+/// one row past the rules, because prose starts flush with the left margin
+/// and says nothing in the columns after it. A header set above an
+/// open-edged grid is populated across its columns and stays — including a
+/// row-header stub whose own leading column is blank and every other
+/// column is filled, which is the shape the detector accepts a header for
+/// even when it names no leading column of its own.
+///
+/// A table with no vertical rules inside its extent is left as detected;
+/// there is no geometry to judge it by.
+fn trim_rows_outside_the_rules(
+    table: &mut Table,
+    items: &[TextItem],
+    lines: &[PdfLine],
+    page_no: u32,
+) {
+    let (Some(&left), Some(&right)) = (table.columns.first(), table.columns.last()) else {
+        return;
+    };
+    let mut top = f32::MIN;
+    let mut bottom = f32::MAX;
+    let mut ruled = false;
+    for line in lines.iter().filter(|line| line.page == page_no) {
+        if (line.x1 - line.x2).abs() > RULE_LEAN
+            || (line.y1 - line.y2).abs() < MIN_RULE_LENGTH
+            || line.x1 < left - RULE_TOLERANCE
+            || line.x1 > right + RULE_TOLERANCE
+        {
+            continue;
+        }
+        ruled = true;
+        top = top.max(line.y1.max(line.y2));
+        bottom = bottom.min(line.y1.min(line.y2));
+    }
+    if !ruled {
+        return;
+    }
+    // A row's content sits nowhere but the first column: that is what a
+    // stray paragraph line looks like, since prose starts at the left
+    // margin and never reaches into a table's later columns. A row-header
+    // stub is the opposite shape — its own first column is the one left
+    // blank — so this predicate leaves it alone, which is what the
+    // detector's own acceptance of that header depends on.
+    let sparse =
+        |cells: &[String]| cells.len() > 1 && cells[1..].iter().all(|cell| cell.trim().is_empty());
+    while table.rows.len() > 1
+        && table.rows[0] > top + RULE_TOLERANCE
+        && table.cells.first().is_some_and(|cells| sparse(cells))
+    {
+        table.rows.remove(0);
+        table.cells.remove(0);
+        let floor = table.rows[0] + RULE_TOLERANCE;
+        table
+            .item_indices
+            .retain(|index| items.get(*index).is_none_or(|item| item.y <= floor));
+    }
+    while table.rows.len() > 1
+        && table.rows[table.rows.len() - 1] < bottom - RULE_TOLERANCE
+        && table.cells.last().is_some_and(|cells| sparse(cells))
+    {
+        table.rows.pop();
+        table.cells.pop();
+        // The ceiling below which a run is outside the grid is the new
+        // trailing row's own boundary, not the one just discarded — using
+        // the discarded row's y left runs sitting exactly on it (the usual
+        // case: detectors report a row at its own text baseline) inside
+        // the tolerance band and off the page they were sent back to.
+        let ceiling = table.rows[table.rows.len() - 1] - RULE_TOLERANCE;
+        table
+            .item_indices
+            .retain(|index| items.get(*index).is_none_or(|item| item.y >= ceiling));
+    }
 }
 
 /// Whether a page's detected tables include real data, which is what
@@ -259,5 +356,180 @@ mod tests {
     fn a_grid_that_claims_no_run_claims_no_extent() {
         let table = Table::new(Vec::new(), Vec::new(), Vec::new(), Vec::new());
         assert!(region(&table, &[]).bbox.is_none());
+    }
+
+    /// A vertical rule at `x` from `bottom` up to `top`.
+    fn vertical(x: f32, bottom: f32, top: f32) -> PdfLine {
+        PdfLine {
+            x1: x,
+            y1: bottom,
+            x2: x,
+            y2: top,
+            page: 1,
+        }
+    }
+
+    /// A two-column grid ruled from y 620 down to y 434, and an intro
+    /// paragraph above it that a title's underline at y 680 made the
+    /// detector take for the grid's first row.
+    fn grid_with_a_prose_row_above() -> (Table, Vec<TextItem>, Vec<PdfLine>) {
+        let items = vec![
+            placed("Complete every field.", 90.0, 652.0),
+            placed("Field", 90.0, 607.0),
+            placed("Value", 306.0, 607.0),
+            placed("Request number", 90.0, 592.0),
+            placed("EQ-2024-0117", 306.0, 592.0),
+        ];
+        let table = Table::new(
+            vec![84.6, 300.6, 516.6],
+            vec![680.0, 619.8, 604.3],
+            vec![
+                vec!["Complete every field.".to_owned(), String::new()],
+                vec!["Field".to_owned(), "Value".to_owned()],
+                vec!["Request number".to_owned(), "EQ-2024-0117".to_owned()],
+            ],
+            vec![0, 1, 2, 3, 4],
+        );
+        let lines = vec![
+            vertical(84.6, 433.6, 620.1),
+            vertical(300.6, 434.1, 619.6),
+            vertical(516.6, 433.6, 620.1),
+        ];
+        (table, items, lines)
+    }
+
+    #[test]
+    fn a_prose_row_above_the_vertical_rules_is_not_a_row_of_the_grid() {
+        let (mut table, items, lines) = grid_with_a_prose_row_above();
+        trim_rows_outside_the_rules(&mut table, &items, &lines, 1);
+        assert_eq!(table.cells.len(), 2, "{:?}", table.cells);
+        assert_eq!(table.cells[0], ["Field", "Value"]);
+        assert!(
+            (table.rows[0] - 619.8).abs() < f32::EPSILON,
+            "the grid's top is the top rule: {:?}",
+            table.rows
+        );
+        assert!(
+            !table.item_indices.contains(&0),
+            "the intro's run went back to the page: {:?}",
+            table.item_indices
+        );
+        let bbox = region(&table, &items).bbox.expect("an extent");
+        assert!(
+            bbox.y + bbox.height < 640.0,
+            "the extent stops at the grid: {bbox:?}"
+        );
+    }
+
+    #[test]
+    fn a_header_populated_across_its_columns_stays_above_an_open_grid() {
+        // The detector accepts a header above the top rule when every
+        // column of it is filled; that shape is a header, not prose.
+        let (mut table, items, lines) = grid_with_a_prose_row_above();
+        table.cells[0] = vec!["Name".to_owned(), "Amount".to_owned()];
+        trim_rows_outside_the_rules(&mut table, &items, &lines, 1);
+        assert_eq!(table.cells.len(), 3);
+    }
+
+    #[test]
+    fn a_grid_without_vertical_rules_is_left_as_detected() {
+        let (mut table, items, _) = grid_with_a_prose_row_above();
+        trim_rows_outside_the_rules(&mut table, &items, &[], 1);
+        assert_eq!(table.cells.len(), 3);
+    }
+
+    #[test]
+    fn a_sparse_row_below_the_rules_is_trimmed_too() {
+        let (mut table, mut items, lines) = grid_with_a_prose_row_above();
+        table.cells.remove(0);
+        table.rows.remove(0);
+        items.push(placed("Signature: ____", 90.0, 400.0));
+        table.rows.push(410.0);
+        table
+            .cells
+            .push(vec!["Signature: ____".to_owned(), String::new()]);
+        table.item_indices.push(5);
+        trim_rows_outside_the_rules(&mut table, &items, &lines, 1);
+        assert_eq!(table.cells.len(), 2, "{:?}", table.cells);
+        assert!(!table.item_indices.contains(&5));
+    }
+
+    #[test]
+    fn a_sparse_row_below_the_rules_gives_its_runs_back_when_rows_are_baselines() {
+        // The text-anchor and alignment detectors report each row by the
+        // baseline its text sits on, not by the rule above it. The trimmed
+        // row's run then sits exactly on the boundary that was popped, and
+        // it has to go back to the page all the same.
+        let items = vec![
+            placed("Field", 90.0, 607.0),
+            placed("Value", 306.0, 607.0),
+            placed("Request number", 90.0, 592.0),
+            placed("EQ-2024-0117", 306.0, 592.0),
+            placed("Signature: ____", 90.0, 400.0),
+        ];
+        let mut table = Table::new(
+            vec![84.6, 300.6, 516.6],
+            vec![607.0, 592.0, 400.0],
+            vec![
+                vec!["Field".to_owned(), "Value".to_owned()],
+                vec!["Request number".to_owned(), "EQ-2024-0117".to_owned()],
+                vec!["Signature: ____".to_owned(), String::new()],
+            ],
+            vec![0, 1, 2, 3, 4],
+        );
+        let lines = vec![
+            vertical(84.6, 433.6, 620.1),
+            vertical(300.6, 434.1, 619.6),
+            vertical(516.6, 433.6, 620.1),
+        ];
+        trim_rows_outside_the_rules(&mut table, &items, &lines, 1);
+        assert_eq!(table.cells.len(), 2, "{:?}", table.cells);
+        assert!(
+            !table.item_indices.contains(&4),
+            "the signature line's run went back to the page: {:?}",
+            table.item_indices
+        );
+        let bbox = region(&table, &items).bbox.expect("an extent");
+        assert!(bbox.y > 430.0, "the extent stops at the grid: {bbox:?}");
+    }
+
+    /// A horizontal rule at `y` from `left` to `right`.
+    fn horizontal(y: f32, left: f32, right: f32) -> PdfLine {
+        PdfLine {
+            x1: left,
+            y1: y,
+            x2: right,
+            y2: y,
+            page: 1,
+        }
+    }
+
+    #[test]
+    fn a_header_with_an_unlabelled_stub_column_stays_above_an_open_grid() {
+        // The open-edge detector accepts a header above its top rule whose
+        // first cell is empty: the stub column of a row-header grid has no
+        // label of its own. That header has one filled cell, which is the
+        // shape of a title row too, and it is not one.
+        let items = vec![
+            placed("Value", 360.0, 375.0),
+            placed("Pack", 60.0, 320.0),
+            placed("OCR body", 360.0, 320.0),
+            placed("Application", 60.0, 220.0),
+            placed("Search", 360.0, 220.0),
+        ];
+        let lines = vec![
+            horizontal(360.0, 30.0, 630.0),
+            horizontal(275.0, 30.0, 630.0),
+            horizontal(170.0, 30.0, 630.0),
+            vertical(330.0, 168.0, 362.0),
+        ];
+        let tables = page_tables(1, &items, &[], &lines).expect("the grid is detected");
+        let rows: Vec<&[String]> = tables.tables[0]
+            .rows
+            .iter()
+            .map(|row| row.cells.as_slice())
+            .collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0], ["", "Value"], "the header is the first row");
     }
 }
