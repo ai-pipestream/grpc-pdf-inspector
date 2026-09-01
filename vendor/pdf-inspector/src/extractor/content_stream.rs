@@ -276,10 +276,12 @@ pub(crate) fn extract_page_text_items_with_forms(
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
-    // Get content
-    let content_data = doc
-        .get_page_content(page_id)
-        .map_err(|e| PdfError::Parse(e.to_string()))?;
+    // Get content. lopdf 0.44 dropped the vestigial Result on
+    // get_page_content: in 0.42 the body already skipped unreadable stream
+    // objects and fell back to raw bytes on a failed decode, and the only
+    // error path was write_all into a Vec, which cannot fail. Same bytes,
+    // no error to map.
+    let content_data = doc.get_page_content(page_id);
 
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's

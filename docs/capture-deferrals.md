@@ -399,3 +399,15 @@ the one to be careful with.
   has no cross-page evidence in that mode, so it fires less than it would
   on a whole-document render. Less silent deletion, and the same
   `report_furniture` names whatever still goes.
+
+## Vendored dependency moves (owner decisions, not re-vendors)
+
+- *Patch* (lopdf 0.44, 2026-09-02): the vendored crate's lopdf moved from
+  0.42.0 to 0.44.0 at the owner's request, ahead of upstream pdf-inspector.
+  One call site changed: `Document::get_page_content` lost a `Result` that
+  was vestigial (in 0.42 the body already skipped unreadable stream objects
+  and used raw bytes when a decode failed; the only error path was
+  `write_all` into a `Vec`, which cannot fail), so
+  `extractor/content_stream.rs` no longer maps an error that could not
+  happen. Same bytes out; the crate suite keeps 1015 passed / 14
+  fixture-missing and the service suite keeps 228.

@@ -58,7 +58,10 @@ The private APIs, and what each unblocks:
 The copy landed in its own commit, with the tree building and testing
 identically to the registry build, before any API was touched. Each patch is a
 separate commit after it, listed by SHA in `docs/capture-deferrals.md`. Every patch is additive: nothing that was public
-changed shape, and the crate's own tests are the ones it shipped with.
+changed shape, and the crate's own tests are the ones it shipped with. One
+exception is listed there under "Vendored dependency moves": the lopdf
+dependency moved ahead of upstream at the owner's request, with the one call
+site the API change reached.
 
 The crate keeps its own style, its own formatting and its own lint posture.
 Files here are not reformatted to match the service.
