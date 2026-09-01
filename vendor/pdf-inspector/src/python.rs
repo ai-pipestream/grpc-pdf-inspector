@@ -743,7 +743,7 @@ fn process_pdf_with_ocr(
         offline,
     })?;
     let result = py
-        .allow_threads(move || crate::vision::process_pdf_with_ocr(path, options))
+        .detach(move || crate::vision::process_pdf_with_ocr(path, options))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok(to_py_ocr_result(result))
 }
@@ -789,7 +789,7 @@ fn process_pdf_with_ocr_bytes(
     })?;
     let data = data.to_vec();
     let result = py
-        .allow_threads(move || crate::vision::process_pdf_with_ocr_mem(&data, options))
+        .detach(move || crate::vision::process_pdf_with_ocr_mem(&data, options))
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok(to_py_ocr_result(result))
 }

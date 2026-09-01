@@ -411,3 +411,10 @@ the one to be careful with.
   `extractor/content_stream.rs` no longer maps an error that could not
   happen. Same bytes out; the crate suite keeps 1015 passed / 14
   fixture-missing and the service suite keeps 228.
+- *Patch* (pyo3 0.29, 2026-09-02): the vendored crate's pyo3 moved from
+  0.28 to 0.29 at the owner's request. `Python::allow_threads` became
+  `Python::detach` (a rename with the same GIL semantics); the two call
+  sites in `python.rs` follow it. The `python` feature is outside the
+  service's default gate, so it was checked directly: `cargo check
+  --features python` compiles with zero errors and the crate's usual
+  warning posture.
