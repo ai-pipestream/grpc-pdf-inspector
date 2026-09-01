@@ -111,10 +111,15 @@ const MIN_RULE_LENGTH: f32 = 10.0;
 /// paragraph between the title and the table then reads as the table's
 /// first row, with one cell of prose and the rest empty. The vertical
 /// rules say where the grid is. A leading or trailing row whose boundary
-/// lies beyond every vertical rule of the table, and whose cells are all
-/// but one empty, is outside the grid, and its runs go back to the page.
-/// A header set above an open-edged grid is populated across its columns
-/// and stays: that is the shape the detector accepts it for.
+/// lies beyond every vertical rule of the table, and whose cells hold
+/// content in no column but the first, is outside the grid, and its runs
+/// go back to the page: that is the shape a paragraph makes when it spills
+/// one row past the rules, because prose starts flush with the left margin
+/// and says nothing in the columns after it. A header set above an
+/// open-edged grid is populated across its columns and stays — including a
+/// row-header stub whose own leading column is blank and every other
+/// column is filled, which is the shape the detector accepts a header for
+/// even when it names no leading column of its own.
 ///
 /// A table with no vertical rules inside its extent is left as detected;
 /// there is no geometry to judge it by.
@@ -145,8 +150,14 @@ fn trim_rows_outside_the_rules(
     if !ruled {
         return;
     }
+    // A row's content sits nowhere but the first column: that is what a
+    // stray paragraph line looks like, since prose starts at the left
+    // margin and never reaches into a table's later columns. A row-header
+    // stub is the opposite shape — its own first column is the one left
+    // blank — so this predicate leaves it alone, which is what the
+    // detector's own acceptance of that header depends on.
     let sparse =
-        |cells: &[String]| cells.iter().filter(|cell| !cell.trim().is_empty()).count() <= 1;
+        |cells: &[String]| cells.len() > 1 && cells[1..].iter().all(|cell| cell.trim().is_empty());
     while table.rows.len() > 1
         && table.rows[0] > top + RULE_TOLERANCE
         && table.cells.first().is_some_and(|cells| sparse(cells))
@@ -162,8 +173,14 @@ fn trim_rows_outside_the_rules(
         && table.rows[table.rows.len() - 1] < bottom - RULE_TOLERANCE
         && table.cells.last().is_some_and(|cells| sparse(cells))
     {
-        let ceiling = table.rows.pop().unwrap_or(f32::MIN) - RULE_TOLERANCE;
+        table.rows.pop();
         table.cells.pop();
+        // The ceiling below which a run is outside the grid is the new
+        // trailing row's own boundary, not the one just discarded — using
+        // the discarded row's y left runs sitting exactly on it (the usual
+        // case: detectors report a row at its own text baseline) inside
+        // the tolerance band and off the page they were sent back to.
+        let ceiling = table.rows[table.rows.len() - 1] - RULE_TOLERANCE;
         table
             .item_indices
             .retain(|index| items.get(*index).is_none_or(|item| item.y >= ceiling));
@@ -435,5 +452,84 @@ mod tests {
         trim_rows_outside_the_rules(&mut table, &items, &lines, 1);
         assert_eq!(table.cells.len(), 2, "{:?}", table.cells);
         assert!(!table.item_indices.contains(&5));
+    }
+
+    #[test]
+    fn a_sparse_row_below_the_rules_gives_its_runs_back_when_rows_are_baselines() {
+        // The text-anchor and alignment detectors report each row by the
+        // baseline its text sits on, not by the rule above it. The trimmed
+        // row's run then sits exactly on the boundary that was popped, and
+        // it has to go back to the page all the same.
+        let items = vec![
+            placed("Field", 90.0, 607.0),
+            placed("Value", 306.0, 607.0),
+            placed("Request number", 90.0, 592.0),
+            placed("EQ-2024-0117", 306.0, 592.0),
+            placed("Signature: ____", 90.0, 400.0),
+        ];
+        let mut table = Table::new(
+            vec![84.6, 300.6, 516.6],
+            vec![607.0, 592.0, 400.0],
+            vec![
+                vec!["Field".to_owned(), "Value".to_owned()],
+                vec!["Request number".to_owned(), "EQ-2024-0117".to_owned()],
+                vec!["Signature: ____".to_owned(), String::new()],
+            ],
+            vec![0, 1, 2, 3, 4],
+        );
+        let lines = vec![
+            vertical(84.6, 433.6, 620.1),
+            vertical(300.6, 434.1, 619.6),
+            vertical(516.6, 433.6, 620.1),
+        ];
+        trim_rows_outside_the_rules(&mut table, &items, &lines, 1);
+        assert_eq!(table.cells.len(), 2, "{:?}", table.cells);
+        assert!(
+            !table.item_indices.contains(&4),
+            "the signature line's run went back to the page: {:?}",
+            table.item_indices
+        );
+        let bbox = region(&table, &items).bbox.expect("an extent");
+        assert!(bbox.y > 430.0, "the extent stops at the grid: {bbox:?}");
+    }
+
+    /// A horizontal rule at `y` from `left` to `right`.
+    fn horizontal(y: f32, left: f32, right: f32) -> PdfLine {
+        PdfLine {
+            x1: left,
+            y1: y,
+            x2: right,
+            y2: y,
+            page: 1,
+        }
+    }
+
+    #[test]
+    fn a_header_with_an_unlabelled_stub_column_stays_above_an_open_grid() {
+        // The open-edge detector accepts a header above its top rule whose
+        // first cell is empty: the stub column of a row-header grid has no
+        // label of its own. That header has one filled cell, which is the
+        // shape of a title row too, and it is not one.
+        let items = vec![
+            placed("Value", 360.0, 375.0),
+            placed("Pack", 60.0, 320.0),
+            placed("OCR body", 360.0, 320.0),
+            placed("Application", 60.0, 220.0),
+            placed("Search", 360.0, 220.0),
+        ];
+        let lines = vec![
+            horizontal(360.0, 30.0, 630.0),
+            horizontal(275.0, 30.0, 630.0),
+            horizontal(170.0, 30.0, 630.0),
+            vertical(330.0, 168.0, 362.0),
+        ];
+        let tables = page_tables(1, &items, &[], &lines).expect("the grid is detected");
+        let rows: Vec<&[String]> = tables.tables[0]
+            .rows
+            .iter()
+            .map(|row| row.cells.as_slice())
+            .collect();
+        assert_eq!(rows.len(), 3, "{rows:?}");
+        assert_eq!(rows[0], ["", "Value"], "the header is the first row");
     }
 }
