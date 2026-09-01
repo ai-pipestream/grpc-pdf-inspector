@@ -855,9 +855,9 @@ impl TableKind {
 }
 /// SpanKind names what a positioned run actually is.
 ///
-/// The extractor emits more than glyphs: an image XObject contributes its
-/// placement box, a link annotation contributes its rectangle and target,
-/// and an AcroForm field contributes its value.
+/// The extractor emits more than glyphs: an image or form XObject
+/// contributes its placement box, a link annotation contributes its
+/// rectangle and target, and an AcroForm field contributes its value.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum SpanKind {
@@ -872,6 +872,13 @@ pub enum SpanKind {
     Link = 3,
     /// An AcroForm field's value.
     FormField = 4,
+    /// A Form XObject's placement box: the form's own bounding box carried
+    /// through its matrix and the transformation in force when the page
+    /// invoked it. A vector figure included as a form draws no image
+    /// XObject, and this is the only record of where it sits. `text` is a
+    /// placeholder naming the resource, not content; the form's own text
+    /// runs arrive as SPAN_KIND_TEXT in their own right.
+    Form = 5,
 }
 impl SpanKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -885,6 +892,7 @@ impl SpanKind {
             Self::Image => "SPAN_KIND_IMAGE",
             Self::Link => "SPAN_KIND_LINK",
             Self::FormField => "SPAN_KIND_FORM_FIELD",
+            Self::Form => "SPAN_KIND_FORM",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -895,6 +903,7 @@ impl SpanKind {
             "SPAN_KIND_IMAGE" => Some(Self::Image),
             "SPAN_KIND_LINK" => Some(Self::Link),
             "SPAN_KIND_FORM_FIELD" => Some(Self::FormField),
+            "SPAN_KIND_FORM" => Some(Self::Form),
             _ => None,
         }
     }

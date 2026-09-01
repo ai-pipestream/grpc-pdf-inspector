@@ -22,9 +22,9 @@
 //! content streams, not glyphs.
 //!
 //! FULL then runs exactly one more:
-//! `extract_text_with_positions_and_rects_mem_with_invisible`, whose runs,
-//! rectangles and line segments answer everything the rest of the mode
-//! needs. The markdown is rendered from those runs here with
+//! `extract_text_with_positions_rects_and_forms_mem_with_invisible`, whose
+//! runs, rectangles, line segments and form placements answer everything
+//! the rest of the mode needs. The markdown is rendered from those runs here with
 //! [`to_markdown_from_items_with_rects_and_page_count`]; the tables come
 //! from the same runs plus the vector geometry; the layout verdict comes
 //! from the runs and the tables; the text-quality verdicts and the garble
@@ -387,13 +387,17 @@ fn parse(
             let filter: Option<HashSet<u32>> =
                 (!options.pages.is_empty()).then(|| options.pages.iter().copied().collect());
             metrics.parser_pass();
-            let ((items, rects, lines), skipped_invisible) = guarded(|| {
-                pdf_inspector::extract_text_with_positions_and_rects_mem_with_invisible(
+            let ((items, rects, lines), forms, skipped_invisible) = guarded(|| {
+                pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_invisible(
                     bytes,
                     filter.as_ref(),
                     false,
                 )
             })?;
+            // Where the page invoked Form XObjects. A vector figure is one,
+            // and it draws no image run, so this is the only record of
+            // where it sits. They ride the spans event, after the runs.
+            let mut forms = spans::forms_by_page(forms);
             // What the walk left out, said whether or not anyone asked for
             // the runs themselves. A text layer nobody is told about is
             // what this reports.
@@ -512,9 +516,16 @@ fn parse(
                 // sit in the middle of that line's letters, where no block
                 // of the rendering can match across it.
                 if events.wanted(options.emit_spans) {
-                    let spans = spans::page_spans_marking(page_no, &page_items, |item| {
+                    let mut spans = spans::page_spans_marking(page_no, &page_items, |item| {
                         chrome.convicts(item)
                     });
+                    spans.spans.extend(
+                        forms
+                            .remove(&page_no)
+                            .unwrap_or_default()
+                            .iter()
+                            .map(spans::form_span),
+                    );
                     events.route(
                         pb::parse_pdf_response::Event::Spans(spans),
                         options.emit_spans,

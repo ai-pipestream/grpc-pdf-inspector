@@ -167,6 +167,16 @@ fn drawn_text(items: &[TextItem]) -> BTreeMap<u32, Vec<&TextItem>> {
 /// It is shown the whole document, which is the only way it can weigh
 /// repetition: the service renders one page at a time, and on a single
 /// page's lines the document-wide classifier has nothing to count.
+///
+/// Its verdict is taken on the page's edge lines and nowhere else. The
+/// classifier proves chrome by repetition, and a document whose pages
+/// repeat their body, a form printed twelve times or a fixture of one
+/// page copied, repeats far more than its chrome: on such a page it
+/// convicts the whole body, which no reader would call a running head.
+/// Chrome is what stands apart at the top or the bottom of a page, set
+/// off by white space or by a smaller face, and [`edges`] is this module's
+/// one account of where that is. A run the parser convicts anywhere else
+/// is content that repeats, and stays content.
 fn stripped_by_the_parser(items: &[TextItem], page_count: u32, convicted: &mut HashSet<Key>) {
     let lines = pdf_inspector::extractor::group_into_lines(items.to_vec());
     let grouped: HashSet<Key> = lines
@@ -182,7 +192,21 @@ fn stripped_by_the_parser(items: &[TextItem], page_count: u32, convicted: &mut H
             .collect();
     // Only runs the grouping actually saw: a run it dropped on its way is
     // not a run the stripper decided anything about.
-    convicted.extend(grouped.difference(&kept).cloned());
+    let stripped: HashSet<Key> = grouped.difference(&kept).cloned().collect();
+    // Text only: an image placement is not a line of chrome, whatever the
+    // classifier made of its placeholder.
+    for runs in drawn_text(items).values() {
+        let edge: Vec<f32> = edges(runs)
+            .into_iter()
+            .flat_map(|(_, heights)| heights)
+            .collect();
+        convicted.extend(
+            runs.iter()
+                .filter(|item| edge.iter().any(|y| (item.y - y).abs() < SAME_LINE))
+                .map(|item| key(item))
+                .filter(|key| stripped.contains(key)),
+        );
+    }
 }
 
 /// How many distinct pages a repetition needs before it is evidence.
@@ -637,6 +661,77 @@ mod tests {
         assert!(
             !items.iter().any(|run| chrome.convicts(run)),
             "same-size edge lines are content that sits at the margin"
+        );
+    }
+
+    /// Twelve pages that repeat the same body lines at the same heights,
+    /// each with a same-face first line naming the page: the shape of a
+    /// generated sample and of a form printed many times over.
+    fn repeated_pages(pages: u32) -> Vec<TextItem> {
+        let mut items = Vec::new();
+        for page in 1..=pages {
+            items.push(item(
+                page,
+                &format!("the long document, page {page}"),
+                50.0,
+                750.0,
+            ));
+            for line in 0..9u8 {
+                items.push(item(
+                    page,
+                    "lorem ipsum dolor sit amet lorem ipsum dolor sit amet lorem ipsum",
+                    50.0,
+                    736.0 - 14.0 * f32::from(line),
+                ));
+            }
+        }
+        items
+    }
+
+    #[test]
+    fn a_body_that_repeats_page_after_page_is_not_chrome() {
+        // The parser's classifier convicts every line of such a page. A
+        // page's chrome is at its edges, and a verdict that reaches past
+        // them has proved repetition, not chrome.
+        let items = repeated_pages(12);
+        let chrome = Chrome::detect(&items, 12);
+        let convicted: Vec<&TextItem> = items.iter().filter(|run| chrome.convicts(run)).collect();
+        assert!(
+            convicted.is_empty(),
+            "{} runs convicted, first {:?} on page {}",
+            convicted.len(),
+            convicted.first().map(|run| &run.text),
+            convicted.first().map_or(0, |run| run.page)
+        );
+    }
+
+    #[test]
+    fn an_image_placement_is_never_chrome() {
+        // The same raster on every page, drawn full-bleed: a scan's
+        // background, a letterhead. Whatever the classifier makes of its
+        // placeholder text, an image is not a line of chrome.
+        let mut items: Vec<TextItem> = (1..=4).flat_map(|page| sheet(page, "A Head")).collect();
+        for page in 1..=4u32 {
+            let mut image = item(page, "[Image: Im1]", 0.0, 0.0);
+            image.width = 612.0;
+            image.height = 792.0;
+            image.item_type = ItemType::Image;
+            items.push(image);
+        }
+        let chrome = Chrome::detect(&items, 4);
+        assert!(
+            !items
+                .iter()
+                .filter(|run| matches!(run.item_type, ItemType::Image))
+                .any(|run| chrome.convicts(run)),
+            "an image placement was convicted"
+        );
+        assert!(
+            items
+                .iter()
+                .filter(|run| run.text == "A Head")
+                .all(|run| chrome.convicts(run)),
+            "the running head is still chrome"
         );
     }
 

@@ -75,7 +75,7 @@
 use std::collections::HashMap;
 
 use crate::emphasis;
-use crate::page_runs::{Located, PageRuns, page_ref};
+use crate::page_runs::{Located, PageRuns, Picture, page_ref};
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
 use crate::structure;
@@ -108,6 +108,11 @@ const FURNITURE_REF: &str = "#/furniture";
 /// The deepest heading level the fold recognizes. `#` through `####` map
 /// to levels 1 through 4; a line with more hashes is prose.
 const MAX_HEADING_LEVEL: usize = 4;
+
+/// How far a block's top may reach into a picture's box, in points, and
+/// still be the block below it: a caption's ascenders touch the figure
+/// above them.
+const PICTURE_OVERLAP: f64 = 2.0;
 
 /// A fold of one parse's events into one Document.
 ///
@@ -420,7 +425,13 @@ impl DocumentFold {
         for run in &page.invisible {
             self.push_invisible(run, page.page_no);
         }
-        self.push_pictures(page.page_no);
+        // The page's pictures, top to bottom, waiting for the block that
+        // follows each of them in reading order; and, as the page is read,
+        // the blocks cut off the right of a block the renderer fused across
+        // a gutter, waiting the same way. The renderer put them where the
+        // left block was, and the column they sit in is read later.
+        let mut pictures = self.pictures_of(page.page_no);
+        let mut deferred: Vec<(String, Located)> = Vec::new();
 
         // The page's chrome, by its letters, so a block of markdown the
         // renderer kept and the chrome report claimed is not folded into
@@ -458,6 +469,8 @@ impl DocumentFold {
             if claimed.contains(&letters(block.text())) {
                 continue;
             }
+            self.place_pictures_above(&mut pictures, located.bbox.as_ref(), page.page_no);
+            self.place_deferred_above(&mut deferred, located.bbox.as_ref(), page.page_no);
             while dropped
                 .peek()
                 .is_some_and(|(index, _)| located.first_run.is_some_and(|first| *index < first))
@@ -484,31 +497,45 @@ impl DocumentFold {
                     self.close_list();
                     self.push_code(&text, page.page_no, language.as_deref(), located);
                 }
-                block => {
+                Block::Paragraph(text) => {
                     self.close_list();
-                    let (guessed, text) = match block {
-                        Block::Heading { level, text } => (Some(level), text),
-                        Block::Paragraph(text) => (None, text),
-                        // The arms above handled every other variant.
-                        _ => continue,
-                    };
-                    // The document's own word for the block beats the
-                    // markdown renderer's guess at it. The renderer inferred
-                    // heading depth from type size; a tagged document states
-                    // it.
-                    let authored = located
-                        .role
+                    // A paragraph the renderer assembled out of two blocks
+                    // set side by side goes back into its blocks, in
+                    // column order, each with the box of its own runs.
+                    let parts = self
+                        .runs
                         .as_ref()
-                        .and_then(|(role, _)| structure::heading_level(*role));
-                    let level = authored.or(guessed);
-                    let kind = level.map_or(Kind::Paragraph, Kind::Heading);
-                    self.push_text(&text, page.page_no, kind, located);
+                        .filter(|runs| runs.page_no() == page.page_no)
+                        .and_then(|runs| runs.side_by_side(&located, &text));
+                    match parts {
+                        Some(parts) => {
+                            let mut parts = parts.into_iter();
+                            if let Some((text, located)) = parts.next() {
+                                self.push_prose(&text, page.page_no, None, located);
+                            }
+                            deferred.extend(parts);
+                        }
+                        None => self.push_prose(&text, page.page_no, None, located),
+                    }
+                }
+                Block::Heading { level, text } => {
+                    self.close_list();
+                    self.push_prose(&text, page.page_no, Some(level), located);
                 }
             }
         }
         // Whatever the page drew after its last rendered block.
         for (_, run) in dropped {
             self.push_dropped(run, page.page_no);
+        }
+        // And whatever no block followed: at the foot of the page, or in a
+        // column the page's own blocks never reached.
+        for picture in pictures.drain(..) {
+            self.push_picture(picture, page.page_no);
+        }
+        for (text, located) in deferred.drain(..) {
+            self.close_list();
+            self.push_prose(&text, page.page_no, None, located);
         }
         // A page ends whatever it was in the middle of.
         self.close_list();
@@ -586,43 +613,112 @@ impl DocumentFold {
         }
     }
 
-    /// Append one `PictureItem` per image the page drew.
+    /// The pictures the page drew, top to bottom: every image the content
+    /// stream placed, and every Form XObject that is a figure.
     ///
     /// The extractor emits a run for every image XObject with the box the
     /// content stream placed it at, and the markdown renderer discards
-    /// them, so `Document.pictures` used to be structurally empty. They go
-    /// in ahead of the page's text: a picture is placed by the content
-    /// stream, and the fold's reading order for a page starts where the
-    /// page starts.
-    fn push_pictures(&mut self, page_no: u32) {
-        let pictures = self
+    /// them, so `Document.pictures` used to be structurally empty. A form
+    /// is judged against the page's size, which the metadata pass
+    /// measured.
+    fn pictures_of(&self, page_no: u32) -> Vec<Picture> {
+        let size = self
+            .document
+            .pages
+            .get(&i32::try_from(page_no).unwrap_or(i32::MAX))
+            .and_then(|page| page.size.as_ref());
+        let mut pictures = self
             .runs
             .as_ref()
             .filter(|runs| runs.page_no() == page_no)
-            .map(PageRuns::pictures)
+            .map(|runs| runs.pictures(size))
             .unwrap_or_default();
-        for picture in pictures {
-            let parent = self.current_parent();
-            let self_ref = format!("#/pictures/{}", self.document.pictures.len());
-            self.document.pictures.push(doc::PictureItem {
-                self_ref: self_ref.clone(),
-                parent: Some(reference(&parent)),
-                content_layer: doc::ContentLayer::Body as i32,
-                label: doc::DocItemLabel::Picture as i32,
-                prov: provenance(page_no, Some(picture.bbox)),
-                // A link annotation over the picture's region: out of the
-                // document as a hyperlink, into it as a target. The bytes
-                // of the image are not decoded here, so `image` stays unset
-                // rather than describing something this pass did not read.
-                hyperlink: picture.hyperlink,
-                target: picture.target,
-                source: vec![doc::SourceType {
-                    source: Some(doc::source_type::Source::Collector(self.source.clone())),
-                }],
-                ..doc::PictureItem::default()
-            });
-            self.link_child(&parent, &self_ref);
+        pictures.sort_by(|left, right| right.bbox.t.total_cmp(&left.bbox.t));
+        pictures
+    }
+
+    /// Append the pictures that stand above the block at `bbox`, so a
+    /// picture takes its place in the reading order where the page put
+    /// it: after the text above it and before the text below.
+    ///
+    /// A block is below a picture when its top is under the picture's
+    /// bottom and the two share some of the page's width. A block in the
+    /// other column is not below it, however far down the page it sits;
+    /// the picture waits for its own column. A block with no box says
+    /// nothing about where it is, and nothing is placed on its account.
+    fn place_pictures_above(
+        &mut self,
+        pictures: &mut Vec<Picture>,
+        bbox: Option<&doc::BoundingBox>,
+        page_no: u32,
+    ) {
+        let Some(block) = bbox else {
+            return;
+        };
+        let mut index = 0;
+        while index < pictures.len() {
+            if stands_above(&pictures[index].bbox, block) {
+                let picture = pictures.remove(index);
+                self.push_picture(picture, page_no);
+            } else {
+                index += 1;
+            }
         }
+    }
+
+    /// Append the deferred blocks that stand above the block at `bbox`, by
+    /// the same rule as [`Self::place_pictures_above`]: a block cut off
+    /// the right of a fused block is read after the column to its left,
+    /// which is when the reading reaches a block below it in its own
+    /// column, or the end of the page.
+    fn place_deferred_above(
+        &mut self,
+        deferred: &mut Vec<(String, Located)>,
+        bbox: Option<&doc::BoundingBox>,
+        page_no: u32,
+    ) {
+        let Some(block) = bbox else {
+            return;
+        };
+        let mut index = 0;
+        while index < deferred.len() {
+            let above = deferred[index]
+                .1
+                .bbox
+                .as_ref()
+                .is_some_and(|part| stands_above(part, block));
+            if above {
+                let (text, located) = deferred.remove(index);
+                self.close_list();
+                self.push_prose(&text, page_no, None, located);
+            } else {
+                index += 1;
+            }
+        }
+    }
+
+    /// Append one `PictureItem`.
+    fn push_picture(&mut self, picture: Picture, page_no: u32) {
+        let parent = self.current_parent();
+        let self_ref = format!("#/pictures/{}", self.document.pictures.len());
+        self.document.pictures.push(doc::PictureItem {
+            self_ref: self_ref.clone(),
+            parent: Some(reference(&parent)),
+            content_layer: doc::ContentLayer::Body as i32,
+            label: doc::DocItemLabel::Picture as i32,
+            prov: provenance(page_no, Some(picture.bbox)),
+            // A link annotation over the picture's region: out of the
+            // document as a hyperlink, into it as a target. The bytes of
+            // the image are not decoded here, so `image` stays unset
+            // rather than describing something this pass did not read.
+            hyperlink: picture.hyperlink,
+            target: picture.target,
+            source: vec![doc::SourceType {
+                source: Some(doc::source_type::Source::Collector(self.source.clone())),
+            }],
+            ..doc::PictureItem::default()
+        });
+        self.link_child(&parent, &self_ref);
     }
 
     /// Put one stripped line into the furniture layer.
@@ -808,6 +904,22 @@ impl DocumentFold {
     /// Close the open list, if there is one.
     fn close_list(&mut self) {
         self.open_list = None;
+    }
+
+    /// Append one heading or paragraph, at the depth the document states
+    /// when it states one.
+    ///
+    /// The document's own word for the block beats the markdown renderer's
+    /// guess at it. The renderer inferred heading depth from type size; a
+    /// tagged document states it.
+    fn push_prose(&mut self, text: &str, page_no: u32, guessed: Option<i32>, located: Located) {
+        let authored = located
+            .role
+            .as_ref()
+            .and_then(|(role, _)| structure::heading_level(*role));
+        let level = authored.or(guessed);
+        let kind = level.map_or(Kind::Paragraph, Kind::Heading);
+        self.push_text(text, page_no, kind, located);
     }
 
     /// Append one text item of the given kind and return its self ref.
@@ -1018,6 +1130,15 @@ fn cell_bbox(region: &pb::TableRegion, row: usize, column: usize) -> Option<doc:
     })
 }
 
+/// Whether `upper` stands above `block` in the same column: the block's
+/// top is under the upper box's bottom and the two share some of the
+/// page's width.
+fn stands_above(upper: &doc::BoundingBox, block: &doc::BoundingBox) -> bool {
+    let below = block.t < upper.b + PICTURE_OVERLAP;
+    let shares_width = block.l.max(upper.l) < block.r.min(upper.r);
+    below && shares_width
+}
+
 /// A wire rectangle as a schema bounding box, in the same space.
 fn bounding_box(rect: &pb::Rect) -> doc::BoundingBox {
     doc::BoundingBox {
@@ -1112,7 +1233,18 @@ fn blocks(markdown: &str) -> Vec<Block> {
     let mut paragraph: Vec<&str> = Vec::new();
     let mut fence: Option<(Option<String>, Vec<String>)> = None;
 
-    for line in markdown.lines() {
+    // A number glued to its word is a list marker only in company: the
+    // line before or after it has to carry a marker too.
+    let lines: Vec<&str> = markdown.lines().collect();
+    let marked: Vec<bool> = lines
+        .iter()
+        .map(|line| list_item(line, false).is_some() || is_glued_list_marker(line))
+        .collect();
+    let glued_ok = |index: usize| {
+        (index > 0 && marked[index - 1]) || marked.get(index + 1).copied().unwrap_or(false)
+    };
+
+    for (index, line) in lines.iter().copied().enumerate() {
         // A fence swallows everything until it is closed, so nothing
         // inside a code block is read as markdown.
         if let Some((language, body)) = fence.as_mut() {
@@ -1146,7 +1278,7 @@ fn blocks(markdown: &str) -> Vec<Block> {
             blocks.push(Block::Heading { level, text });
             continue;
         }
-        if let Some((marker, enumerated, text)) = list_item(line) {
+        if let Some((marker, enumerated, text)) = list_item(line, glued_ok(index)) {
             flush_paragraph(&mut paragraph, &mut blocks);
             blocks.push(Block::ListItem {
                 marker,
@@ -1201,10 +1333,17 @@ fn is_table_row(line: &str) -> bool {
 /// Parse a list line into its marker, whether the marker counts, and the
 /// text after it.
 ///
-/// Only the markers the extraction renderer emits are recognized: `- ` for
+/// The markers the extraction renderer emits are recognized: `- ` for
 /// bullets and `N. ` for numbers. A line beginning with a dash and no space
 /// is a sentence that starts with a dash.
-fn list_item(line: &str) -> Option<(String, bool, String)> {
+///
+/// So is a number glued to the word after it, `2.minimize`, when
+/// `glued_ok`: a list set tight enough that the number and the first word
+/// of the item come out of the extractor as one run is printed by the
+/// renderer exactly as the run had it. The caller says whether the
+/// neighbouring lines make it a list; on its own, a line that begins that
+/// way is prose.
+fn list_item(line: &str, glued_ok: bool) -> Option<(String, bool, String)> {
     let line = line.trim_start();
     if let Some(rest) = line.strip_prefix("- ") {
         let text = rest.trim();
@@ -1214,9 +1353,33 @@ fn list_item(line: &str) -> Option<(String, bool, String)> {
     if digits.is_empty() {
         return None;
     }
-    let rest = line.get(digits.len()..)?.strip_prefix(". ")?;
+    let after = line.get(digits.len()..)?;
+    let rest = match after.strip_prefix(". ") {
+        Some(rest) => rest,
+        None if glued_ok => after.strip_prefix('.').filter(|rest| is_glued_word(rest))?,
+        None => return None,
+    };
     let text = rest.trim();
     (!text.is_empty()).then(|| (format!("{digits}."), true, text.to_owned()))
+}
+
+/// Whether a line begins with a number glued to a word: `N.` followed by
+/// at least two letters, and by nothing that would make it a decimal or a
+/// section number.
+fn is_glued_list_marker(line: &str) -> bool {
+    let line = line.trim_start();
+    let digits = line.chars().take_while(char::is_ascii_digit).count();
+    (1..=2).contains(&digits) && line[digits..].strip_prefix('.').is_some_and(is_glued_word)
+}
+
+/// Whether `rest` opens with a word of letters, which is what follows a
+/// glued marker and not what follows the integer part of a number.
+fn is_glued_word(rest: &str) -> bool {
+    rest.chars()
+        .take(2)
+        .filter(char::is_ascii_alphabetic)
+        .count()
+        == 2
 }
 
 /// Parse an ATX heading line into its level and text, or `None` when the
@@ -2452,5 +2615,208 @@ mod tests {
         fold.consume(&page(1, "one\n"));
         assert_eq!(fold.take().texts.len(), 1);
         assert_eq!(fold.take().texts.len(), 0);
+    }
+
+    /// One page's runs at explicit boxes.
+    fn spans_at(page_no: u32, runs: &[(&str, f64, f64, f64)]) -> pb::parse_pdf_response::Event {
+        pb::parse_pdf_response::Event::Spans(pb::PageSpans {
+            page_no,
+            spans: runs
+                .iter()
+                .map(|(text, x, y, width)| pb::TextSpan {
+                    text: (*text).to_owned(),
+                    bbox: Some(pb::Rect {
+                        x: *x,
+                        y: *y,
+                        width: *width,
+                        height: 10.0,
+                    }),
+                    kind: pb::SpanKind::Text.into(),
+                    ..pb::TextSpan::default()
+                })
+                .collect(),
+        })
+    }
+
+    #[test]
+    fn a_paragraph_the_renderer_fused_across_a_gutter_is_two_items_in_column_order() {
+        // A caption set beside the prose wrapped around its figure: the
+        // renderer read each baseline across both, and printed one block
+        // whose words alternate between them.
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        fold.consume(&spans_at(
+            1,
+            &[
+                ("prose line one", 108.0, 420.0, 228.0),
+                ("Figure 3: Overlap", 345.0, 419.0, 159.0),
+                ("prose line two", 108.0, 409.0, 228.0),
+                ("between the sets", 345.0, 408.0, 159.0),
+                ("prose line three", 108.0, 398.0, 228.0),
+                ("is small", 345.0, 397.0, 159.0),
+            ],
+        ));
+        fold.consume(&page(
+            1,
+            "prose line one Figure 3: Overlap prose line two between the sets prose line \
+             three is small",
+        ));
+        let document = fold.take();
+        let texts: Vec<&str> = document.texts.iter().map(|item| text_of(item).0).collect();
+        assert_eq!(
+            texts,
+            [
+                "prose line one prose line two prose line three",
+                "Figure 3: Overlap between the sets is small"
+            ]
+        );
+        let prose = base_of(&document.texts[0]).prov[0]
+            .bbox
+            .as_ref()
+            .expect("the prose has its own box");
+        assert!((prose.r - 336.0).abs() < f64::EPSILON, "{prose:?}");
+        let caption = base_of(&document.texts[1]).prov[0]
+            .bbox
+            .as_ref()
+            .expect("the caption has its own box");
+        assert!((caption.l - 345.0).abs() < f64::EPSILON, "{caption:?}");
+        assert_eq!(
+            document.body.as_ref().expect("a body").children.len(),
+            2,
+            "both hang off the body"
+        );
+    }
+
+    #[test]
+    fn the_right_half_of_a_fused_block_waits_for_its_own_column() {
+        // Page 6 of the two-column fixture: the renderer fused the left
+        // column's first paragraph with the whole right column. The right
+        // half is read after the rest of the left column, not between the
+        // left column's first and second paragraphs.
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        fold.consume(&spans_at(
+            1,
+            &[
+                ("left one", 57.0, 700.0, 238.0),
+                ("right one", 316.0, 699.0, 238.0),
+                ("left two", 57.0, 689.0, 238.0),
+                ("right two", 316.0, 688.0, 238.0),
+                ("left three", 57.0, 678.0, 238.0),
+                ("right three", 316.0, 677.0, 238.0),
+                ("left second paragraph", 57.0, 650.0, 238.0),
+                ("left third paragraph", 57.0, 620.0, 238.0),
+            ],
+        ));
+        fold.consume(&page(
+            1,
+            "left one right one left two right two left three right three
+
+             left second paragraph
+
+left third paragraph",
+        ));
+        let document = fold.take();
+        let texts: Vec<&str> = document.texts.iter().map(|item| text_of(item).0).collect();
+        assert_eq!(
+            texts,
+            [
+                "left one left two left three",
+                "left second paragraph",
+                "left third paragraph",
+                "right one right two right three",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_caption_cut_off_a_fused_block_is_read_before_the_full_width_block_below_it() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        fold.consume(&spans_at(
+            1,
+            &[
+                ("prose line one", 108.0, 420.0, 228.0),
+                ("Figure 3: Overlap", 345.0, 419.0, 159.0),
+                ("prose line two", 108.0, 409.0, 228.0),
+                ("between the sets", 345.0, 408.0, 159.0),
+                ("prose line three", 108.0, 398.0, 228.0),
+                ("is small", 345.0, 397.0, 159.0),
+                ("A full width paragraph follows", 108.0, 370.0, 396.0),
+            ],
+        ));
+        fold.consume(&page(
+            1,
+            "prose line one Figure 3: Overlap prose line two between the sets prose line \
+             three is small\n\nA full width paragraph follows",
+        ));
+        let document = fold.take();
+        let texts: Vec<&str> = document.texts.iter().map(|item| text_of(item).0).collect();
+        assert_eq!(
+            texts,
+            [
+                "prose line one prose line two prose line three",
+                "Figure 3: Overlap between the sets is small",
+                "A full width paragraph follows",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_number_glued_to_its_word_is_a_list_marker_in_company() {
+        // A list set tight enough that the number and the first word came
+        // out of the extractor as one run, printed as the run had it.
+        let items = blocks("1.minimize the error\n2.minimize the loss\n3.apply the rule\n");
+        assert_eq!(items.len(), 3, "three list items");
+        for (block, expected) in
+            items
+                .iter()
+                .zip(["minimize the error", "minimize the loss", "apply the rule"])
+        {
+            match block {
+                Block::ListItem {
+                    marker,
+                    enumerated,
+                    text,
+                } => {
+                    assert!(marker.ends_with('.'));
+                    assert!(*enumerated);
+                    assert_eq!(text, expected);
+                }
+                _ => panic!("a list item, not {:?}", block.text()),
+            }
+        }
+    }
+
+    #[test]
+    fn a_number_glued_to_its_word_alone_is_prose() {
+        // Nothing beside it says list: a version, a section reference, a
+        // sentence that starts with one.
+        let version = blocks("1.x compatible releases follow.\nThe next line is prose.\n");
+        assert_eq!(version.len(), 1);
+        assert!(matches!(version[0], Block::Paragraph(_)));
+        let section = blocks("3.2 Diffusion steps as repair operators\nWe exploit the property.\n");
+        assert_eq!(section.len(), 1, "a section number is not a glued marker");
+        assert!(matches!(section[0], Block::Paragraph(_)));
+    }
+
+    #[test]
+    fn a_glued_list_ends_where_the_markers_end() {
+        // The heading after the list starts a paragraph of its own, which
+        // is what lets a consumer see the heading at the head of a block.
+        let parsed = blocks(
+            "1.minimize the error\n2.minimize the loss\n3.2 A HEADING LINE\nWe exploit the property.\n",
+        );
+        assert_eq!(
+            parsed.len(),
+            3,
+            "{:?}",
+            parsed.iter().map(Block::text).collect::<Vec<_>>()
+        );
+        assert!(matches!(parsed[2], Block::Paragraph(_)));
+        assert_eq!(
+            parsed[2].text(),
+            "3.2 A HEADING LINE\nWe exploit the property."
+        );
     }
 }

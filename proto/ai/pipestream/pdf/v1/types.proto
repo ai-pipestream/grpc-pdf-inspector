@@ -250,9 +250,9 @@ message Rect {
 
 // SpanKind names what a positioned run actually is.
 //
-// The extractor emits more than glyphs: an image XObject contributes its
-// placement box, a link annotation contributes its rectangle and target,
-// and an AcroForm field contributes its value.
+// The extractor emits more than glyphs: an image or form XObject
+// contributes its placement box, a link annotation contributes its
+// rectangle and target, and an AcroForm field contributes its value.
 enum SpanKind {
   // Never sent. Present because proto3 requires a zero value.
   SPAN_KIND_UNSPECIFIED = 0;
@@ -269,6 +269,14 @@ enum SpanKind {
 
   // An AcroForm field's value.
   SPAN_KIND_FORM_FIELD = 4;
+
+  // A Form XObject's placement box: the form's own bounding box carried
+  // through its matrix and the transformation in force when the page
+  // invoked it. A vector figure included as a form draws no image
+  // XObject, and this is the only record of where it sits. `text` is a
+  // placeholder naming the resource, not content; the form's own text
+  // runs arrive as SPAN_KIND_TEXT in their own right.
+  SPAN_KIND_FORM = 5;
 }
 
 // TextSpan is one positioned run as the extractor saw it, before markdown.

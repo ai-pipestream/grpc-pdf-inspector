@@ -948,6 +948,128 @@ pub fn styled_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page PDF whose figure is drawn as vector art through a
+/// Form XObject, placed between two paragraphs, with a caption under it.
+///
+/// A figure included from another PDF, which is how a paper's plots are
+/// set, is a form: paths and a few labels, no image XObject anywhere. The
+/// walker used to report nothing for it, so the paper's figures had no
+/// picture items. The form's `/BBox` is 200 by 100 and the page draws it
+/// scaled by two at (72, 400), so its placed box is 400 by 200 with its
+/// top at 600.
+#[must_use]
+pub fn vector_figure_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    // The figure: a frame, a curve, and a label set in its own font.
+    let figure_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 200.into(), 100.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+        },
+        b"0.5 w 5 5 190 90 re S 10 20 m 60 80 120 10 190 70 c S \
+          BT /F1 6 Tf 20 8 Td (yield) Tj ET"
+            .to_vec(),
+    ));
+    let content = "BT /F1 11 Tf 72 700 Td (Prose above the figure describes the method in some detail.) Tj ET\n\
+                   BT /F1 11 Tf 72 686 Td (It continues for a second line before the figure.) Tj ET\n\
+                   q 2 0 0 2 72 400 cm /Fx1 Do Q\n\
+                   BT /F1 9 Tf 72 385 Td (Figure 1: A vector drawing of the yield.) Tj ET\n\
+                   BT /F1 11 Tf 72 340 Td (Prose below the figure discusses what it shows.) Tj ET\n\
+                   BT /F1 11 Tf 72 326 Td (It also runs to a second line.) Tj ET";
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+            "XObject" => dictionary! { "Fx1" => figure_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a one-page PDF whose whole content is drawn through one Form
+/// XObject, the shape print-to-PDF producers emit: the page stream is a
+/// single `Do`, and everything a reader sees is inside the form.
+#[must_use]
+pub fn wrapped_page_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let wrapper_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+        },
+        b"BT /F1 12 Tf 72 700 Td (A page drawn entirely through one form.) Tj ET \
+          BT /F1 12 Tf 72 686 Td (Nothing here is a figure.) Tj ET"
+            .to_vec(),
+    ));
+    let content_id = doc.add_object(Stream::new(dictionary! {}, b"q /X1 Do Q".to_vec()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "XObject" => dictionary! { "X1" => wrapper_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Build a one-page PDF carrying an article of text, an image below it,
 /// and a `/Link` annotation covering the image's region.
 ///

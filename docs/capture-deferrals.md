@@ -48,6 +48,7 @@ Three reasons appear below and they are not interchangeable:
 | U24 file identifier | `PdfMetadata.file_id`, `DocumentOrigin.source_id` |
 | S3 formatting | `TextSpan` flags, `InlineSpan.formatting` / `.font_family` / `.font_size_pt` over the characters they cover |
 | D7 image placements | `SPAN_KIND_IMAGE` runs, `Document.pictures[]` with their boxes |
+| Figures drawn as Form XObjects | `SPAN_KIND_FORM` runs, `Document.pictures[]` with the form's placed box, each picture in reading order after the text above it |
 | Links over non-text regions | `PictureItem.hyperlink` for external targets, `PictureItem.target` for internal ones |
 | U8 / U13 / U16 posture and identity, on the Document plane | `DocumentMeta.format_version` / `.structured` / `.authoring_tool` / `.subject` / `.protection` / `.raw_metadata` |
 | U15 / U23 page geometry and labels, on the Document plane | `PageItem.page_label` / `.media_size` / `.user_unit` |
@@ -202,6 +203,35 @@ markdown looked fine.
   `tests/furniture.rs` asserts both halves: no chrome in the rendering with
   the verdict, and the fusion itself without it.
 
+**Form XObject placements.** A figure included from another PDF, which
+is how a paper's plots are set, is a Form XObject: paths and a few
+labels, no image anywhere. The walker entered every form to read its text
+and knew, at the `Do`, the form's `/BBox` and the transformation in
+force, and reported neither; the paper's second and third figures
+therefore had no picture item, only their captions.
+
+- *Patch* `6606929`:
+  `extract_text_with_positions_rects_and_forms_mem_with_invisible` returns
+  the runs, rectangles and lines of its sibling and, beside them, a
+  `PdfForm` per invocation: the resource name and the `/BBox` carried
+  through the form's `/Matrix` and the CTM at the call, page-level and
+  nested alike, clipped and rotated exactly as the rectangles are. The
+  sibling entry points return what they returned; the page walker gained a
+  `_with_forms` twin and the old name is a wrapper that drops the forms.
+- *Wired*: `SPAN_KIND_FORM` runs on the `spans` event, after the page's
+  runs, with the placeholder `[Form: name]` and the placed box; the runs
+  the renderer sees do not include them, so the markdown is unchanged.
+  The fold makes a picture of a form that is a region of the page and not
+  the page: not the wrapper a print-to-PDF producer draws the whole page
+  through, judged against the page size the metadata pass measured; not a
+  glyph or rule drawn as a form; not a form inside a form that already
+  counts; and not a form whose content is an image the page reports
+  already. The picture is placed in reading order, before the first
+  located block below it that shares its width.
+- *Tests*: `tests/pictures.rs`, over a fixture whose figure is a form of
+  paths and one label placed between two paragraphs, and over a page drawn
+  entirely through one form.
+
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page
 statistics, which are collapsed into one of four reason strings and several
@@ -310,18 +340,59 @@ the one to be careful with.
   need does reach this service now, so the job is no longer blocked; it is
   just still a job.
 - **Locating a block among its runs.** The fold matches a block of markdown
-  to the runs behind it by comparing letters and digits, forwards through
-  the page. A page whose renderer reorders runs — multi-column layouts
-  especially — can leave a block unlocated, and an unlocated block gets a
-  page-only provenance entry rather than a wrong box.
-- **Where a picture sits.** A picture is placed under whatever heading is
-  open when its page begins, because the image runs are folded before the
-  page's own blocks are read. Its box is exact; its position in the
-  hierarchy is reading order at page granularity.
-- **The furniture report.** It names runs the markdown does not contain, in
-  reading order. A run the renderer moved backwards past another reads as
-  dropped. The report is approximate on reordering pages and exact on
-  ordinary ones.
+  to the runs behind it by following its letters and digits from run to
+  run, so a paragraph whose lines the extractor interleaved with the
+  neighbouring column's is found as a chain rather than missed as a
+  stretch. A run is offered to one block only, from its unclaimed
+  beginning first, so two identical lines match their own runs and a
+  short label does not take letters out of a paragraph that contains the
+  same word. What still goes unlocated is a block whose letters the
+  rendering changed, or a chain the search could not finish inside its
+  budget, and an unlocated block gets a page-only provenance entry rather
+  than a wrong box.
+- **Blocks set side by side.** The renderer assembles a line from the runs
+  sharing a baseline, so a caption beside the prose wrapped around its
+  figure comes out of it as one block whose words alternate between the
+  two. The fold cuts such a block back onto the runs that drew each side
+  when a gutter no run crosses separates them and their lines alternate,
+  and each side keeps the renderer's own characters in the renderer's own
+  order. Two blocks whose lines never alternate, a marker beside the first
+  line of its item or a label beside a one-line value, stay one block, as
+  does anything the renderer assembled across a gutter narrower than six
+  points.
+- **Where a picture sits.** A picture is placed in reading order before the
+  first located block below it that shares its width, so a figure between
+  two paragraphs of its column stands between them. On a page whose blocks
+  could not be located, or below the last block of its column, it stands
+  at the end of the page. Its box is exact either way.
+- **Form XObjects as figures.** A form is a picture when it is a region of
+  the page and not the page's own wrapper, is no smaller than a figure,
+  sits inside no form that already counts, and holds no image the page
+  reports already. A text box drawn as a form passes those tests too, and
+  becomes a picture beside the text it holds, which still arrives as text.
+  With no page size to judge by, the largest form on a page stands.
+- **The furniture report.** The parser's own stripper is heard only on a
+  page's edge lines: the outermost lines set off by white space or by a
+  smaller face. A page whose body repeats page after page, a form printed
+  many times over or a sample of one page copied, is convicted whole by a
+  classifier that proves chrome by repetition, and the verdict on its body
+  is set aside. A same-face first line with no gap under it is body text,
+  whatever it says.
+- **Grids trimmed to their rules.** The line detector takes the nearest
+  rule above a grid as its top, and a page that underlines its title puts a
+  rule there, so the paragraph between the title and the table became the
+  table's first row. A leading or trailing row whose boundary lies beyond
+  every vertical rule of the grid, and whose cells are all but one empty,
+  is dropped and its runs go back to the page. A header populated across
+  its columns above an open-edged grid stays, because that is the shape
+  the detector accepts it for; a title row over a ruled grid with one cell
+  filled would stay too, and is not one this corpus has.
+- **Glued list markers.** A list set tight enough that the number and the
+  first word of an item came out of the extractor as one run is printed by
+  the renderer as the run had it, `2.minimize`, and the fold reads that as
+  a marker when the line before or after it carries one too. A single such
+  line is prose, which is what a version string or a sentence beginning
+  with a number is.
 - **Per-page rendering and document-wide stripping.** Markdown is rendered
   one page at a time, which is what keeps the stream a stream. The
   cross-page repetition classifier behind the header and footer stripper
