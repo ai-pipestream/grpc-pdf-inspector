@@ -3,7 +3,7 @@
 use super::fonts::descriptor_style_flags;
 use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_italic_font};
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, TextItem};
+use crate::types::{ItemType, PdfForm, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -12,7 +12,7 @@ use super::fonts::{
     extract_text_from_operand, get_font_file2_obj_num, get_operand_bytes, CMapDecisionCache,
     FontStyleCache,
 };
-use super::{get_number, image_bbox_from_ctm, multiply_matrices};
+use super::{apply_ctm_point, get_number, image_bbox_from_ctm, multiply_matrices};
 
 const MAX_FORM_XOBJECT_DEPTH: u8 = 5;
 
@@ -186,6 +186,9 @@ pub(crate) struct ExtractedText {
     pub(crate) items: Vec<TextItem>,
     pub(crate) rtl_visual_candidates: Vec<usize>,
     pub(crate) rtl_logical_ops: u32,
+    /// Where each Form XObject the walk entered was placed, this form
+    /// first and any it invoked after it.
+    pub(crate) forms: Vec<PdfForm>,
 }
 
 impl ExtractedText {
@@ -194,6 +197,7 @@ impl ExtractedText {
             items: Vec::new(),
             rtl_visual_candidates: Vec::new(),
             rtl_logical_ops: 0,
+            forms: Vec::new(),
         }
     }
 
@@ -206,11 +210,13 @@ impl ExtractedText {
         items: &mut Vec<TextItem>,
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_ops: &mut u32,
+        forms: &mut Vec<PdfForm>,
     ) {
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         *rtl_logical_ops += self.rtl_logical_ops;
         items.extend(self.items);
+        forms.extend(self.forms);
     }
 }
 
@@ -219,6 +225,7 @@ impl ExtractedText {
 pub(crate) fn extract_form_xobject_text(
     doc: &Document,
     form_id: ObjectId,
+    name: &str,
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
@@ -229,6 +236,7 @@ pub(crate) fn extract_form_xobject_text(
     extract_form_xobject_text_inner(
         doc,
         form_id,
+        name,
         page_num,
         font_cmaps,
         parent_ctm,
@@ -239,10 +247,39 @@ pub(crate) fn extract_form_xobject_text(
     )
 }
 
+/// The `/BBox` of a form dictionary as four numbers, when it carries one.
+fn form_bbox(dict: &lopdf::Dictionary) -> Option<[f32; 4]> {
+    let arr = dict.get(b"BBox").ok()?.as_array().ok()?;
+    if arr.len() < 4 {
+        return None;
+    }
+    let mut bbox = [0.0f32; 4];
+    for (slot, value) in bbox.iter_mut().zip(arr.iter()) {
+        *slot = get_number(value)?;
+    }
+    Some(bbox)
+}
+
+/// The page-space axis-aligned box of a form's `/BBox` under `ctm`.
+fn form_placement(bbox: &[f32; 4], ctm: &[f32; 6]) -> (f32, f32, f32, f32) {
+    let corners = [
+        apply_ctm_point(ctm, bbox[0], bbox[1]),
+        apply_ctm_point(ctm, bbox[2], bbox[1]),
+        apply_ctm_point(ctm, bbox[2], bbox[3]),
+        apply_ctm_point(ctm, bbox[0], bbox[3]),
+    ];
+    let x_min = corners.iter().map(|c| c.0).fold(f32::INFINITY, f32::min);
+    let x_max = corners.iter().map(|c| c.0).fold(f32::NEG_INFINITY, f32::max);
+    let y_min = corners.iter().map(|c| c.1).fold(f32::INFINITY, f32::min);
+    let y_max = corners.iter().map(|c| c.1).fold(f32::NEG_INFINITY, f32::max);
+    (x_min, y_min, x_max - x_min, y_max - y_min)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn extract_form_xobject_text_inner(
     doc: &Document,
     form_id: ObjectId,
+    name: &str,
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
@@ -279,6 +316,7 @@ fn extract_form_xobject_text_inner(
     let items = &mut extracted.items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
+    let forms = &mut extracted.forms;
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
@@ -361,6 +399,20 @@ fn extract_form_xobject_text_inner(
     };
     let base_ctm = multiply_matrices(&form_matrix, parent_ctm);
 
+    // Where this invocation placed the form. Recorded beside the text, and
+    // nothing in the walk depends on it.
+    if let Some(bbox) = form_bbox(&stream.dict) {
+        let (x, y, width, height) = form_placement(&bbox, &base_ctm);
+        forms.push(PdfForm {
+            name: name.to_string(),
+            x,
+            y,
+            width,
+            height,
+            page: page_num,
+        });
+    }
+
     // Process the content stream
     let mut current_font = String::new();
     let mut current_font_size: f32 = 12.0;
@@ -435,6 +487,7 @@ fn extract_form_xobject_text_inner(
                                     extract_form_xobject_text_inner(
                                         doc,
                                         *nested_id,
+                                        &xobj_name,
                                         page_num,
                                         font_cmaps,
                                         &ctm,
@@ -447,6 +500,7 @@ fn extract_form_xobject_text_inner(
                                         items,
                                         rtl_visual_candidates,
                                         rtl_logical_ops,
+                                        forms,
                                     );
                                 }
                             }
@@ -1052,6 +1106,7 @@ mod tests {
         extract_form_xobject_text(
             doc,
             form_id,
+            "Fm0",
             1,
             &FontCMaps::from_doc(doc),
             &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],

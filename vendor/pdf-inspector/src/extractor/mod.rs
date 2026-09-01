@@ -14,14 +14,14 @@ mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
-use crate::types::{PageExtraction, PdfLine, PdfRect, TextItem};
+use crate::types::{PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items;
+use content_stream::extract_page_text_items_with_forms;
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -186,6 +186,33 @@ pub fn extract_text_with_positions_and_rects_mem_with_invisible(
     Ok((extraction, skipped_invisible))
 }
 
+/// [`extract_text_with_positions_and_rects_mem_with_invisible`] with the
+/// Form XObject placements of the walk beside the runs.
+///
+/// For every `Do` of a form, page-level or nested, the form's `/BBox`
+/// carried through its `/Matrix` and the CTM in force, in page space. A
+/// vector figure included as a form draws no image XObject, so this is
+/// the only record of where it was drawn. The runs, rectangles and lines
+/// are exactly those of the sibling call.
+pub fn extract_text_with_positions_rects_and_forms_mem_with_invisible(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+    include_invisible: bool,
+) -> Result<(PageExtraction, Vec<PdfForm>, bool), PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
+    let (doc, _) = crate::load_document_from_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible) =
+        extract_positioned_text_impl_reporting_invisible(
+            &doc,
+            &font_cmaps,
+            page_filter,
+            include_invisible,
+            None,
+        )?;
+    Ok((extraction, forms, skipped_invisible))
+}
+
 /// [`extract_text_with_positions_mem_pages`] with the invisible layer under
 /// the caller's control, reporting what the walk did with it.
 ///
@@ -335,13 +362,15 @@ pub(crate) fn extract_positioned_text_from_doc_reporting_invisible(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, bool), PdfError> {
-    extract_positioned_text_impl_reporting_invisible(
-        doc,
-        font_cmaps,
-        page_filter,
-        include_invisible,
-        None,
-    )
+    let (extraction, _forms, thresholds, gid_pages, skipped_invisible) =
+        extract_positioned_text_impl_reporting_invisible(
+            doc,
+            font_cmaps,
+            page_filter,
+            include_invisible,
+            None,
+        )?;
+    Ok((extraction, thresholds, gid_pages, skipped_invisible))
 }
 
 fn extract_positioned_text_impl(
@@ -351,7 +380,7 @@ fn extract_positioned_text_impl(
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    let (extraction, thresholds, gid_pages, _skipped_invisible) =
+    let (extraction, _forms, thresholds, gid_pages, _skipped_invisible) =
         extract_positioned_text_impl_reporting_invisible(
             doc,
             font_cmaps,
@@ -368,11 +397,12 @@ fn extract_positioned_text_impl_reporting_invisible(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, bool), PdfError> {
+) -> Result<(PageExtraction, Vec<PdfForm>, PageThresholds, HashSet<u32>, bool), PdfError> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();
+    let mut all_forms = Vec::new();
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
     let mut skipped_invisible_anywhere = false;
@@ -390,7 +420,7 @@ fn extract_positioned_text_impl_reporting_invisible(
                 continue;
             }
         }
-        let page_result = extract_page_text_items(
+        let page_result = extract_page_text_items_with_forms(
             doc,
             page_id,
             *page_num,
@@ -399,8 +429,13 @@ fn extract_positioned_text_impl_reporting_invisible(
             &mut style_cache,
             &mut FormWalkBudget::new(),
         );
-        let ((mut items, mut rects, mut lines), has_gid_fonts, coords_rotated, skipped_invisible) =
-            match page_result {
+        let (
+            (mut items, mut rects, mut lines),
+            mut forms,
+            has_gid_fonts,
+            coords_rotated,
+            skipped_invisible,
+        ) = match page_result {
                 Ok(extraction) => extraction,
                 Err(error)
                     if required_pages.is_some_and(|required| !required.contains(page_num)) =>
@@ -475,6 +510,7 @@ fn extract_positioned_text_impl_reporting_invisible(
                             x0 < bx1 + TOL && x1 > bx0 - TOL && y0 < by1 + TOL && y1 > by0 - TOL
                         };
                         rects.retain(|r| overlaps(r.x, r.y, r.width, r.height));
+                        forms.retain(|f| overlaps(f.x, f.y, f.width, f.height));
                         clipped_box = Some((bx0, by0, bx1, by1));
                         lines.retain(|l| {
                             overlaps(
@@ -525,6 +561,7 @@ fn extract_positioned_text_impl_reporting_invisible(
         all_items.extend(items);
         all_rects.extend(rects);
         all_lines.extend(lines);
+        all_forms.extend(forms);
 
         // Extract hyperlinks from page annotations
         let mut links = extract_page_links(doc, page_id, *page_num);
@@ -550,6 +587,7 @@ fn extract_positioned_text_impl_reporting_invisible(
 
     Ok((
         (all_items, all_rects, all_lines),
+        all_forms,
         page_thresholds,
         gid_encoded_pages,
         skipped_invisible_anywhere,
@@ -642,7 +680,7 @@ pub(crate) fn is_text_layout_item(item: &crate::types::TextItem) -> bool {
 /// Map a (u, v) point in unit-square coordinates through the 6-element CTM
 /// to page-space. CTM format is `[a, b, c, d, e, f]` per
 /// [`multiply_matrices`].
-fn apply_ctm_point(ctm: &[f32; 6], u: f32, v: f32) -> (f32, f32) {
+pub(crate) fn apply_ctm_point(ctm: &[f32; 6], u: f32, v: f32) -> (f32, f32) {
     (
         u * ctm[0] + v * ctm[2] + ctm[4],
         u * ctm[1] + v * ctm[3] + ctm[5],

@@ -7,7 +7,7 @@ use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
 };
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, PageExtraction, PdfLine, PdfRect, TextItem};
+use crate::types::{ItemType, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::trace;
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -151,7 +151,33 @@ pub(crate) fn extract_page_text_items(
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
+    let (extraction, _forms, has_gid_fonts, coords_rotated, skipped_invisible) =
+        extract_page_text_items_with_forms(
+            doc,
+            page_id,
+            page_num,
+            font_cmaps,
+            include_invisible,
+            style_cache,
+            form_budget,
+        )?;
+    Ok((extraction, has_gid_fonts, coords_rotated, skipped_invisible))
+}
+
+/// [`extract_page_text_items`] with the Form XObject placements of the walk
+/// beside the extraction: every `Do` of a form, page-level and nested, as
+/// the page-space box its `/BBox` landed in.
+pub(crate) fn extract_page_text_items_with_forms(
+    doc: &Document,
+    page_id: ObjectId,
+    page_num: u32,
+    font_cmaps: &FontCMaps,
+    include_invisible: bool,
+    style_cache: &mut FontStyleCache,
+    form_budget: &mut FormWalkBudget,
+) -> Result<(PageExtraction, Vec<PdfForm>, bool, bool, bool), PdfError> {
     let mut items = Vec::new();
+    let mut forms: Vec<PdfForm> = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
     let mut clip_rects: Vec<PdfRect> = Vec::new();
     let mut lines: Vec<PdfLine> = Vec::new();
@@ -271,7 +297,13 @@ pub(crate) fn extract_page_text_items(
                 page_num,
                 super::content_decode::MAX_PAGE_OPERATIONS
             );
-            return Ok(((Vec::new(), Vec::new(), Vec::new()), false, false, false));
+            return Ok((
+                (Vec::new(), Vec::new(), Vec::new()),
+                Vec::new(),
+                false,
+                false,
+                false,
+            ));
         }
     };
 
@@ -1003,6 +1035,7 @@ pub(crate) fn extract_page_text_items(
                                     extract_form_xobject_text(
                                         doc,
                                         *form_id,
+                                        &xobj_name,
                                         page_num,
                                         font_cmaps,
                                         &ctm,
@@ -1014,6 +1047,7 @@ pub(crate) fn extract_page_text_items(
                                         &mut items,
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_ops,
+                                        &mut forms,
                                     );
                                 }
                             }
@@ -1436,6 +1470,14 @@ pub(crate) fn extract_page_text_items(
         correct_rotated_page(items, rects, lines, &rotation_votes);
     if coords_rotated {
         rotate_underline_graphics(&mut underline_rects, &mut underline_lines);
+        // Form placements follow the rectangles into the rotated frame.
+        for form in &mut forms {
+            let new_x = form.y;
+            let new_y = -(form.x + form.width.abs());
+            form.x = new_x;
+            form.y = new_y;
+            std::mem::swap(&mut form.width, &mut form.height);
+        }
     }
     super::underline::mark_underlined_items(
         &mut items,
@@ -1448,6 +1490,7 @@ pub(crate) fn extract_page_text_items(
     let items = super::merge_subscript_items(items);
     Ok((
         (items, rects, lines),
+        forms,
         has_gid_fonts,
         coords_rotated,
         skipped_invisible,

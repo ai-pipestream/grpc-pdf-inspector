@@ -42,6 +42,16 @@ The private APIs, and what each unblocks:
    by repetition across pages, so on the service's own calls it can prove
    nothing: the judgement had to be reachable over the whole document
    separately from the rendering, or be reinvented outside the parser.
+6. **Form XObject placements** (`src/extractor/xobjects.rs`,
+   `src/extractor/content_stream.rs`, `src/extractor/mod.rs`). The walker
+   entered every Form XObject to read its text and knew, at the `Do`, the
+   form's `/BBox` and the transformation in force, and reported neither. A
+   figure included from another PDF is a form of paths with no image in it,
+   so nothing said where it was drawn.
+   `extract_text_with_positions_rects_and_forms_mem_with_invisible` returns a
+   `PdfForm` per invocation beside the runs, rectangles and lines its sibling
+   returns; the sibling entry points and the page walker's old name return
+   exactly what they did.
 
 ## How the patches are kept auditable
 
