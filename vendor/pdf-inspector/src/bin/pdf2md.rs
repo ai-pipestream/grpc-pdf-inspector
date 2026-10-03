@@ -297,6 +297,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn items_json_uses_supplied_pdf_password() {
         let path = "tests/fixtures/encrypted-secret123.pdf";
 
