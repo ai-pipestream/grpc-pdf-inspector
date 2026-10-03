@@ -29,7 +29,7 @@ pdf-inspector = { path = "vendor/pdf-inspector" }
 # re-export the lopdf it parses with, so reading them means parsing the
 # buffer again here. That is what `emit_metadata` costs, and why it is
 # opt-in.
-lopdf = "0.44"
+lopdf = "0.45"
 prost = "0.14.4"
 # `google.protobuf.Value`, which the vendored document schema uses for the
 # `BaseMeta.custom_fields` escape hatch the Document fold writes into.
