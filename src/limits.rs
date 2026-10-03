@@ -60,6 +60,16 @@ pub const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 4096 * MIB;
 /// longest gRParse waits for this collector.
 pub const DEFAULT_MAX_PARSE_SECONDS: u64 = 300;
 
+/// Default wall-clock budget for one call's upload, from the moment it is
+/// admitted to a parse slot until its last frame: one minute.
+///
+/// The slot is taken before the upload is read, so the upload has a budget
+/// of its own, well inside the call's: without it, a client trickling a byte
+/// at a time could keep a slot for the whole parse budget without ever
+/// handing over a document. A minute carries the default upload cap at
+/// about 18 Mbit/s; a deployment fed over slower links raises it.
+pub const DEFAULT_MAX_UPLOAD_SECONDS: u64 = 60;
+
 /// Ceilings the process enforces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -75,6 +85,9 @@ pub struct Limits {
     pub max_decompressed_bytes: u64,
     /// Longest a call may hold its parse slot, upload included.
     pub max_parse_time: Duration,
+    /// Longest a call's upload may take once it holds its slot. The upload
+    /// also spends `max_parse_time`, so the shorter of the two ends it.
+    pub max_upload_time: Duration,
 }
 
 impl Default for Limits {
@@ -86,9 +99,29 @@ impl Default for Limits {
             max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
             max_decompressed_bytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
             max_parse_time: Duration::from_secs(DEFAULT_MAX_PARSE_SECONDS),
+            max_upload_time: Duration::from_secs(DEFAULT_MAX_UPLOAD_SECONDS),
         }
     }
 }
+
+/// A limit the environment set to a value the server will not run with.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct InvalidLimit {
+    /// The environment variable.
+    pub name: &'static str,
+    /// What it was set to.
+    pub value: String,
+    /// Why that cannot be used.
+    pub reason: &'static str,
+}
+
+impl std::fmt::Display for InvalidLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}={:?} {}", self.name, self.value, self.reason)
+    }
+}
+
+impl std::error::Error for InvalidLimit {}
 
 /// Read a `u64` environment variable, falling back to `default`.
 ///
@@ -96,10 +129,38 @@ impl Default for Limits {
 /// treated as "not set": no limit here has a meaningful zero, and silently
 /// running with an unbounded cap because of a typo is the failure mode worth
 /// designing out.
-fn env_u64(name: &str, default: u64) -> u64 {
-    match std::env::var(name).ok().and_then(|v| v.parse::<u64>().ok()) {
+fn env_u64(var: &impl Fn(&str) -> Option<String>, name: &str, default: u64) -> u64 {
+    match var(name).and_then(|v| v.parse::<u64>().ok()) {
         Some(0) | None => default,
         Some(value) => value,
+    }
+}
+
+/// Read a whole number of seconds that must be positive if it is set.
+///
+/// Stricter than [`env_u64`], because it is newer: no deployment depends on
+/// a typo here quietly meaning the default, so a value that does not parse,
+/// or a zero, stops the server instead.
+fn env_seconds(
+    var: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u64,
+) -> Result<u64, InvalidLimit> {
+    let Some(value) = var(name) else {
+        return Ok(default);
+    };
+    match value.trim().parse::<u64>() {
+        Ok(0) => Err(InvalidLimit {
+            name,
+            value,
+            reason: "must be at least one second",
+        }),
+        Ok(seconds) => Ok(seconds),
+        Err(_) => Err(InvalidLimit {
+            name,
+            value,
+            reason: "is not a whole number of seconds",
+        }),
     }
 }
 
@@ -108,27 +169,50 @@ impl Limits {
     /// falling back to the defaults above.
     ///
     /// See the README for the full list.
-    #[must_use]
-    pub fn from_env() -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidLimit`] when a variable is set to a value the server must
+    /// not start with, so a misconfigured process fails at startup rather
+    /// than running with a limit nobody asked for.
+    pub fn from_env() -> Result<Self, InvalidLimit> {
+        Self::from_vars(|name| std::env::var(name).ok())
+    }
+
+    /// [`Self::from_env`], reading each variable through `var` rather than
+    /// from the process environment.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_env`].
+    pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, InvalidLimit> {
         let defaults = Self::default();
-        Self {
-            max_document_bytes: env_u64("GRPC_PDF_MAX_BYTES", DEFAULT_MAX_DOCUMENT_BYTES),
-            max_chunk_bytes: env_u64("GRPC_PDF_MAX_CHUNK_BYTES", DEFAULT_MAX_CHUNK_BYTES),
+        Ok(Self {
+            max_document_bytes: env_u64(&var, "GRPC_PDF_MAX_BYTES", DEFAULT_MAX_DOCUMENT_BYTES),
+            max_chunk_bytes: env_u64(&var, "GRPC_PDF_MAX_CHUNK_BYTES", DEFAULT_MAX_CHUNK_BYTES),
             max_concurrent_parses: usize::try_from(env_u64(
+                &var,
                 "GRPC_PDF_MAX_CONCURRENT_PARSES",
                 defaults.max_concurrent_parses as u64,
             ))
             .unwrap_or(defaults.max_concurrent_parses),
-            max_stream_bytes: env_u64("GRPC_PDF_MAX_STREAM_BYTES", DEFAULT_MAX_STREAM_BYTES),
+            max_stream_bytes: env_u64(&var, "GRPC_PDF_MAX_STREAM_BYTES", DEFAULT_MAX_STREAM_BYTES),
             max_decompressed_bytes: env_u64(
+                &var,
                 "GRPC_PDF_MAX_DECOMPRESSED_BYTES",
                 DEFAULT_MAX_DECOMPRESSED_BYTES,
             ),
             max_parse_time: Duration::from_secs(env_u64(
+                &var,
                 "GRPC_PDF_MAX_PARSE_SECONDS",
                 DEFAULT_MAX_PARSE_SECONDS,
             )),
-        }
+            max_upload_time: Duration::from_secs(env_seconds(
+                &var,
+                "GRPC_PDF_MAX_UPLOAD_SECONDS",
+                DEFAULT_MAX_UPLOAD_SECONDS,
+            )?),
+        })
     }
 
     /// The decompression bounds one call parses under, as the parser's
@@ -169,5 +253,36 @@ mod tests {
         assert_eq!(limits.max_stream_bytes, 256 * MIB);
         assert_eq!(limits.max_decompressed_bytes, 4096 * MIB);
         assert_eq!(limits.max_parse_time, Duration::from_secs(300));
+        assert_eq!(limits.max_upload_time, Duration::from_secs(60));
+    }
+
+    /// Limits read from `vars` alone, as if they were the whole environment.
+    fn read(vars: &[(&str, &str)]) -> Result<Limits, InvalidLimit> {
+        Limits::from_vars(|name| {
+            vars.iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| (*value).to_owned())
+        })
+    }
+
+    #[test]
+    fn an_empty_environment_is_the_defaults() {
+        assert_eq!(read(&[]), Ok(Limits::default()));
+    }
+
+    #[test]
+    fn the_upload_budget_is_read_from_the_environment() {
+        let limits = read(&[("GRPC_PDF_MAX_UPLOAD_SECONDS", "15")]).expect("a valid budget");
+        assert_eq!(limits.max_upload_time, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn a_zero_or_unreadable_upload_budget_stops_startup() {
+        for value in ["0", "", "sixty", "-5", "1.5"] {
+            let error = read(&[("GRPC_PDF_MAX_UPLOAD_SECONDS", value)])
+                .expect_err("the server must not start with this");
+            assert_eq!(error.name, "GRPC_PDF_MAX_UPLOAD_SECONDS", "{value:?}");
+            assert_eq!(error.value, value);
+        }
     }
 }

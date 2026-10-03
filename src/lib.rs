@@ -38,7 +38,7 @@ pub mod spans;
 pub mod structure;
 pub mod tables;
 
-pub use limits::Limits;
+pub use limits::{InvalidLimit, Limits};
 pub use metrics::Metrics;
 pub use service::PdfGrpc;
 

@@ -851,9 +851,10 @@ pub struct ServerLimits {
     pub max_decompressed_bytes: u64,
     /// Longest, in seconds, one ParsePdf call may hold a parse slot, from the
     /// moment it is admitted to one until its trailer, upload included. Past
-    /// it the call fails with DEADLINE_EXCEEDED. A caller's own shorter
-    /// deadline ends the parse sooner: the server stops working as soon as the
-    /// caller cancels.
+    /// it the call fails with DEADLINE_EXCEEDED. The upload has a shorter
+    /// budget of its own inside this one, a minute by default, and also fails
+    /// with DEADLINE_EXCEEDED. A caller's own shorter deadline ends the parse
+    /// sooner: the server stops working as soon as the caller cancels.
     #[prost(uint64, tag="6")]
     pub max_parse_seconds: u64,
 }

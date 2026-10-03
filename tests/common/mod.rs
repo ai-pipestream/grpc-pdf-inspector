@@ -1822,13 +1822,19 @@ pub async fn start() -> Harness {
 
 /// Start a server on an ephemeral localhost port with the given limits.
 pub async fn start_with(limits: Limits) -> Harness {
+    start_with_service(|metrics| PdfGrpc::with_metrics(limits, metrics)).await
+}
+
+/// Start a server on an ephemeral localhost port, built by `build` around
+/// the counters the harness will report.
+pub async fn start_with_service(build: impl FnOnce(Arc<Metrics>) -> PdfGrpc) -> Harness {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local address");
 
     let metrics = Metrics::new();
-    let service = PdfGrpc::with_metrics(limits, Arc::clone(&metrics)).into_service();
+    let service = build(Arc::clone(&metrics)).into_service();
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)

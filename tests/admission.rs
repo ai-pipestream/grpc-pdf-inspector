@@ -13,8 +13,8 @@ mod common;
 
 use std::time::{Duration, Instant};
 
-use grpc_pdf_inspector::Limits;
 use grpc_pdf_inspector::proto::v1 as pb;
+use grpc_pdf_inspector::{Limits, PdfGrpc};
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Code;
@@ -57,6 +57,64 @@ fn open_unfinished_upload(
         Ok(())
     });
     (frames, call)
+}
+
+/// Open a call that sends its options and then `frame` once every `every`,
+/// `frames` times, before closing its upload. Returns the call's outcome and
+/// how long it took.
+async fn trickle(
+    harness: &common::Harness,
+    frame: impl Fn(usize) -> pb::ParsePdfRequest + Send + 'static,
+    every: Duration,
+    frames: usize,
+) -> (Result<(), tonic::Status>, Duration) {
+    let (sender, outbound) = mpsc::channel(4);
+    tokio::spawn(async move {
+        let options = pb::ParsePdfRequest {
+            frame: Some(pb::parse_pdf_request::Frame::Options(
+                pb::PdfOptions::default(),
+            )),
+        };
+        if sender.send(options).await.is_err() {
+            return;
+        }
+        for n in 0..frames {
+            tokio::time::sleep(every).await;
+            // The server ending the call drops the stream; stop with it.
+            if sender.send(frame(n)).await.is_err() {
+                return;
+            }
+        }
+    });
+    let started = Instant::now();
+    let mut client = harness.client.clone();
+    let outcome = async {
+        let mut stream = client
+            .parse_pdf(ReceiverStream::new(outbound))
+            .await?
+            .into_inner();
+        while stream.message().await?.is_some() {}
+        Ok(())
+    }
+    .await;
+    (outcome, started.elapsed())
+}
+
+/// A DETECT_ONLY call goes through, so the slot the test's call held is
+/// free again.
+async fn assert_the_slot_is_free(harness: &common::Harness) {
+    let pdf = common::text_pdf(2, 20, "slot-marker");
+    let events = harness
+        .parse(
+            &pdf,
+            pb::PdfOptions {
+                mode: pb::ProcessMode::DetectOnly.into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the next call is admitted");
+    assert_eq!(common::info(&events).page_count, 2);
 }
 
 #[tokio::test]
@@ -147,4 +205,74 @@ async fn an_upload_that_stalls_ends_at_the_calls_time_budget() {
         .await
         .expect("the next call is admitted");
     assert_eq!(common::info(&events).page_count, 2);
+}
+
+#[tokio::test]
+async fn an_upload_that_trickles_ends_at_its_own_budget() {
+    // The parse budget is the default five minutes; only the upload's own
+    // budget can end this call before the client finishes trickling.
+    let harness = common::start_with(Limits {
+        max_concurrent_parses: 1,
+        max_upload_time: Duration::from_secs(1),
+        ..Limits::default()
+    })
+    .await;
+
+    // A byte every 100 ms is never a stall, and the client would go on for
+    // five seconds and then close an upload that is not a PDF.
+    let (outcome, elapsed) = trickle(
+        &harness,
+        |_| pb::ParsePdfRequest {
+            frame: Some(pb::parse_pdf_request::Frame::Chunk(b"%".to_vec())),
+        },
+        Duration::from_millis(100),
+        50,
+    )
+    .await;
+    let status = outcome.expect_err("a trickled upload cannot hold the slot past its budget");
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(
+        status.message().contains("GRPC_PDF_MAX_UPLOAD_SECONDS"),
+        "{status:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(4),
+        "the trickled upload held its slot for {elapsed:?}"
+    );
+    assert_the_slot_is_free(&harness).await;
+}
+
+#[tokio::test]
+async fn frames_without_bytes_do_not_keep_an_upload_alive() {
+    let harness = common::start_with_service(|metrics| {
+        PdfGrpc::with_metrics(
+            Limits {
+                max_concurrent_parses: 1,
+                ..Limits::default()
+            },
+            metrics,
+        )
+        .with_upload_stall(Duration::from_millis(300))
+    })
+    .await;
+
+    // A frame every 50 ms, each either an empty chunk or no frame at all,
+    // for three seconds: never quiet for the stall window, and never a byte.
+    let (outcome, elapsed) = trickle(
+        &harness,
+        |n| pb::ParsePdfRequest {
+            frame: (n % 2 == 0).then(|| pb::parse_pdf_request::Frame::Chunk(Vec::new())),
+        },
+        Duration::from_millis(50),
+        60,
+    )
+    .await;
+    let status = outcome.expect_err("frames without bytes are not progress");
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+    assert!(status.message().contains("no upload bytes"), "{status:?}");
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the byteless upload held its slot for {elapsed:?}"
+    );
+    assert_the_slot_is_free(&harness).await;
 }
