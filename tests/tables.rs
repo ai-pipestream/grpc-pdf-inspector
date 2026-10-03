@@ -199,3 +199,52 @@ async fn the_fold_puts_the_grid_in_the_documents_tables_not_in_a_paragraph() {
         assert!(!text.contains('|'), "a table survived as prose: {text:?}");
     }
 }
+
+#[tokio::test]
+async fn a_pipe_block_is_never_given_another_detectors_grid() {
+    // The line detector reports the ruled grid and only it; the renderer
+    // prints the borderless table as pipes and the ruled one as prose. The
+    // fold used to hand the pipe block the ruled grid because it came
+    // first, which dropped the borderless table's cells and printed the
+    // ruled table's twice.
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::ruled_and_borderless_tables_pdf(),
+            pb::PdfOptions {
+                emit_document: true,
+                emit_tables: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    // The fixture is only interesting while the two detectors disagree.
+    let grids = common::tables(&events);
+    assert_eq!(grids.len(), 1);
+    assert_eq!(grids[0].tables.len(), 1, "only the ruled grid is detected");
+    let markdown = &common::pages(&events)[0].markdown;
+    assert!(markdown.contains("|Year|Engine|Cards|"), "{markdown:?}");
+
+    let document = common::documents(&events)[0];
+    let mut text: Vec<String> = common::placed(document)
+        .into_iter()
+        .map(|item| item.text)
+        .collect();
+    for table in &document.tables {
+        let data = table.data.as_ref().expect("a grid");
+        text.extend(data.table_cells.iter().map(|cell| cell.text.clone()));
+    }
+    let occurrences = |needle: &str| text.iter().filter(|text| text.contains(needle)).count();
+    assert_eq!(
+        occurrences("Analytical Engine"),
+        1,
+        "the ruled table is in the Document once: {text:?}"
+    );
+    assert!(
+        occurrences("Punched") >= 1,
+        "the borderless table is still in the Document: {text:?}"
+    );
+    common::assert_layers_and_parents_agree(document);
+}

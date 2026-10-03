@@ -572,6 +572,25 @@ pub fn table_pdf() -> Vec<u8> {
 /// the line-driven detector sees the grid the document actually drew.
 #[must_use]
 pub fn ruled_table_pdf() -> Vec<u8> {
+    ruled_table_page(false)
+}
+
+/// The ruled table's page with a borderless table of short aligned cells
+/// below it: the [`table_pdf`] grid, set lower on the page.
+///
+/// The two tables come out of different detectors. The rules make the line
+/// detector report the ruled grid, and only it, because a detector that
+/// finds a data table ends the search; the markdown renderer's own table
+/// finder misses the ruled table and prints the borderless one as pipe
+/// characters. Nothing pairs the pipe block with the ruled grid but their
+/// order on the page.
+#[must_use]
+pub fn ruled_and_borderless_tables_pdf() -> Vec<u8> {
+    ruled_table_page(true)
+}
+
+/// The ruled table's page, with or without the borderless table under it.
+fn ruled_table_page(with_borderless: bool) -> Vec<u8> {
     const LEFT: i32 = 72;
     const MIDDLE: i32 = 220;
     const RIGHT: i32 = 540;
@@ -633,6 +652,22 @@ pub fn ruled_table_pdf() -> Vec<u8> {
             "BT /F1 10 Tf {} {y} Td ({description}) Tj ET\n",
             MIDDLE + 6
         ));
+    }
+
+    if with_borderless {
+        const COLUMNS: [i32; 3] = [72, 240, 400];
+        const CELLS: [(&str, &str, &str); 4] = [
+            ("Year", "Engine", "Cards"),
+            ("1837", "Analytical", "Punched"),
+            ("1843", "Notes", "Woven"),
+            ("1854", "Difference", "None"),
+        ];
+        for (index, (first, second, third)) in CELLS.iter().enumerate() {
+            let y = 420 - 24 * i32::try_from(index).expect("four rows fit in an i32");
+            for (column, text) in COLUMNS.iter().zip([first, second, third]) {
+                content.push_str(&format!("BT /F1 11 Tf {column} {y} Td ({text}) Tj ET\n"));
+            }
+        }
     }
 
     let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));

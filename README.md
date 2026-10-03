@@ -153,7 +153,11 @@ collector's parse of the same document:
   from the markdown's ATX levels when it is not. Lists become `ListItem`s
   inside a list `GroupItem`, fenced blocks become `CodeItem`s, and a
   detected table becomes a `TableItem` with typed cells rather than pipe
-  characters inside a paragraph.
+  characters inside a paragraph. The grids and the pipe blocks come from
+  different detectors, so a pipe block takes the grid on its page that sits
+  where it sits (or, when its runs could not be located, whose cells it
+  carries); a grid no block matches stays on the `tables` event, and a
+  block no grid matches stays as the renderer printed it.
 - Every item carries a `ProvenanceItem` naming its page, with a bounding
   box whenever the page's runs could be located behind the item's text.
   `PageItem.unit` says those boxes are in points, and `PageItem.size`
