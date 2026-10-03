@@ -1795,6 +1795,7 @@ mod vector_grid_tests {
     /// text X-clustering in the cell-rect fallback previously split wide
     /// columns into ten spurious columns.
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn forecast_table_chart_six_cols() {
         use crate::extractor::content_stream::extract_page_text_items;
         use crate::tables::detect_tables_from_rects;
@@ -1885,6 +1886,7 @@ mod vector_grid_tests {
     /// table (TYPE / SIZE / SETBACKS) should survive. See pdf-evals PR #30
     /// for the original score regression that surfaced this.
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn accessory_building_rejects_prose_in_frame() {
         let tables = detect_rect_tables_in_fixture(
             "tests/fixtures/accessory_building_permit_prose_frame.pdf",
@@ -1912,6 +1914,7 @@ mod vector_grid_tests {
     }
 
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn td9264_insurance_prose_not_rect_table() {
         let tables = detect_rect_tables_in_fixture_page("tests/fixtures/td9264.pdf", 4);
         assert!(
@@ -1928,6 +1931,7 @@ mod vector_grid_tests {
     /// bands, but without a real rect-derived column scaffold they must not be
     /// accepted as a vector grid.
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn wireless_two_col_rejects_rect_grid() {
         let tables = detect_rect_tables_in_fixture("tests/fixtures/wireless_two_col_no_rects.pdf");
         assert!(
@@ -1941,6 +1945,7 @@ mod vector_grid_tests {
     }
 
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn wireless_two_col_region_rejects_vector_grid() {
         let buf = std::fs::read("tests/fixtures/wireless_two_col_no_rects.pdf").unwrap();
         let crops = [
@@ -1961,6 +1966,7 @@ mod vector_grid_tests {
     /// Wireless dense table regression: text-position columns alone are not
     /// enough evidence for a rect-derived grid.
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn wireless_dense_rejects_rect_grid() {
         let tables = detect_rect_tables_in_fixture("tests/fixtures/wireless_dense_no_rects.pdf");
         assert!(
@@ -1974,6 +1980,7 @@ mod vector_grid_tests {
     }
 
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn wireless_dense_region_rejects_vector_grid() {
         let buf = std::fs::read("tests/fixtures/wireless_dense_no_rects.pdf").unwrap();
         let crops = [
@@ -1991,6 +1998,7 @@ mod vector_grid_tests {
     }
 
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn multiline_indent_cell_rect_grid_fixture_detects_table() {
         let tables = detect_rect_tables_in_fixture_page(
             "tests/fixtures/multiline_indent_cell_rect_grid.pdf",
@@ -2017,6 +2025,7 @@ mod vector_grid_tests {
     }
 
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn multiline_indent_cell_rect_grid_region_detects_vector_grid() {
         let buf = std::fs::read("tests/fixtures/multiline_indent_cell_rect_grid.pdf").unwrap();
         let detected =
@@ -2045,6 +2054,7 @@ mod vector_grid_tests {
     /// removed from clustering before chart/table evidence is evaluated, or
     /// they swamp the real cell rectangles and make this table look chart-like.
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn greencomp_competence_two_cols() {
         let tables = detect_rect_tables_in_fixture("tests/fixtures/greencomp_competence.pdf");
         assert!(
@@ -2076,6 +2086,7 @@ mod vector_grid_tests {
     /// schema with shaded header). Currently `pdf2md` returns zero markdown
     /// table rows.
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn upstage_key_functions_four_cols() {
         let tables = detect_rect_tables_in_fixture("tests/fixtures/upstage_key_functions.pdf");
         assert!(
@@ -2110,6 +2121,7 @@ mod vector_grid_tests {
     /// the actual text items. This test asserts the detector keeps all 4
     /// columns and every column ends up populated.
     #[test]
+    #[ignore = "reads a tests/fixtures PDF, which the published crate does not ship"]
     fn wired_header_data_misalign_keeps_all_columns() {
         let tables = detect_rect_tables_in_fixture("tests/fixtures/wired_header_data_misalign.pdf");
         let table = tables

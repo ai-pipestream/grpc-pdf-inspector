@@ -78,6 +78,8 @@ reasons in `docs/capture-deferrals.md`.
   are now counted apart, an image page whose text is all invisible is a
   scan carrying an OCR layer (and its document is Mixed), and the per-page
   OCR list is built for text-based documents too, not only mixed ones.
+  Detection and extraction both keep the mode as graphics state: `BT` no
+  longer resets it, only `Tr` and `Q` change it.
 - **Decoding is bounded** (`src/guard.rs`, and every decoding call site).
   Every stream the crate decodes goes through the guard module, which holds
   it to a per-stream ceiling and a per-run budget, loads documents with the
@@ -97,6 +99,10 @@ exceptions, with their reasons there, and they bring their own tests beside
 the ones the crate shipped with. One more exception is listed there under
 "Vendored dependency moves": the lopdf dependency moved ahead of upstream at
 the owner's request, with the one call site the API change reached.
+
+The crate's unit tests run in CI on its own manifest and lock. The upstream
+tests that read `tests/fixtures` are marked `#[ignore]`, since the published
+crate does not ship that directory.
 
 The crate keeps its own style, its own formatting and its own lint posture.
 Files here are not reformatted to match the service.

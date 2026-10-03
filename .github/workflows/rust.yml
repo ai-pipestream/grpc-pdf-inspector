@@ -25,6 +25,10 @@ jobs:
         run: cargo build
       - name: Run tests
         run: cargo test
+      # The vendored parser crate is a separate package with its own lock,
+      # so the step above never runs its unit tests.
+      - name: Run the vendored crate's tests
+        run: cargo test --locked --manifest-path vendor/pdf-inspector/Cargo.toml
       - name: Install rustfmt, clippy
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         if: ${{ matrix.toolchain == 'stable' }}
