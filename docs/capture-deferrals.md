@@ -277,7 +277,9 @@ font, CMap and Form XObject streams without limit.
   loads and reports nothing, so a document whose object stream is a bomb
   loads without that stream's objects rather than failing; and lopdf's
   load-time decoding has no total budget of its own, only the per-stream
-  ceiling.
+  ceiling. Nor does loading check the deadline or the cancellation flag:
+  the first checkpoint is after it, so a document slow to load holds its
+  slot past its time and its caller until loading ends.
 
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page

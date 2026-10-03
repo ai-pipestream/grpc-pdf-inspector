@@ -211,7 +211,11 @@ before a failure remain valid. Every parser pass runs under those limits:
 each stream is decoded against the per-stream cap and the read's budget,
 and the parse checks its deadline, and whether its caller is still there,
 between pages, so a hung-up or overdue call gives its slot back within a
-page rather than at the end of the document.
+page rather than at the end of the document. That does not hold while the
+document is loading: lopdf decodes the cross-reference and object streams
+before the first page with no check of either, so a call whose document is
+slow to load keeps its slot until loading ends (see
+`docs/capture-deferrals.md`).
 
 Passwords: supply `options.password` for an encrypted PDF. The library's
 per-page extraction API takes no password, so FULL mode with a password
