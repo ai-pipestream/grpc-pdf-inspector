@@ -1462,6 +1462,46 @@ fn ocr_layer_reading(page: u32, reading: impl Fn(&str) -> String) -> String {
 /// such a page a scan and start calling it text.
 #[must_use]
 pub fn searchable_scan_pdf(pages: u32) -> Vec<u8> {
+    searchable_scan_with_layer(pages, ocr_layer)
+}
+
+/// The words of [`ocr_layer`], laid down by a producer that sets text
+/// rendering mode 3 once, before any text object, and then draws each line
+/// in a text object of its own.
+///
+/// The mode is graphics state, so `BT` does not reset it and every one of
+/// these lines is as invisible as in [`searchable_scan_pdf`]; only a reader
+/// that resets the mode at `BT` sees them.
+fn ocr_layer_with_mode_set_before_bt(page: u32) -> String {
+    let mut content = String::from("3 Tr\n");
+    for (row, line) in PROSE.iter().enumerate() {
+        let y = 700 - 14 * i32::try_from(row).expect("eight lines fit in an i32");
+        content.push_str("BT\n/F1 10 Tf\n");
+        let mut x = 72;
+        for word in line.split_whitespace() {
+            let word = word.replace(['(', ')'], "");
+            content.push_str(&format!("1 0 0 1 {x} {y} Tm ({word}) Tj\n"));
+            x += 6 * i32::try_from(word.len() + 1).expect("a word fits in an i32");
+        }
+        content.push_str("ET\n");
+    }
+    content.push_str(&format!(
+        "BT\n/F1 10 Tf\n1 0 0 1 72 100 Tm (Scanned page {page}) Tj\nET\n"
+    ));
+    content
+}
+
+/// Build a searchable scan like [`searchable_scan_pdf`] whose producer sets
+/// the invisible rendering mode before its text objects rather than inside
+/// them.
+#[must_use]
+pub fn searchable_scan_with_mode_before_bt_pdf(pages: u32) -> Vec<u8> {
+    searchable_scan_with_layer(pages, ocr_layer_with_mode_set_before_bt)
+}
+
+/// A searchable scan whose pages each draw a page-sized raster and then
+/// the OCR layer `layer` writes for the page number.
+fn searchable_scan_with_layer(pages: u32, layer: fn(u32) -> String) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -1474,7 +1514,7 @@ pub fn searchable_scan_pdf(pages: u32) -> Vec<u8> {
     for page in 1..=pages {
         let image_id = scan_image(&mut doc);
         let mut content = String::from("q 612 0 0 792 0 0 cm /Im1 Do Q\n");
-        content.push_str(&ocr_layer(page));
+        content.push_str(&layer(page));
         let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
         let page_id = doc.add_object(dictionary! {
             "Type" => "Page",

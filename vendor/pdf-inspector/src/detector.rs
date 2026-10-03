@@ -1427,8 +1427,9 @@ const INVISIBLE_RENDER_MODE: i32 = 3;
 /// - "'" - move to next line and show text
 /// - "\"" - set word/char spacing, move to next line, show text
 ///
-/// It also follows the text rendering mode (`Tr`), with the extractor's own
-/// rules: `BT` resets it, `q` saves it and `Q` restores it. A show operator
+/// It also follows the text rendering mode (`Tr`) as the graphics-state
+/// parameter it is (ISO 32000-1, 9.3.1): `BT` and `ET` leave it alone, `q`
+/// saves it and `Q` restores it, the rules the extractor keeps. A show operator
 /// drawn in mode 3 paints nothing, so it is counted as invisible text and
 /// its characters are not collected: a scan carrying an OCR layer has
 /// hundreds of them per page, and counting them as a text layer is how such
@@ -1519,16 +1520,10 @@ fn scan_content_stream(
             }
         }
 
-        // The rendering mode's scope, as the extractor keeps it: BT starts
-        // every text object visible, q saves the mode and Q restores it.
-        if b == b'B'
-            && i + 1 < content.len()
-            && content[i + 1] == b'T'
-            && is_word_start(i)
-            && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace())
-        {
-            render_mode = 0;
-        } else if b == b'q' && is_word_start(i) && is_word_end(i) {
+        // The rendering mode's scope, as the extractor keeps it: q saves
+        // the mode and Q restores it. BT does not touch it, so a scan whose
+        // producer sets `3 Tr` before its text objects stays invisible.
+        if b == b'q' && is_word_start(i) && is_word_end(i) {
             if saved_render_modes.len() < MAX_SAVED_RENDER_MODES {
                 saved_render_modes.push(render_mode);
             } else {
@@ -2174,15 +2169,29 @@ mod tests {
 
     #[test]
     fn the_rendering_mode_is_scoped_as_the_extractor_scopes_it() {
-        // BT starts every text object visible; q saves the mode and Q
+        // Tr is graphics state: BT and ET leave it alone, q saves it and Q
         // restores it.
         let mut uchars = HashSet::new();
         let content = b"BT 3 Tr (one) Tj ET\n\
                         BT (two) Tj ET\n\
-                        BT 3 Tr q 0 Tr (three) Tj Q (four) Tj ET";
+                        BT 0 Tr 3 Tr q 0 Tr (three) Tj Q (four) Tj ET\n\
+                        q 0 Tr BT (five) Tj ET Q BT (six) Tj ET";
         let scan = scan_content_stream(content, &mut uchars, &mut HashSet::new());
-        assert_eq!(scan.text_ops, 2, "two and three are drawn visibly");
-        assert_eq!(scan.invisible_text_ops, 2, "one and four are not");
+        assert_eq!(scan.text_ops, 2, "three and five are drawn visibly");
+        assert_eq!(scan.invisible_text_ops, 4, "one, two, four and six are not");
+    }
+
+    #[test]
+    fn a_rendering_mode_set_before_bt_holds_inside_it() {
+        // A producer that sets the mode once, ahead of its text objects:
+        // every show operator after it is invisible.
+        let mut uchars = HashSet::new();
+        let content = b"q 612 0 0 792 0 0 cm /Im1 Do Q\n3 Tr\n\
+                        BT /F1 10 Tf (Invoice) Tj ET\nBT (Total) Tj ET";
+        let scan = scan_content_stream(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(scan.text_ops, 0);
+        assert_eq!(scan.invisible_text_ops, 2);
+        assert!(uchars.is_empty(), "{uchars:?}");
     }
 
     #[test]

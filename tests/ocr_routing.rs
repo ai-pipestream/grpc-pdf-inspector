@@ -68,6 +68,62 @@ async fn a_searchable_scan_is_not_text_based_and_every_page_needs_ocr() {
 }
 
 #[tokio::test]
+async fn a_rendering_mode_set_before_bt_still_hides_the_ocr_layer() {
+    // The text rendering mode is graphics state, so a producer that sets
+    // `3 Tr` once, ahead of its text objects, draws every one of them
+    // invisibly. Resetting the mode at each `BT` read this scan as text.
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::searchable_scan_with_mode_before_bt_pdf(3),
+            detect_only(),
+        )
+        .await
+        .expect("the fixture should parse");
+
+    let info = common::info(&events);
+    assert_eq!(
+        info.pdf_type(),
+        pb::PdfType::Mixed,
+        "no glyph on any page is visible: {info:?}"
+    );
+    assert_eq!(info.pages_needing_ocr, [1, 2, 3]);
+    for page in 1..=3 {
+        assert_eq!(
+            info_reasons(info, page),
+            [pb::OcrReason::Scanned],
+            "page {page}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_layer_hidden_before_bt_is_flagged_as_invisible_on_extraction() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::searchable_scan_with_mode_before_bt_pdf(2),
+            pb::PdfOptions {
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    for page in common::pages(&events) {
+        assert!(page.needs_ocr, "page {} is a scan", page.page_no);
+        assert_eq!(page.ocr_reason(), pb::OcrReason::Scanned);
+    }
+    let status = common::status(&events);
+    assert!(
+        status.has_invisible_text,
+        "the extractor read the layer as invisible: {status:?}"
+    );
+    assert_eq!(trailer_pages(status), [1, 2]);
+}
+
+#[tokio::test]
 async fn a_scanned_page_the_sample_never_reached_is_still_named() {
     // Twenty pages sample as 1, 3, 5, 7, 9, 11, 13 and 20, so the scans on
     // 16 and 17 are outside the sample and the document reads as text.

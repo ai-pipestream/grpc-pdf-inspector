@@ -414,11 +414,14 @@ pub(crate) fn extract_page_text_items_with_forms(
                 }
             }
             "BT" => {
-                // Begin text block
+                // Begin text block. Only the text and line matrices start
+                // over: the rendering mode is part of the graphics state
+                // (ISO 32000-1, 9.3.1 and 8.4.1), so a `3 Tr` set before
+                // `BT`, or in an earlier text object, still holds here
+                // until `Tr` or `Q` changes it.
                 in_text_block = true;
                 text_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
                 line_matrix = [1.0, 0.0, 0.0, 1.0, 0.0, 0.0];
-                text_rendering_mode = 0;
             }
             "ET" => {
                 // End text block
@@ -1701,6 +1704,42 @@ mod tests {
         )
         .unwrap();
         items
+    }
+
+    fn item_texts(content: &[u8]) -> Vec<String> {
+        extract_simple_items(content)
+            .into_iter()
+            .map(|item| item.text)
+            .collect()
+    }
+
+    #[test]
+    fn the_rendering_mode_outlives_bt_and_et() {
+        // Tr is graphics state: BT does not reset it, so a mode set before
+        // the text object, or in an earlier one, is still in force.
+        assert!(
+            item_texts(b"3 Tr BT /F1 12 Tf 1 0 0 1 100 700 Tm (hidden) Tj ET").is_empty(),
+            "a mode set before BT applies inside it"
+        );
+        assert!(
+            item_texts(b"BT 3 Tr ET BT /F1 12 Tf 1 0 0 1 100 700 Tm (hidden) Tj ET").is_empty(),
+            "a mode set in one text object applies in the next"
+        );
+    }
+
+    #[test]
+    fn the_graphics_state_stack_scopes_the_rendering_mode() {
+        let texts = item_texts(
+            b"q 3 Tr Q BT /F1 12 Tf 1 0 0 1 100 700 Tm (shown) Tj ET\n\
+              3 Tr q 0 Tr BT /F1 12 Tf 1 0 0 1 100 650 Tm (drawn) Tj ET Q\n\
+              BT /F1 12 Tf 1 0 0 1 100 600 Tm (restored) Tj ET",
+        );
+        assert!(texts.iter().any(|text| text == "shown"), "{texts:?}");
+        assert!(texts.iter().any(|text| text == "drawn"), "{texts:?}");
+        assert!(
+            !texts.iter().any(|text| text == "restored"),
+            "Q brings back the invisible mode saved by q: {texts:?}"
+        );
     }
 
     #[test]
