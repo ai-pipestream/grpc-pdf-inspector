@@ -10,6 +10,13 @@ pub struct PdfOptions {
     /// rejected with INVALID_ARGUMENT. Detection always covers the whole
     /// document; this selects which pages are analyzed or extracted.
     ///
+    /// A page listed twice is processed once, in the place it was first
+    /// listed. A page past the end of the document is left out and the
+    /// trailer carries PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE; a list in which
+    /// no page exists fails with INVALID_ARGUMENT rather than succeeding with
+    /// nothing. For a span of pages, prefer `first_page` and `last_page`:
+    /// they cost two numbers however long the span is.
+    ///
     /// Note the indexing: PDF page numbers on this wire are 1-indexed, as
     /// they are in every viewer. (The underlying library's per-page
     /// extraction API is 0-indexed; the server converts.)
@@ -115,12 +122,33 @@ pub struct PdfOptions {
     /// about. Setting this streams those runs with their boxes, beside the
     /// visible ones rather than inside them.
     ///
+    /// One case is different. A page that draws no visible text at all, and
+    /// whose invisible layer is real text, is a scan made searchable, and that
+    /// layer is the only text the page has. It becomes the page's markdown, as
+    /// the parser's own OCR-layer fallback reads it, the page is flagged with
+    /// `needs_ocr` and OCR_REASON_SCANNED, and its runs are not repeated on
+    /// `invisible`.
+    ///
     /// `ParseStatus.has_invisible_text` says whether there was any at all, in
     /// every FULL call and at no cost. This flag is what turns the runs
     /// themselves on, and it costs a second walk of the content streams,
     /// taken only for a document that actually drew invisible text.
     #[prost(bool, tag="10")]
     pub report_invisible: bool,
+    /// The first page of an inclusive span of pages to process, 1-indexed.
+    /// Absent means the first page. Setting it, or `last_page`, selects the
+    /// span instead of `pages`, and setting both a span and `pages` is
+    /// INVALID_ARGUMENT, as are page 0 and a span that ends before it starts.
+    /// A span that starts past the end of the document selects no page and
+    /// fails with INVALID_ARGUMENT.
+    #[prost(uint32, optional, tag="11")]
+    pub first_page: ::core::option::Option<u32>,
+    /// The last page of the span, inclusive. Absent means the last page of
+    /// the document, and so does any value past it: a span is clamped to the
+    /// document without a warning, so "from page 5 to the end" is
+    /// `first_page: 5` and nothing else.
+    #[prost(uint32, optional, tag="12")]
+    pub last_page: ::core::option::Option<u32>,
 }
 /// TableCells is one row of a detected table.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -313,7 +341,12 @@ pub struct PdfInfo {
     pub title: ::prost::alloc::string::String,
     /// 1-indexed pages whose text layer is unusable and which therefore need
     /// OCR. Empty for a fully text-based document. In FULL mode these pages
-    /// still get a `page` event, with empty markdown.
+    /// still get a `page` event, with empty markdown, or with the page's OCR
+    /// layer when it carries one.
+    ///
+    /// Every page is judged on its own content, whatever the classification:
+    /// a scanned page inside a text-based document is named here even when
+    /// the sampling that classified the document never looked at it.
     #[prost(uint32, repeated, tag="5")]
     pub pages_needing_ocr: ::prost::alloc::vec::Vec<u32>,
     /// Why each of those pages needs OCR, when the cause is known.
@@ -323,6 +356,15 @@ pub struct PdfInfo {
     /// that the cheap answer stayed cheap.
     #[prost(uint64, tag="7")]
     pub detection_time_ms: u64,
+    /// True when detection judged that OCR would read this document better
+    /// than its own text layer does: images carry essential context (a
+    /// template, a scan, a scan's OCR layer), or the pages are a dense
+    /// newspaper layout whose reading order the text layer cannot be trusted
+    /// to keep. It can be true for a TEXT_BASED document with no page named
+    /// in `pages_needing_ocr`, which is the newspaper case: every page has a
+    /// usable text layer, and reading it in order is the hard part.
+    #[prost(bool, tag="8")]
+    pub ocr_recommended: bool,
 }
 /// PageMarkdown is one extracted page, in requested page order.
 ///
@@ -336,17 +378,21 @@ pub struct PageMarkdown {
     /// whole-document fallback.
     #[prost(uint32, tag="1")]
     pub page_no: u32,
-    /// The page's text layer as markdown. Empty when the page needs OCR.
+    /// The page's text layer as markdown. Empty when the page has none. A
+    /// scanned page that carries an invisible OCR layer and no visible text
+    /// has that layer here, and sets `needs_ocr`.
     #[prost(string, tag="2")]
     pub markdown: ::prost::alloc::string::String,
-    /// True when this page's own text layer is unreliable, as judged by the
-    /// pass that read it rather than by the sampling detection on `info`.
+    /// True when this page's own text layer is unreliable or missing, as
+    /// judged by the pass that read it rather than by the sampling detection
+    /// on `info`.
     ///
     /// The two can disagree, and the disagreement is the point: detection
     /// samples pages and answers about the document, while this answers about
     /// this page after its glyphs were actually decoded. A page that decoded
     /// to mojibake shows up here even when the document as a whole looked
-    /// fine.
+    /// fine, and so does a page that drew a picture and no text at all, and a
+    /// scanned page whose only text is its invisible OCR layer.
     #[prost(bool, tag="3")]
     pub needs_ocr: bool,
     /// Why, when the cause is known. UNSPECIFIED when `needs_ocr` is false.
@@ -383,9 +429,12 @@ pub struct PageMarkdown {
     /// unfilled labels.
     ///
     /// Empty unless `PdfOptions.report_invisible` was set, and empty then too
-    /// for a page that drew none. These runs are never in `markdown`, because
+    /// for a page that drew none. These runs are not in `markdown`, because
     /// they are not content a reader saw, and they carry their boxes, so a
-    /// consumer can say where on the page the hidden text sits.
+    /// consumer can say where on the page the hidden text sits. The exception
+    /// is a scan's OCR layer on a page with no visible text, which is the
+    /// page's markdown and is not repeated here (see
+    /// `PdfOptions.report_invisible`).
     #[prost(message, repeated, tag="7")]
     pub invisible: ::prost::alloc::vec::Vec<TextSpan>,
     /// How far this page's letter frequencies sit from natural language, 0.0
@@ -716,8 +765,9 @@ pub struct ParseWarning {
 /// positions, after `info` has already gone out.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParseStatus {
-    /// How many `page` events were emitted. Equals the number of requested
-    /// pages on a complete FULL stream; zero in DETECT_ONLY and ANALYZE.
+    /// How many `page` events were emitted. Equals the number of selected
+    /// pages that exist, each counted once, on a complete FULL stream; zero
+    /// in DETECT_ONLY and ANALYZE.
     #[prost(uint32, tag="1")]
     pub pages_extracted: u32,
     /// Non-fatal observations, in the order they occurred.
@@ -730,6 +780,11 @@ pub struct ParseStatus {
     /// True when broken font encodings were detected in the text layer
     /// (garbled text, replacement characters). Extraction output should not
     /// be trusted; route to OCR. Meaningful in ANALYZE and FULL only.
+    ///
+    /// A scanned page's OCR layer is an OCR engine's reading, not a
+    /// font-encoded text layer, so its misreadings do not set this: that
+    /// page is flagged `needs_ocr` on its own, and the document's other pages
+    /// keep their verdicts.
     #[prost(bool, tag="4")]
     pub has_encoding_issues: bool,
     /// Wall-clock milliseconds for the whole call, classification included.
@@ -737,14 +792,23 @@ pub struct ParseStatus {
     pub processing_time_ms: u64,
     /// Per-page OCR reasons from the pass that read the text layer, as
     /// distinct from `PdfInfo.ocr_reasons`, which comes from the sampling
-    /// detection. Populated in ANALYZE and FULL.
+    /// detection. Populated in ANALYZE and FULL, for the selected pages only:
+    /// `PdfInfo` is about the whole document, this is about the pages read.
+    ///
+    /// In FULL this names every extracted page that needs OCR: the pages
+    /// detection named, pages whose text decoded to mojibake, pages that drew
+    /// a picture and no text at all (OCR_REASON_SCANNED, or OCR_REASON_NO_TEXT
+    /// for a page drawn only through Form XObjects), and scanned pages whose
+    /// OCR layer became their markdown (OCR_REASON_SCANNED).
     ///
     /// `has_encoding_issues` above is these reasons collapsed to one boolean;
     /// it stays for callers that only want the routing bit.
     #[prost(message, repeated, tag="6")]
     pub extraction_ocr_reasons: ::prost::alloc::vec::Vec<PageOcrReasons>,
     /// True when some extracted page drew text with rendering mode 3, which
-    /// paints no glyphs and therefore never reaches the markdown.
+    /// paints no glyphs: a layer the markdown leaves out, or a scanned page's
+    /// OCR layer, which the markdown carries only for a page with no visible
+    /// text and which flags that page `needs_ocr`.
     ///
     /// Reported in FULL for text-bearing documents whether or not
     /// `PdfOptions.report_invisible` was set, because it is what the
@@ -766,11 +830,33 @@ pub struct ServerLimits {
     /// stream. A larger upload is legal; split it across more frames.
     #[prost(uint64, tag="2")]
     pub max_chunk_bytes: u64,
-    /// How many ParsePdf calls may run concurrently. Further calls wait
-    /// rather than being refused, because the bound exists to cap CPU and
-    /// heap, not to shed load.
+    /// How many ParsePdf calls may run concurrently, uploading or parsing.
+    /// Further calls wait rather than being refused, because the bound exists
+    /// to cap CPU and heap, not to shed load, and a waiting call's upload is
+    /// not read until it has a slot, so waiting holds no upload in memory.
     #[prost(uint32, tag="3")]
     pub max_concurrent_parses: u32,
+    /// Largest size, in bytes, any one stream of a document may decompress
+    /// to: a content, font, CMap, Form XObject, object or cross-reference
+    /// stream. A page's content streams share it. A document with a stream
+    /// past it fails with RESOURCE_EXHAUSTED rather than taking the server's
+    /// memory with it.
+    #[prost(uint64, tag="4")]
+    pub max_stream_bytes: u64,
+    /// Largest total, in bytes, one read of a document may decompress, summed
+    /// over every stream that read decodes. A FULL call reads the document
+    /// more than once and each read has its own budget. Past it the call fails
+    /// with RESOURCE_EXHAUSTED.
+    #[prost(uint64, tag="5")]
+    pub max_decompressed_bytes: u64,
+    /// Longest, in seconds, one ParsePdf call may hold a parse slot, from the
+    /// moment it is admitted to one until its trailer, upload included. Past
+    /// it the call fails with DEADLINE_EXCEEDED. The upload has a shorter
+    /// budget of its own inside this one, a minute by default, and also fails
+    /// with DEADLINE_EXCEEDED. A caller's own shorter deadline ends the parse
+    /// sooner: the server stops working as soon as the caller cancels.
+    #[prost(uint64, tag="6")]
+    pub max_parse_seconds: u64,
 }
 /// ProcessMode selects how far the pipeline runs for one call.
 ///
@@ -925,6 +1011,10 @@ pub enum PdfType {
     ImageBased = 3,
     /// Some pages have text, some are image-heavy. Text pages extract
     /// normally; `pages_needing_ocr` names the rest.
+    ///
+    /// A scan whose pages carry an invisible OCR layer is MIXED too: the layer
+    /// is text that extraction recovers, and every such page is named as
+    /// needing OCR, because no reader sees that text.
     Mixed = 4,
 }
 impl PdfType {
@@ -1286,6 +1376,9 @@ pub enum ParseWarningCode {
     /// read, so no `metadata` event was sent. The text extraction is
     /// unaffected: this reports a gap, not a failure.
     MetadataUnavailable = 2,
+    /// Some pages listed in `PdfOptions.pages` are past the end of the
+    /// document. They were left out; the pages that exist were processed.
+    PagesOutOfRange = 3,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1297,6 +1390,7 @@ impl ParseWarningCode {
             Self::Unspecified => "PARSE_WARNING_CODE_UNSPECIFIED",
             Self::PasswordFallback => "PARSE_WARNING_CODE_PASSWORD_FALLBACK",
             Self::MetadataUnavailable => "PARSE_WARNING_CODE_METADATA_UNAVAILABLE",
+            Self::PagesOutOfRange => "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1305,6 +1399,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_UNSPECIFIED" => Some(Self::Unspecified),
             "PARSE_WARNING_CODE_PASSWORD_FALLBACK" => Some(Self::PasswordFallback),
             "PARSE_WARNING_CODE_METADATA_UNAVAILABLE" => Some(Self::MetadataUnavailable),
+            "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE" => Some(Self::PagesOutOfRange),
             _ => None,
         }
     }

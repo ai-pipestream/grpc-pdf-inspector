@@ -385,3 +385,49 @@ async fn an_internal_link_anchors_its_text_to_the_page_it_leads_to() {
         "the run points at the page the annotation leads to"
     );
 }
+
+#[tokio::test]
+async fn an_xmp_packet_that_inflates_past_the_stream_limit_is_left_out() {
+    // The fixture with its XMP packet swapped for one that inflates to
+    // eight mebibytes from a few kilobytes.
+    let mut document = lopdf::Document::load_mem(&common::metadata_pdf()).expect("the fixture");
+    let metadata_id = document
+        .catalog()
+        .expect("a catalog")
+        .get(b"Metadata")
+        .and_then(lopdf::Object::as_reference)
+        .expect("an XMP packet");
+    let mut packet = b"<?xpacket begin=\"\"?>".to_vec();
+    packet.resize(8 * 1024 * 1024, b' ');
+    let mut bomb = lopdf::Stream::new(
+        lopdf::dictionary! { "Type" => "Metadata", "Subtype" => "XML" },
+        packet,
+    );
+    bomb.compress().expect("compress the packet");
+    document
+        .objects
+        .insert(metadata_id, lopdf::Object::Stream(bomb));
+    let mut pdf = Vec::new();
+    document.save_to(&mut pdf).expect("serialize");
+
+    let harness = common::start_with(grpc_pdf_inspector::Limits {
+        max_stream_bytes: 1024 * 1024,
+        ..Default::default()
+    })
+    .await;
+    let events = harness
+        .parse(&pdf, metadata_only())
+        .await
+        .expect("a bomb in the metadata is a gap in the metadata, not a failed parse");
+    let metadata = common::metadata(&events);
+    assert!(
+        metadata.xmp_packet.is_empty(),
+        "{} bytes of packet were read",
+        metadata.xmp_packet.len()
+    );
+    assert_eq!(
+        metadata.info.as_ref().expect("an info").title,
+        "The Analytical Engine",
+        "and the rest of the metadata is unaffected"
+    );
+}

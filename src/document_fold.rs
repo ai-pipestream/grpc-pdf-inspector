@@ -17,10 +17,13 @@
 //! - **Structure is markdown-derived.** The `page` events carry markdown,
 //!   and that markdown is all the fold parses: ATX headings (`#` through
 //!   `####`) become section headers with their level, blank-line-separated
-//!   blocks become paragraphs. Lists, emphasis and tables inside a block
-//!   stay as their markdown source in `text`; the extraction markdown has
-//!   already flattened the layout, so there is little more to recover, and
-//!   parsing deeper would pretend to structure the source does not have.
+//!   blocks become paragraphs, `-` and `1.` items become `ListItem`s inside
+//!   a list group, fenced blocks become `CodeItem`s, and a pipe-syntax
+//!   block becomes a `TableItem` when a detected grid on its page is the
+//!   same table. Emphasis comes off the text onto `InlineSpan.formatting`.
+//!   Beyond that the extraction markdown has already flattened the layout,
+//!   and parsing deeper would pretend to structure the source does not
+//!   have.
 //! - **Pages are measured when the file was asked about itself.** `pages`
 //!   carries one `PageItem` per page the `info` event reported, with
 //!   `page_no` and `unit` always set and `size` set from the page's own
@@ -44,7 +47,9 @@
 //!   hangs off the same group under `CONTENT_LAYER_INVISIBLE`, with the
 //!   box the content stream put it at, so a hidden watermark or an OCR
 //!   layer behind a scan becomes an item a coordinator can act on instead
-//!   of text that was simply never mentioned.
+//!   of text that was simply never mentioned. The exception is a scanned
+//!   page with no visible text at all: its OCR layer is that page's
+//!   markdown, so it is the body, and the page's quality recommends OCR.
 //! - **Metadata is the file's own.** `source_meta`, `outline`,
 //!   `attachments` and `anchors` come from the document's dictionaries
 //!   rather than from its text — an authored outline is better evidence of
@@ -136,11 +141,18 @@ pub struct DocumentFold {
     /// tagged and the stream carried them. Held like `runs`: the
     /// `structure` event arrives before the page it describes.
     structure: Option<pb::PageStructure>,
-    /// The grids found on the page being folded, in reverse reading order
-    /// so the next one is the last one. Each pipe-syntax block in the
-    /// page's markdown takes one: both sequences are in reading order, so
-    /// the nth flattened table is the nth detected grid.
-    detected_tables: Vec<pb::TableRegion>,
+    /// The grids found on the page being folded, not yet claimed by a
+    /// pipe-syntax block of its markdown.
+    ///
+    /// The grids and the pipe blocks come from different detectors: the
+    /// grids from the rule, line and alignment cascade, the pipe blocks
+    /// from the markdown renderer's own table finder. So a block claims the
+    /// grid that sits where it sits, or whose cells it carries, rather than
+    /// the next one in order, and either side can be left over: a ruled
+    /// table the renderer printed as prose, or a pipe block no grid
+    /// matches. Cleared after each page, so no page claims another page's
+    /// grid.
+    detected_tables: Option<pb::PageTables>,
     /// The list currently being accumulated: whether its markers count, and
     /// the self ref of the group its items hang off.
     open_list: Option<(bool, String)>,
@@ -187,7 +199,7 @@ impl DocumentFold {
             runs: None,
             internal_links: HashMap::new(),
             structure: None,
-            detected_tables: Vec::new(),
+            detected_tables: None,
             open_list: None,
         }
     }
@@ -206,9 +218,7 @@ impl DocumentFold {
             Event::Info(info) => self.on_info(info),
             Event::Metadata(metadata) => self.on_metadata(metadata),
             Event::Structure(structure) => self.structure = Some(structure.clone()),
-            Event::Tables(tables) => {
-                self.detected_tables = tables.tables.iter().rev().cloned().collect();
-            }
+            Event::Tables(tables) => self.detected_tables = Some(tables.clone()),
             Event::Spans(spans) => {
                 let internal = self
                     .internal_links
@@ -229,7 +239,7 @@ impl DocumentFold {
     pub fn take(&mut self) -> doc::Document {
         self.runs = None;
         self.structure = None;
-        self.detected_tables.clear();
+        self.detected_tables = None;
         self.open_list = None;
         self.internal_links.clear();
         std::mem::replace(&mut self.document, Self::new().document)
@@ -537,8 +547,10 @@ impl DocumentFold {
             self.close_list();
             self.push_prose(&text, page.page_no, None, located);
         }
-        // A page ends whatever it was in the middle of.
+        // A page ends whatever it was in the middle of, and its grids are
+        // of no use to any other page.
         self.close_list();
+        self.detected_tables = None;
     }
 
     /// Where a run sits among the page's runs, when the page's runs
@@ -812,12 +824,22 @@ impl DocumentFold {
     /// Fold one flattened table back into a grid.
     ///
     /// The detector found the grid; the renderer printed pipe characters;
-    /// this puts the grid back. When no grid was detected for this block —
-    /// because the caller's stream carried none — the pipe characters are
-    /// kept as a paragraph, which is what they were before.
+    /// this puts the grid back. The grid is the one on this page that is
+    /// the same table ([`matching_grid`]); when there is none, because no
+    /// detector reported this table or because the stream carried no
+    /// grids, the pipe characters are kept as a paragraph, which is what
+    /// they were before.
     fn on_table(&mut self, text: &str, page_no: u32, located: Located) {
         self.close_list();
-        let Some(region) = self.detected_tables.pop() else {
+        let region = self
+            .detected_tables
+            .as_mut()
+            .filter(|tables| tables.page_no == page_no)
+            .and_then(|tables| {
+                matching_grid(&tables.tables, text, located.bbox.as_ref())
+                    .map(|index| tables.tables.remove(index))
+            });
+        let Some(region) = region else {
             self.push_text(text, page_no, Kind::Paragraph, located);
             return;
         };
@@ -1097,6 +1119,113 @@ fn table_data(region: &pb::TableRegion) -> doc::TableData {
         grid,
         ..doc::TableData::default()
     }
+}
+
+/// The share of two boxes' overlap, or of two tables' cells, that makes a
+/// pipe block and a detected grid the same table.
+const SAME_TABLE: f64 = 0.5;
+
+/// Which of a page's detected grids, if any, is the table a pipe-syntax
+/// block flattened.
+///
+/// By geometry when both sides have it: the block's runs and the grid's
+/// claimed runs overlap over at least half of the smaller of the two boxes.
+/// By content otherwise: at least half of each side's cells are found in
+/// the other's letters. The best match wins; no match is an answer too, and
+/// a grid nothing matches is never forced onto the next block.
+fn matching_grid(
+    grids: &[pb::TableRegion],
+    block: &str,
+    located: Option<&doc::BoundingBox>,
+) -> Option<usize> {
+    let block_cells = pipe_cells(block);
+    let block_letters: String = block_cells.iter().map(|cell| letters(cell)).collect();
+    let mut best: Option<(usize, f64)> = None;
+    for (index, grid) in grids.iter().enumerate() {
+        let score = match (located, grid.bbox.as_ref()) {
+            (Some(block_box), Some(grid_box)) => overlap(block_box, &bounding_box(grid_box)),
+            _ => {
+                let grid_cells: Vec<&str> = grid
+                    .rows
+                    .iter()
+                    .flat_map(|row| row.cells.iter().map(String::as_str))
+                    .collect();
+                let grid_letters: String = grid_cells.iter().map(|cell| letters(cell)).collect();
+                found_in(&grid_cells, &block_letters).min(found_in(
+                    &block_cells.iter().map(String::as_str).collect::<Vec<_>>(),
+                    &grid_letters,
+                ))
+            }
+        };
+        // The first of equally good matches, which is the first in
+        // reading order.
+        if score >= SAME_TABLE && best.is_none_or(|(_, so_far)| score > so_far) {
+            best = Some((index, score));
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+/// The cells of a pipe-syntax block, row by row, without the separator
+/// row and without empty cells.
+fn pipe_cells(block: &str) -> Vec<String> {
+    block
+        .lines()
+        .filter(|line| {
+            !line
+                .chars()
+                .all(|character| matches!(character, '|' | '-' | ':' | ' ' | '\t'))
+        })
+        .flat_map(|line| line.split('|'))
+        .map(str::trim)
+        .filter(|cell| !cell.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+/// The share of `cells` whose letters appear in `haystack`.
+///
+/// A cell of one letter or digit is found anywhere by accident, so it only
+/// counts when no cell is longer; a table with no letters at all shares
+/// nothing.
+fn found_in(cells: &[&str], haystack: &str) -> f64 {
+    let all: Vec<String> = cells
+        .iter()
+        .map(|cell| letters(cell))
+        .filter(|cell| !cell.is_empty())
+        .collect();
+    let telling: Vec<&String> = all
+        .iter()
+        .filter(|cell| cell.chars().count() >= 2)
+        .collect();
+    let candidates: Vec<&String> = if telling.is_empty() {
+        all.iter().collect()
+    } else {
+        telling
+    };
+    if candidates.is_empty() {
+        return 0.0;
+    }
+    let found = candidates
+        .iter()
+        .filter(|cell| haystack.contains(cell.as_str()))
+        .count();
+    found as f64 / candidates.len() as f64
+}
+
+/// How much two boxes overlap, as a share of the smaller one's area.
+fn overlap(a: &doc::BoundingBox, b: &doc::BoundingBox) -> f64 {
+    let width = a.r.min(b.r) - a.l.max(b.l);
+    let height = a.t.min(b.t) - a.b.max(b.b);
+    if width <= 0.0 || height <= 0.0 {
+        return 0.0;
+    }
+    let area = |r: &doc::BoundingBox| (r.r - r.l) * (r.t - r.b);
+    let smaller = area(a).min(area(b));
+    if smaller <= 0.0 {
+        return 0.0;
+    }
+    (width * height) / smaller
 }
 
 /// One cell's box, cut from the grid's own measurements.
@@ -2354,6 +2483,151 @@ mod tests {
             !data.table_cells[0].column_header,
             "a contents table has no header row"
         );
+    }
+
+    /// A two-column grid of `rows` at the given box.
+    fn grid(rows: &[[&str; 2]], x: f64, y: f64) -> pb::TableRegion {
+        pb::TableRegion {
+            bbox: Some(pb::Rect {
+                x,
+                y,
+                width: 300.0,
+                height: 40.0,
+            }),
+            column_boundaries: vec![x, x + 150.0],
+            row_boundaries: vec![y + 40.0, y + 20.0],
+            rows: rows
+                .iter()
+                .map(|cells| pb::TableCells {
+                    cells: cells.iter().map(|cell| (*cell).to_owned()).collect(),
+                })
+                .collect(),
+            kind: pb::TableKind::Data.into(),
+        }
+    }
+
+    /// The grid a ruled table's rules gave the line detector, high on the
+    /// page, and the grid of a borderless table under it.
+    fn ruled_and_borderless() -> (pb::TableRegion, pb::TableRegion) {
+        (
+            grid(
+                &[["Engine", "Purpose"], ["Analytical", "General"]],
+                72.0,
+                600.0,
+            ),
+            grid(&[["Year", "Cards"], ["1837", "Punched"]], 72.0, 300.0),
+        )
+    }
+
+    /// The text of the first data cell of every table in the fragment.
+    fn first_cells(document: &doc::Document) -> Vec<String> {
+        document
+            .tables
+            .iter()
+            .map(|table| {
+                table.data.as_ref().expect("a grid").table_cells[0]
+                    .text
+                    .clone()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_pipe_block_claims_the_grid_whose_cells_it_carries_not_the_next_one() {
+        // The renderer missed the ruled table and printed only the
+        // borderless one as pipes. Order would hand it the ruled grid.
+        let (ruled, borderless) = ruled_and_borderless();
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Tables(pb::PageTables {
+            page_no: 1,
+            tables: vec![ruled, borderless],
+        }));
+        fold.consume(&page(
+            1,
+            "Engine Purpose Analytical General\n\n| Year | Cards |\n| 1837 | Punched |\n",
+        ));
+        let document = fold.take();
+        assert_eq!(
+            first_cells(&document),
+            ["Year"],
+            "the borderless grid, once"
+        );
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_located_pipe_block_claims_the_grid_it_sits_on() {
+        // Two grids whose cells say the same thing, told apart only by where
+        // they sit; the block's runs are on the lower one.
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Tables(pb::PageTables {
+            page_no: 1,
+            tables: vec![
+                grid(&[["Year", "Cards"], ["1837", "Punched"]], 72.0, 600.0),
+                grid(&[["Year", "Cards"], ["1837", "Punched"]], 72.0, 300.0),
+            ],
+        }));
+        fold.consume(&spans_at(
+            1,
+            &[
+                ("Year", 72.0, 325.0, 40.0),
+                ("Cards", 222.0, 325.0, 40.0),
+                ("1837", 72.0, 305.0, 40.0),
+                ("Punched", 222.0, 305.0, 60.0),
+            ],
+        ));
+        fold.consume(&page(1, "| Year | Cards |\n| 1837 | Punched |\n"));
+        let document = fold.take();
+        assert_eq!(document.tables.len(), 1);
+        let bbox = document.tables[0].prov[0].bbox.as_ref().expect("a box");
+        assert!(
+            (bbox.b - 300.0).abs() < f64::EPSILON,
+            "the lower grid: {bbox:?}"
+        );
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_grid_no_pipe_block_matches_is_not_forced_onto_one() {
+        // Only the ruled grid was detected, and the only pipe block is the
+        // borderless table: they are not the same table, so the block stays
+        // what the renderer printed rather than carrying the other table's
+        // cells, and the borderless table's words are not lost.
+        let (ruled, _) = ruled_and_borderless();
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Tables(pb::PageTables {
+            page_no: 1,
+            tables: vec![ruled],
+        }));
+        fold.consume(&page(1, "| Year | Cards |\n| 1837 | Punched |\n"));
+        let document = fold.take();
+        assert!(document.tables.is_empty(), "{:?}", first_cells(&document));
+        assert!(base_of(&document.texts[0]).text.contains("Punched"));
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_page_never_claims_another_pages_grid() {
+        let (_, borderless) = ruled_and_borderless();
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(2, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Tables(pb::PageTables {
+            page_no: 1,
+            tables: vec![borderless],
+        }));
+        fold.consume(&page(
+            1,
+            "A page whose table the renderer printed as prose.",
+        ));
+        // The second page has no grids of its own, and its pipe block
+        // carries the same words as the first page's grid.
+        fold.consume(&page(2, "| Year | Cards |\n| 1837 | Punched |\n"));
+        let document = fold.take();
+        assert!(document.tables.is_empty(), "{:?}", first_cells(&document));
+        assert_sound(&document);
     }
 
     #[test]

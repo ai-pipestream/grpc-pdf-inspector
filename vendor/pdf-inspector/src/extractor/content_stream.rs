@@ -243,9 +243,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                 if let Ok(obj_ref) = tounicode.as_reference() {
                     font_tounicode_refs.insert(resource_name, obj_ref.0);
                 } else if let Object::Stream(s) = tounicode {
-                    let data = s
-                        .decompressed_content()
-                        .unwrap_or_else(|_| s.content.clone());
+                    let data = crate::guard::inflate_or_raw(s);
                     if let Some(entry) =
                         crate::tounicode::build_cmap_entry_from_stream(&data, font_dict, doc, 0)
                     {
@@ -266,7 +264,7 @@ pub(crate) fn extract_page_text_items_with_forms(
     let mut encoding_cache: HashMap<String, Encoding<'_>> = HashMap::new();
     for (font_name, font_dict) in &fonts {
         let name = String::from_utf8_lossy(font_name).to_string();
-        if let Ok(enc) = font_dict.get_font_encoding(doc) {
+        if let Ok(enc) = crate::guard::font_encoding(font_dict, doc) {
             encoding_cache.insert(name, enc);
         }
     }
@@ -276,12 +274,10 @@ pub(crate) fn extract_page_text_items_with_forms(
     // Get XObjects (images) from page resources
     let xobjects = get_page_xobjects(doc, page_id);
 
-    // Get content. lopdf 0.44 dropped the vestigial Result on
-    // get_page_content: in 0.42 the body already skipped unreadable stream
-    // objects and fell back to raw bytes on a failed decode, and the only
-    // error path was write_all into a Vec, which cannot fail. Same bytes,
-    // no error to map.
-    let content_data = doc.get_page_content(page_id);
+    // Get content: get_page_content's bytes (unreadable stream objects
+    // skipped, raw bytes for a stream whose filter fails), decoded within
+    // the guard's limits. A page whose streams inflate past them is empty.
+    let content_data = crate::guard::page_content(doc, page_id);
 
     // Strip PDF comments (% to end of line) from the content stream.
     // Some PDF generators (e.g. PD4ML) embed comments that confuse lopdf's

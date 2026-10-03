@@ -35,6 +35,7 @@ pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
+pub mod guard;
 pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
@@ -55,17 +56,21 @@ pub use extractor::{
     extract_text_with_positions_mem_pages_with_invisible, extract_text_with_positions_pages,
     extract_text_with_positions_pages_with_password,
     extract_text_with_positions_rects_and_forms_mem_with_invisible,
+    extract_text_with_positions_rects_and_forms_mem_with_ocr_layer,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
+pub use guard::{Interrupt, ParseGuard};
 pub use process_mode::ProcessMode;
 pub use text_quality::{
     analyze_text_quality, detect_encoding_issues, LetterFrequencyScore, TextQualityReport,
     MIN_LETTERS_FOR_GARBLE_SCORE,
 };
-pub use types::{LayoutComplexity, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
+pub use types::{
+    LayoutComplexity, OcrLayerExtraction, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem,
+};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -160,6 +165,11 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    /// Detection's [`PdfTypeResult::ocr_recommended`]: OCR would read this
+    /// document better than its text layer does, because images carry
+    /// essential context (a template or a scan) or the layout is a dense
+    /// newspaper the reading order cannot follow.
+    pub ocr_recommended: bool,
 }
 
 // =========================================================================
@@ -998,6 +1008,30 @@ pub struct PageRegionResult {
 /// real OCR layer carries far more; a stray watermark or artifact does not.
 const OCR_LAYER_MIN_ALNUM: usize = 40;
 
+/// Whether a page walk found any visible text at all: an item that is not
+/// an image placeholder and holds something other than whitespace.
+/// Punctuation counts. This is the OCR-layer fallback's gate: an invisible
+/// OCR layer transcribes the raster, so any visible glyph has an invisible
+/// twin there and adopting the layer would duplicate it.
+pub(crate) fn has_visible_text(items: &[TextItem]) -> bool {
+    items
+        .iter()
+        .any(|it| !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty())
+}
+
+/// Whether a page walk that kept the invisible layer recovered an OCR layer
+/// worth adopting: at least [`OCR_LAYER_MIN_ALNUM`] alphanumerics of real,
+/// non-garbage text. The whole recovered layer is judged, not a prefix: a
+/// broken OCR layer can hide its garbage past any fixed sample size.
+pub(crate) fn is_adoptable_ocr_layer(items: &[TextItem]) -> bool {
+    let sample: String = items
+        .iter()
+        .filter(|it| !matches!(it.item_type, types::ItemType::Image))
+        .map(|it| it.text.as_str())
+        .collect();
+    non_placeholder_alnum(items) >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample)
+}
+
 /// Alphanumeric mass of extracted items, ignoring raster placeholders.
 /// `[Image: ...]` items (ItemType::Image) are synthesized for image
 /// XObjects — they mark that pixels exist, not that text was read, so they
@@ -1091,10 +1125,7 @@ pub fn extract_text_in_regions_mem(
         // has an invisible twin there and adoption would duplicate it
         // (review catches — strict gate, no fuzzy dedupe). Adopt the retry
         // only when it contributes real, non-garbage text.
-        let has_visible_text = items.iter().any(|it| {
-            !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
-        });
-        if skipped_invisible && !has_visible_text {
+        if skipped_invisible && !has_visible_text(&items) {
             if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
                 extractor::content_stream::extract_page_text_items(
                     &doc,
@@ -1106,16 +1137,10 @@ pub fn extract_text_in_regions_mem(
                     &mut form_budget,
                 )
             {
-                let inv_alnum = non_placeholder_alnum(&inv_items);
                 // Judge the WHOLE recovered layer, not a prefix — a broken
                 // OCR layer can hide its garbage past any fixed sample size
                 // (review catch).
-                let sample: String = inv_items
-                    .iter()
-                    .filter(|it| !matches!(it.item_type, types::ItemType::Image))
-                    .map(|it| it.text.as_str())
-                    .collect();
-                if inv_alnum >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample) {
+                if is_adoptable_ocr_layer(&inv_items) {
                     items = inv_items;
                     has_gid = inv_gid;
                     coords_rotated = inv_rotated;
@@ -3886,6 +3911,7 @@ pub(crate) fn load_document_from_mem_with_password(
         Ok(doc) => doc,
         Err(first_err) => {
             for repaired in repair_pdf_container_candidates(buf) {
+                guard::checkpoint()?;
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
@@ -3907,7 +3933,7 @@ pub(crate) fn load_document_from_mem_with_password(
 }
 
 fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
-    match Document::load_mem(buf) {
+    match Document::load_mem_with_options(buf, guard::load_options(None)) {
         // Some encrypted PDFs load structurally but leave their streams
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
@@ -3924,10 +3950,10 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// non-empty password was supplied but rejected.
 fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
     let pw = password.unwrap_or("");
-    match Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(pw)) {
+    match Document::load_mem_with_options(buf, guard::load_options(Some(pw))) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
+            Document::load_mem_with_options(buf, guard::load_options(Some("")))
                 .map_err(|_| inner)
         }
         Err(inner) => Err(inner),
@@ -4127,6 +4153,7 @@ fn process_document(
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
     let confidence = detection.confidence;
+    let ocr_recommended = detection.ocr_recommended;
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
 
     // DetectOnly → return immediately
@@ -4142,6 +4169,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            ocr_recommended,
         });
     }
 
@@ -4158,6 +4186,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            ocr_recommended,
         });
     }
 
@@ -4492,6 +4521,7 @@ fn process_document(
         confidence,
         layout,
         has_encoding_issues,
+        ocr_recommended,
     })
 }
 
@@ -6323,6 +6353,10 @@ pub enum PdfError {
     InvalidStructure,
     #[error("Not a PDF: {0}")]
     NotAPdf(String),
+    /// The [`ParseGuard`] in force stopped the work: a stream past its
+    /// decompression limit, a passed deadline, or a cancellation.
+    #[error("Parse interrupted: {0}")]
+    Interrupted(Interrupt),
 }
 
 impl From<lopdf::Error> for PdfError {

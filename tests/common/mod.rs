@@ -572,6 +572,25 @@ pub fn table_pdf() -> Vec<u8> {
 /// the line-driven detector sees the grid the document actually drew.
 #[must_use]
 pub fn ruled_table_pdf() -> Vec<u8> {
+    ruled_table_page(false)
+}
+
+/// The ruled table's page with a borderless table of short aligned cells
+/// below it: the [`table_pdf`] grid, set lower on the page.
+///
+/// The two tables come out of different detectors. The rules make the line
+/// detector report the ruled grid, and only it, because a detector that
+/// finds a data table ends the search; the markdown renderer's own table
+/// finder misses the ruled table and prints the borderless one as pipe
+/// characters. Nothing pairs the pipe block with the ruled grid but their
+/// order on the page.
+#[must_use]
+pub fn ruled_and_borderless_tables_pdf() -> Vec<u8> {
+    ruled_table_page(true)
+}
+
+/// The ruled table's page, with or without the borderless table under it.
+fn ruled_table_page(with_borderless: bool) -> Vec<u8> {
     const LEFT: i32 = 72;
     const MIDDLE: i32 = 220;
     const RIGHT: i32 = 540;
@@ -633,6 +652,22 @@ pub fn ruled_table_pdf() -> Vec<u8> {
             "BT /F1 10 Tf {} {y} Td ({description}) Tj ET\n",
             MIDDLE + 6
         ));
+    }
+
+    if with_borderless {
+        const COLUMNS: [i32; 3] = [72, 240, 400];
+        const CELLS: [(&str, &str, &str); 4] = [
+            ("Year", "Engine", "Cards"),
+            ("1837", "Analytical", "Punched"),
+            ("1843", "Notes", "Woven"),
+            ("1854", "Difference", "None"),
+        ];
+        for (index, (first, second, third)) in CELLS.iter().enumerate() {
+            let y = 420 - 24 * i32::try_from(index).expect("four rows fit in an i32");
+            for (column, text) in COLUMNS.iter().zip([first, second, third]) {
+                content.push_str(&format!("BT /F1 11 Tf {column} {y} Td ({text}) Tj ET\n"));
+            }
+        }
     }
 
     let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
@@ -1369,6 +1404,390 @@ pub fn garbled_pdf() -> Vec<u8> {
     bytes
 }
 
+/// A scanner's page image: one flat gray, letter-sized at 200 dpi.
+///
+/// The pixel count is the point. The detector calls an image a page scan
+/// when it is large enough to cover the page at a scanning resolution, and
+/// an 8x8 square stretched over the page is not; this one is, and its
+/// pixels compress to almost nothing.
+fn scan_image(doc: &mut Document) -> lopdf::ObjectId {
+    const WIDTH: usize = 1700;
+    const HEIGHT: usize = 2200;
+    let mut image = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => WIDTH as i64,
+            "Height" => HEIGHT as i64,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8,
+        },
+        vec![0xee; WIDTH * HEIGHT],
+    );
+    image.compress().expect("compress the page image");
+    doc.add_object(image)
+}
+
+/// The words a scan's OCR layer transcribes, drawn one show operator per
+/// word the way OCRmyPDF and Tesseract lay a layer down, in text
+/// rendering mode 3 behind the page image.
+fn ocr_layer(page: u32) -> String {
+    ocr_layer_reading(page, |line| line.to_owned())
+}
+
+/// An OCR layer whose engine read each line of [`PROSE`] as `reading` of it.
+fn ocr_layer_reading(page: u32, reading: impl Fn(&str) -> String) -> String {
+    let mut content = String::from("BT\n3 Tr\n/F1 10 Tf\n");
+    for (row, line) in PROSE.iter().enumerate() {
+        let y = 700 - 14 * i32::try_from(row).expect("eight lines fit in an i32");
+        let mut x = 72;
+        for word in reading(line).split_whitespace() {
+            let word = word.replace(['(', ')'], "");
+            content.push_str(&format!("1 0 0 1 {x} {y} Tm ({word}) Tj\n"));
+            x += 6 * i32::try_from(word.len() + 1).expect("a word fits in an i32");
+        }
+    }
+    content.push_str(&format!("1 0 0 1 72 100 Tm (Scanned page {page}) Tj\nET\n"));
+    content
+}
+
+/// Build a searchable scan: `pages` pages, each a page-sized raster with an
+/// OCR layer drawn invisibly behind it, which is what OCRmyPDF, ABBYY and
+/// Acrobat's "make searchable" all produce.
+///
+/// No glyph on any page is visible. Every word a reader sees is pixels, and
+/// the text layer is the OCR engine's transcription of them, so the pages
+/// need OCR whatever the layer says. Each page draws well over fifty show
+/// operators, which is how many it took for the detector to stop calling
+/// such a page a scan and start calling it text.
+#[must_use]
+pub fn searchable_scan_pdf(pages: u32) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let image_id = scan_image(&mut doc);
+        let mut content = String::from("q 612 0 0 792 0 0 cm /Im1 Do Q\n");
+        content.push_str(&ocr_layer(page));
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+                "XObject" => dictionary! { "Im1" => image_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a mostly born-digital document with scanned pages inside it:
+/// `pages` pages of real text, except the pages in `scanned`, which are a
+/// page-sized raster and nothing else.
+///
+/// An annual report with a scanned appendix, a contract with a signed page
+/// scanned back in. Detection samples eight pages, so a long enough
+/// document can keep its scans out of the sample entirely.
+#[must_use]
+pub fn mixed_text_and_scan_pdf(pages: u32, scanned: &[u32]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let (content, resources) = if scanned.contains(&page) {
+            let image_id = scan_image(&mut doc);
+            (
+                String::from("q 612 0 0 792 0 0 cm /Im1 Do Q"),
+                dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
+            )
+        } else {
+            let mut content = format!("BT /F1 12 Tf 72 740 Td (Born digital page {page}) Tj\n");
+            for line in PROSE {
+                content.push_str(&format!("0 -16 Td ({line}) Tj\n"));
+            }
+            content.push_str("ET");
+            (
+                content,
+                dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            )
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources,
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a three-page born-digital document whose middle page is a scan
+/// with an OCR layer that misread every letter: [`ciphered`] prose, drawn
+/// invisibly behind the page image.
+///
+/// The layer is real text by every measure the OCR-layer fallback applies,
+/// so it becomes the page's text, and its letter statistics are those of a
+/// garbled text layer. It is still not a broken font encoding, and the page
+/// needs OCR whatever it says.
+#[must_use]
+pub fn text_with_misread_scan_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=3u32 {
+        let (content, resources) = if page == 2 {
+            let image_id = scan_image(&mut doc);
+            let mut content = String::from("q 612 0 0 792 0 0 cm /Im1 Do Q\n");
+            content.push_str(&ocr_layer_reading(page, ciphered));
+            (
+                content,
+                dictionary! {
+                    "Font" => dictionary! { "F1" => font_id },
+                    "XObject" => dictionary! { "Im1" => image_id },
+                },
+            )
+        } else {
+            let mut content = format!("BT /F1 12 Tf 72 740 Td (Born digital page {page}) Tj\n");
+            for line in PROSE {
+                content.push_str(&format!("0 -16 Td ({line}) Tj\n"));
+            }
+            content.push_str("ET");
+            (
+                content,
+                dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            )
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources,
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => 3,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a three-page document whose middle page is a photograph with
+/// empty text objects over it, between two pages of prose.
+///
+/// Some capture software writes a text object per region whether it read
+/// anything there or not, so the page carries show operators that show
+/// nothing. They are enough to keep the page off every list sampling
+/// detection keeps, and the page still has no word on it that is not
+/// pixels.
+#[must_use]
+pub fn photo_with_empty_text_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let mut photo = Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Image",
+            "Width" => 8,
+            "Height" => 8,
+            "ColorSpace" => "DeviceGray",
+            "BitsPerComponent" => 8,
+        },
+        vec![0x80; 64],
+    );
+    photo.set_plain_content(vec![0x80; 64]);
+    let photo_id = doc.add_object(photo);
+
+    let mut kids = Vec::new();
+    for page in 1..=3u32 {
+        let (content, resources) = if page == 2 {
+            (
+                String::from(
+                    "q 468 0 0 600 72 96 cm /Im1 Do Q\n\
+                     BT /F1 10 Tf 72 80 Td () Tj () Tj () Tj ET",
+                ),
+                dictionary! {
+                    "Font" => dictionary! { "F1" => font_id },
+                    "XObject" => dictionary! { "Im1" => photo_id },
+                },
+            )
+        } else {
+            let mut content = format!("BT /F1 12 Tf 72 740 Td (Prose page {page}) Tj\n");
+            for line in PROSE {
+                content.push_str(&format!("0 -16 Td ({line}) Tj\n"));
+            }
+            content.push_str("ET");
+            (
+                content,
+                dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            )
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources,
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => 3,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a `pages`-page document whose every content stream inflates to
+/// `inflated_bytes`: a line of real text and then that much white space,
+/// Flate-compressed.
+///
+/// White space is legal content, so a reader that decodes the stream finds
+/// one ordinary line in it. What it costs to get there is the point: Flate
+/// packs a run of spaces about a thousand to one, which is how a few
+/// kilobytes of upload ask for megabytes or gigabytes of memory.
+#[must_use]
+pub fn inflating_pdf(pages: u32, inflated_bytes: usize) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let mut content =
+            format!("BT /F1 12 Tf 72 700 Td (A line of text on page {page}) Tj ET\n").into_bytes();
+        content.resize(content.len() + inflated_bytes, b' ');
+        let mut stream = Stream::new(dictionary! {}, content);
+        stream.compress().expect("compress the content stream");
+        let content_id = doc.add_object(stream);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {
@@ -1403,13 +1822,19 @@ pub async fn start() -> Harness {
 
 /// Start a server on an ephemeral localhost port with the given limits.
 pub async fn start_with(limits: Limits) -> Harness {
+    start_with_service(|metrics| PdfGrpc::with_metrics(limits, metrics)).await
+}
+
+/// Start a server on an ephemeral localhost port, built by `build` around
+/// the counters the harness will report.
+pub async fn start_with_service(build: impl FnOnce(Arc<Metrics>) -> PdfGrpc) -> Harness {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
     let addr = listener.local_addr().expect("local address");
 
     let metrics = Metrics::new();
-    let service = PdfGrpc::with_metrics(limits, Arc::clone(&metrics)).into_service();
+    let service = build(Arc::clone(&metrics)).into_service();
     tokio::spawn(async move {
         Server::builder()
             .add_service(service)

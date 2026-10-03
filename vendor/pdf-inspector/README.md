@@ -52,16 +52,51 @@ The private APIs, and what each unblocks:
    `PdfForm` per invocation beside the runs, rectangles and lines its sibling
    returns; the sibling entry points and the page walker's old name return
    exactly what they did.
+7. **The OCR-layer fallback on the positioned runs** (`src/extractor/mod.rs`,
+   `src/lib.rs`, `src/types.rs`). The region extractor adopts a scanned
+   page's invisible OCR layer when the visible walk found no text, and the
+   whole-document pipeline retries a mixed document the same way, but no
+   entry point returning positioned runs did either.
+   `extract_text_with_positions_rects_and_forms_mem_with_ocr_layer` applies
+   the region extractor's own gate and thresholds (now shared as
+   `has_visible_text` and `is_adoptable_ocr_layer`) page by page and returns
+   an `OcrLayerExtraction` naming the pages whose runs are their layer.
+8. **Detection's OCR recommendation** (`src/lib.rs`). `PdfTypeResult`
+   carried `ocr_recommended` and `PdfProcessResult` dropped it;
+   `PdfProcessResult.ocr_recommended` carries it.
+
+## Patches that change what the crate does
+
+Two patches go further than visibility, because the service could not be
+made safe or correct from outside the crate. Both are recorded with their
+reasons in `docs/capture-deferrals.md`.
+
+- **Detection follows the text rendering mode** (`src/detector.rs`). The
+  byte scanner counted every show operator as text, including the hundreds
+  of invisible (Tr 3) ones behind a searchable scan's page image, so such a
+  scan classified text-based with no OCR pages. Invisible show operators
+  are now counted apart, an image page whose text is all invisible is a
+  scan carrying an OCR layer (and its document is Mixed), and the per-page
+  OCR list is built for text-based documents too, not only mixed ones.
+- **Decoding is bounded** (`src/guard.rs`, and every decoding call site).
+  Every stream the crate decodes goes through the guard module, which holds
+  it to a per-stream ceiling and a per-run budget, loads documents with the
+  ceiling as lopdf's `max_decompressed_size`, and lets a caller's
+  `ParseGuard` stop a run at a deadline or on cancellation at page
+  boundaries. `PdfError` gained an `Interrupted` variant for it, which is
+  the one change to a public type's shape.
 
 ## How the patches are kept auditable
 
 The copy landed in its own commit, with the tree building and testing
 identically to the registry build, before any API was touched. Each patch is a
-separate commit after it, listed by SHA in `docs/capture-deferrals.md`. Every patch is additive: nothing that was public
-changed shape, and the crate's own tests are the ones it shipped with. One
-exception is listed there under "Vendored dependency moves": the lopdf
-dependency moved ahead of upstream at the owner's request, with the one call
-site the API change reached.
+separate commit after it, listed by SHA in `docs/capture-deferrals.md`. The
+visibility patches are additive: nothing that was public changed shape. The
+two patches under "Patches that change what the crate does" are the
+exceptions, with their reasons there, and they bring their own tests beside
+the ones the crate shipped with. One more exception is listed there under
+"Vendored dependency moves": the lopdf dependency moved ahead of upstream at
+the owner's request, with the one call site the API change reached.
 
 The crate keeps its own style, its own formatting and its own lint posture.
 Files here are not reformatted to match the service.

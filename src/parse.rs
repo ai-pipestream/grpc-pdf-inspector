@@ -10,9 +10,17 @@
 //!
 //! What is not forced is buffering the *output*. Detection runs first and
 //! `info` goes out the moment it returns — the ~10-50ms routing answer —
-//! before a single page has been extracted. In FULL mode each `page` goes
-//! out as that page's markdown comes back. `tests/streaming.rs` holds the
+//! before a single page has been extracted. `tests/streaming.rs` holds the
 //! test that fails if someone turns this back into a batch.
+//!
+//! Past `info` the stream is incremental in rendering, not in extraction.
+//! The extraction pass below is one library call that reads every selected
+//! page before it returns; only then are the pages rendered, one at a time,
+//! each `page` going out as its markdown is rendered. Between `info` and
+//! the first page there is therefore a stretch that sends nothing, which is
+//! why the parse checks its deadline and its caller's presence inside that
+//! pass (see [`pdf_inspector::ParseGuard`]) rather than relying on the next
+//! send to notice that nobody is listening.
 //!
 //! # Two library passes in FULL, and not three
 //!
@@ -22,7 +30,7 @@
 //! content streams, not glyphs.
 //!
 //! FULL then runs exactly one more:
-//! `extract_text_with_positions_rects_and_forms_mem_with_invisible`, whose
+//! `extract_text_with_positions_rects_and_forms_mem_with_ocr_layer`, whose
 //! runs, rectangles, line segments and form placements answer everything
 //! the rest of the mode needs. The markdown is rendered from those runs here with
 //! [`to_markdown_from_items_with_rects_and_page_count`]; the tables come
@@ -64,7 +72,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
-use pdf_inspector::{MarkdownOptions, PdfOptions, PdfType, ProcessMode};
+use pdf_inspector::{Interrupt, MarkdownOptions, ParseGuard, PdfOptions, PdfType, ProcessMode};
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -194,7 +202,8 @@ impl<'a> Events<'a> {
     }
 }
 
-/// Classify `bytes` and stream the events the mode calls for into `sink`.
+/// Classify `bytes` and stream the events the mode calls for into `sink`,
+/// under the default limits and with no deadline.
 ///
 /// Synchronous on purpose: extraction is CPU-bound and parallelizes with
 /// rayon internally, so the caller runs this on
@@ -202,7 +211,27 @@ impl<'a> Events<'a> {
 /// channel. Everything stays in memory; nothing is written anywhere.
 #[must_use]
 pub fn run(bytes: &[u8], options: &pb::PdfOptions, metrics: &Metrics, sink: &Sink) -> Outcome {
-    match parse(bytes, options, metrics, sink) {
+    run_guarded(
+        bytes,
+        options,
+        metrics,
+        sink,
+        &crate::Limits::default().parse_guard(),
+    )
+}
+
+/// [`run`] under `guard`: every parser pass decodes within its
+/// decompression bounds, and the parse stops at the next page once its
+/// deadline passes or its caller cancels.
+#[must_use]
+pub fn run_guarded(
+    bytes: &[u8],
+    options: &pb::PdfOptions,
+    metrics: &Metrics,
+    sink: &Sink,
+    guard: &ParseGuard,
+) -> Outcome {
+    match parse(bytes, options, metrics, sink, guard) {
         Ok(()) => Outcome::Complete,
         Err(Abort::Gone) => Outcome::Abandoned,
         Err(Abort::Failed(status)) => Outcome::Failed(status),
@@ -215,8 +244,11 @@ fn parse(
     options: &pb::PdfOptions,
     metrics: &Metrics,
     sink: &Sink,
+    guard: &ParseGuard,
 ) -> Result<(), Abort> {
     let started = Instant::now();
+    // The upload may already have spent the call's time.
+    check(guard)?;
     let mode = pb::ProcessMode::try_from(options.mode)
         .map_err(|_| Status::invalid_argument(format!("unknown process mode {}", options.mode)))?;
     let mode = match mode {
@@ -224,13 +256,9 @@ fn parse(
         known => known,
     };
 
-    // Page 0 cannot be rejected by the library — its 1-indexed filter would
-    // treat it as out of range and its 0-indexed extractor would treat it as
-    // the first page — so it is rejected here, where it is still a caller
-    // mistake rather than a silent wrong answer.
-    if options.pages.contains(&0) {
-        return Err(Status::invalid_argument("pages are 1-indexed; page 0 does not exist").into());
-    }
+    // What is wrong with the page selection whatever the document is, said
+    // before the document is read.
+    check_selection(options)?;
 
     // Pass one: classification. Cheap, and the reason this stream opens with
     // an answer instead of with work.
@@ -239,11 +267,19 @@ fn parse(
         detect = detect.password(options.password.clone());
     }
     metrics.parser_pass();
-    let detected = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, detect))?;
+    let detected = guarded(guard, || {
+        pdf_inspector::process_pdf_mem_with_options(bytes, detect)
+    })?;
     // Detection's own per-page verdicts, kept because the trailer's
     // `extraction_ocr_reasons` is these merged with what reading the text
     // layer concludes, exactly as the analysis pass used to merge them.
     let detection_reasons = detected.ocr_reasons_by_page.clone();
+
+    // The pages the call selected, resolved against the document before
+    // anything is sent: a selection with no page in the document is a
+    // caller mistake, not an empty success.
+    let mut warnings = Vec::new();
+    let selection = select(options, detected.page_count, &mut warnings)?;
 
     // The optional second consumer of this stream: when the caller asked for
     // a Document, every event is folded on its way out and the folded
@@ -270,9 +306,8 @@ fn parse(
             })
             .collect(),
         detection_time_ms: detected.processing_time_ms,
+        ocr_recommended: detected.ocr_recommended,
     }))?;
-
-    let mut warnings = Vec::new();
 
     // What the file says about itself, read from its own dictionaries by a
     // second reader. It goes out immediately after `info` so that a
@@ -286,7 +321,7 @@ fn parse(
         // extraction runs off its own reader and is unaffected.
         metrics.parser_pass();
         let metadata = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::metadata::read(bytes, password)
+            crate::metadata::read(bytes, password, guard.max_stream_bytes)
         }))
         .ok()
         .flatten();
@@ -322,8 +357,11 @@ fn parse(
         _ if !text_bearing => {}
         pb::ProcessMode::Analyze => {
             metrics.parser_pass();
-            let analyzed = guarded(|| {
-                pdf_inspector::process_pdf_mem_with_options(bytes, analyze_options(options))
+            let analyzed = guarded(guard, || {
+                pdf_inspector::process_pdf_mem_with_options(
+                    bytes,
+                    analyze_options(options, &selection),
+                )
             })?;
             layout = Some(layout_proto(&analyzed.layout));
             has_encoding_issues = analyzed.has_encoding_issues;
@@ -334,12 +372,14 @@ fn parse(
             // document is extracted whole and delivered as one event. The
             // trailer says so; `page_no` 0 means "the document".
             let mut full = PdfOptions::new();
-            if !options.pages.is_empty() {
-                full = full.pages(options.pages.iter().copied());
+            if let Selection::Pages(pages) = &selection {
+                full = full.pages(pages.iter().copied());
             }
             full = full.password(options.password.clone());
             metrics.parser_pass();
-            let processed = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, full))?;
+            let processed = guarded(guard, || {
+                pdf_inspector::process_pdf_mem_with_options(bytes, full)
+            })?;
             if let Some(markdown) = processed.markdown.filter(|md| !md.is_empty()) {
                 let markdown_bytes = markdown.len() as u64;
                 let replacement_runs = replacement_runs(&markdown);
@@ -384,44 +424,61 @@ fn parse(
             // in hand instead of being rendered away inside the library;
             // and the vector geometry with them, so the ruled-table
             // detectors are reachable at all.
-            let filter: Option<HashSet<u32>> =
-                (!options.pages.is_empty()).then(|| options.pages.iter().copied().collect());
+            let filter = selection.filter();
             metrics.parser_pass();
-            let ((items, rects, lines), forms, skipped_invisible) = guarded(|| {
-                pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_invisible(
+            // With the library's OCR-layer fallback: a scanned page made
+            // searchable draws no visible text, and its runs are its
+            // invisible OCR layer instead of nothing, exactly as the
+            // library's own region and whole-document pipelines read it.
+            let pdf_inspector::OcrLayerExtraction {
+                extraction: (items, rects, lines),
+                forms,
+                skipped_invisible,
+                ocr_layer_pages,
+            } = guarded(guard, || {
+                pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
                     bytes,
                     filter.as_ref(),
-                    false,
                 )
             })?;
             // Where the page invoked Form XObjects. A vector figure is one,
             // and it draws no image run, so this is the only record of
             // where it sits. They ride the spans event, after the runs.
             let mut forms = spans::forms_by_page(forms);
-            // What the walk left out, said whether or not anyone asked for
-            // the runs themselves. A text layer nobody is told about is
-            // what this reports.
-            has_invisible_text = skipped_invisible;
+            // Whether any page drew invisible text, said whether or not
+            // anyone asked for the runs themselves: the layer the walk left
+            // out, and the OCR layers it adopted as a scan's text. A text
+            // layer nobody is told about is what this reports.
+            has_invisible_text = skipped_invisible || !ocr_layer_pages.is_empty();
 
             // The text-quality verdicts, from the runs this call already
             // holds rather than from a second read of the file.
             let quality = pdf_inspector::analyze_text_quality(&items);
-            has_encoding_issues = quality.has_encoding_issues;
-            let verdicts = page_verdicts(&detection_reasons, &quality);
-            extraction_ocr_reasons = verdicts
+            // An OCR layer's misreadings are not a broken font encoding, and
+            // its page needs OCR already; letting them set the document's
+            // flag would send every page of a mostly born-digital document
+            // to recognition for one scanned page.
+            has_encoding_issues = quality
+                .pages_needing_ocr
                 .iter()
-                .map(|(page, reasons)| pb::PageOcrReasons {
-                    page: *page,
-                    reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
-                })
-                .collect();
+                .any(|page| !ocr_layer_pages.contains(page));
+            let mut verdicts = page_verdicts(&detection_reasons, &quality);
+            // A page whose text is its OCR layer is a scan. The layer is
+            // what the markdown carries, so a caller without OCR still gets
+            // the words, but no reader saw them and a caller with OCR
+            // should read the page again.
+            for page in &ocr_layer_pages {
+                add_verdict(&mut verdicts, *page, pb::OcrReason::Scanned);
+            }
 
             // The invisible layer's own runs, which need the walk run again
             // with the layer kept. Taken only when someone is listening and
-            // only when the first walk said there is something to find.
+            // only when the first walk said it left something out; an
+            // adopted OCR layer is in the runs already, so the difference
+            // the second walk is read against has none of it.
             let mut invisible = if events.wanted(options.report_invisible) && skipped_invisible {
                 metrics.parser_pass();
-                let (kept, _) = guarded(|| {
+                let (kept, _) = guarded(guard, || {
                     pdf_inspector::extract_text_with_positions_mem_pages_with_invisible(
                         bytes,
                         filter.as_ref(),
@@ -448,11 +505,10 @@ fn parse(
             // Untagged documents return an empty list, which is the honest
             // answer rather than a failure.
             let mut structure = if events.wanted(options.emit_structure) {
-                let selected: Option<Vec<u32>> =
-                    (!options.pages.is_empty()).then(|| options.pages.clone());
+                let selected = selection.listed();
                 metrics.parser_pass();
-                let elements = guarded(|| {
-                    pdf_inspector::extract_structure_elements_mem(bytes, selected.as_deref())
+                let elements = guarded(guard, || {
+                    pdf_inspector::extract_structure_elements_mem(bytes, selected)
                 })?;
                 structure::by_page(elements)
             } else {
@@ -464,8 +520,20 @@ fn parse(
             let mut pages_with_tables = Vec::new();
             let mut pages_with_columns = Vec::new();
 
-            for page_no in requested_pages(options, detected.page_count) {
+            for page_no in selection.pages(detected.page_count) {
+                // Rendering, tables and the fold run here rather than in
+                // the parser, so the call's time is checked here too.
+                check(guard)?;
                 let page_items = by_page.remove(&page_no).unwrap_or_default();
+
+                // A page that drew a picture and no text at all is a scan,
+                // or a page whose words are in a figure, and it needs OCR
+                // either way. Sampling detection may never have looked at
+                // it and the quality pass only scores pages that have text,
+                // so this is the check that reads every page it extracts.
+                if let Some(reason) = untexted_page_reason(&page_items, forms.get(&page_no)) {
+                    add_verdict(&mut verdicts, page_no, reason);
+                }
 
                 // The roles go out before the runs they describe, so a
                 // consumer reading the whole stream never has to look
@@ -587,7 +655,9 @@ fn parse(
                 // The rendering is the last thing the encoding backstop can
                 // look at, and it catches a page whose runs were each
                 // individually unremarkable.
-                has_encoding_issues |= pdf_inspector::detect_encoding_issues(&markdown);
+                if !ocr_layer_pages.contains(&page_no) {
+                    has_encoding_issues |= pdf_inspector::detect_encoding_issues(&markdown);
+                }
                 events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
                     page_no,
                     markdown,
@@ -616,12 +686,26 @@ fn parse(
                 pages_with_tables,
                 pages_with_columns,
             });
+            extraction_ocr_reasons = verdicts
+                .iter()
+                .map(|(page, reasons)| pb::PageOcrReasons {
+                    page: *page,
+                    reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
+                })
+                .collect();
         }
+    }
+
+    // The trailer answers for the pages that were read. Detection's verdicts
+    // cover the whole document and went out on `info`.
+    if let Some(selected) = selection.filter() {
+        extraction_ocr_reasons.retain(|reasons| selected.contains(&reasons.page));
     }
 
     // The fold has seen every content event now, so its Document goes out
     // here — after the last `page`, before the `status` trailer that closes
     // the stream.
+    check(guard)?;
     if let Some(fold) = events.fold.as_mut() {
         sink.send(pb::parse_pdf_response::Event::Document(fold.take()))?;
     }
@@ -704,33 +788,138 @@ fn replacement_runs(text: &str) -> u32 {
     runs
 }
 
-/// The 1-indexed pages a call asks for, in the order it asked for them.
-///
-/// An empty filter means every page. A page past the end of the document is
-/// dropped rather than answered with an empty event: the caller asked about
-/// something that does not exist, and inventing a page for it would be a
-/// worse answer than saying nothing.
-fn requested_pages(options: &pb::PdfOptions, page_count: u32) -> Vec<u32> {
-    if options.pages.is_empty() {
-        (1..=page_count).collect()
-    } else {
-        options
-            .pages
-            .iter()
-            .copied()
-            .filter(|page| *page <= page_count)
-            .collect()
+/// The pages a call selected, resolved against the document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selection {
+    /// Every page.
+    All,
+    /// These 1-indexed pages, in the order the call asked for them, each
+    /// once, and every one of them in the document.
+    Pages(Vec<u32>),
+}
+
+impl Selection {
+    /// The pages to walk, in order.
+    fn pages(&self, page_count: u32) -> Vec<u32> {
+        match self {
+            Self::All => (1..=page_count).collect(),
+            Self::Pages(pages) => pages.clone(),
+        }
+    }
+
+    /// The pages as a library page filter: `None` for every page. An empty
+    /// filter means "all pages" on the wire but "no pages" to the library,
+    /// so every page is spelled as no filter at all.
+    fn filter(&self) -> Option<HashSet<u32>> {
+        self.listed().map(|pages| pages.iter().copied().collect())
+    }
+
+    /// The selected pages, or `None` for every page.
+    fn listed(&self) -> Option<&[u32]> {
+        match self {
+            Self::All => None,
+            Self::Pages(pages) => Some(pages),
+        }
     }
 }
 
+/// Refuse what is wrong with a page selection whatever the document is.
+///
+/// Page 0 cannot be refused by the library — its 1-indexed filter would
+/// treat it as out of range and its 0-indexed extractor would treat it as
+/// the first page — so it is refused here, where it is still a caller
+/// mistake rather than a silent wrong answer. A list and a span at once
+/// would leave which one counts to a guess, so they are refused too.
+fn check_selection(options: &pb::PdfOptions) -> Result<(), Status> {
+    let zero = || Status::invalid_argument("pages are 1-indexed; page 0 does not exist");
+    if options.pages.contains(&0) || options.first_page == Some(0) || options.last_page == Some(0) {
+        return Err(zero());
+    }
+    let spanned = options.first_page.is_some() || options.last_page.is_some();
+    if spanned && !options.pages.is_empty() {
+        return Err(Status::invalid_argument(
+            "select pages with either `pages` or `first_page`/`last_page`, not both",
+        ));
+    }
+    if let (Some(first), Some(last)) = (options.first_page, options.last_page)
+        && first > last
+    {
+        return Err(Status::invalid_argument(format!(
+            "the page span ends on page {last}, before it starts on page {first}"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a call's page selection against the document's page count.
+///
+/// A listed page is selected once, in the place it was first listed, and a
+/// listed page past the end is left out with a
+/// `PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE` warning: the caller asked about
+/// something that does not exist, and inventing a page for it would be a
+/// worse answer than saying so. A span is clamped to the document, which is
+/// what a span means. A selection with no page in the document at all is
+/// `INVALID_ARGUMENT`, because an empty success would read as a document
+/// with nothing in it.
+fn select(
+    options: &pb::PdfOptions,
+    page_count: u32,
+    warnings: &mut Vec<pb::ParseWarning>,
+) -> Result<Selection, Status> {
+    let none_exist = || {
+        Status::invalid_argument(format!(
+            "none of the selected pages exist; the document has {page_count} page(s)"
+        ))
+    };
+    if options.first_page.is_some() || options.last_page.is_some() {
+        let first = options.first_page.unwrap_or(1);
+        let last = options.last_page.unwrap_or(page_count).min(page_count);
+        if first > last {
+            return Err(none_exist());
+        }
+        return Ok(Selection::Pages((first..=last).collect()));
+    }
+    if options.pages.is_empty() {
+        return Ok(Selection::All);
+    }
+    let mut seen = vec![false; page_count as usize + 1];
+    let mut pages = Vec::new();
+    let mut out_of_range = 0usize;
+    let mut first_out_of_range = None;
+    for &page in &options.pages {
+        match seen.get_mut(page as usize) {
+            Some(seen) if !*seen => {
+                *seen = true;
+                pages.push(page);
+            }
+            Some(_) => {}
+            None => {
+                out_of_range += 1;
+                first_out_of_range.get_or_insert(page);
+            }
+        }
+    }
+    if pages.is_empty() {
+        return Err(none_exist());
+    }
+    if let Some(first) = first_out_of_range {
+        warnings.push(pb::ParseWarning {
+            code: pb::ParseWarningCode::PagesOutOfRange.into(),
+            message: format!(
+                "{out_of_range} listed page(s), the first of them page {first}, are past the end \
+                 of the {page_count}-page document and were left out"
+            ),
+        });
+    }
+    Ok(Selection::Pages(pages))
+}
+
 /// The library options for the analysis pass, honouring the call's page
-/// filter and password.
-fn analyze_options(options: &pb::PdfOptions) -> PdfOptions {
+/// selection and password.
+fn analyze_options(options: &pb::PdfOptions, selection: &Selection) -> PdfOptions {
     let mut analyze = PdfOptions::new().mode(ProcessMode::Analyze);
-    // An empty filter means "all pages" on the wire but "no pages" to the
-    // library, so it is only set when the caller named pages.
-    if !options.pages.is_empty() {
-        analyze = analyze.pages(options.pages.iter().copied());
+    if let Selection::Pages(pages) = selection {
+        analyze = analyze.pages(pages.iter().copied());
     }
     if !options.password.is_empty() {
         analyze = analyze.password(options.password.clone());
@@ -773,6 +962,46 @@ fn page_verdicts(
     verdicts
 }
 
+/// Add one reason to a page's verdict, once.
+fn add_verdict(verdicts: &mut BTreeMap<u32, Vec<pb::OcrReason>>, page: u32, reason: pb::OcrReason) {
+    let reasons = verdicts.entry(page).or_default();
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+/// Why a page that drew no text at all needs OCR, or `None` when it drew
+/// text or drew nothing.
+///
+/// Text is a run of glyphs or a form field's value with something other
+/// than whitespace in it. A page without any that placed an image is a scan
+/// or a picture of words, which is `SCANNED`; one that placed only a Form
+/// XObject drew its content as paths the parser cannot read as characters,
+/// which is `NO_TEXT`. A page that drew none of these is blank, and a blank
+/// page stays a blank page.
+fn untexted_page_reason(
+    items: &[pdf_inspector::TextItem],
+    forms: Option<&Vec<pdf_inspector::PdfForm>>,
+) -> Option<pb::OcrReason> {
+    use pdf_inspector::types::ItemType;
+    let has_text = items.iter().any(|item| {
+        matches!(item.item_type, ItemType::Text | ItemType::FormField)
+            && !item.text.trim().is_empty()
+    });
+    if has_text {
+        None
+    } else if items
+        .iter()
+        .any(|item| matches!(item.item_type, ItemType::Image))
+    {
+        Some(pb::OcrReason::Scanned)
+    } else if forms.is_some_and(|forms| !forms.is_empty()) {
+        Some(pb::OcrReason::NoText)
+    } else {
+        None
+    }
+}
+
 /// How far a page's letters sit from where a natural language puts them, or
 /// `None` when the page carried too few of them for the question to have an
 /// answer.
@@ -803,15 +1032,30 @@ fn ocr_reasons_proto(pages: &[pdf_inspector::PageOcrReasons]) -> Vec<pb::PageOcr
         .collect()
 }
 
-/// Call a fallible parser entry point with a panic guard.
+/// Call a fallible parser entry point under the call's guard, with a panic
+/// guard.
 ///
 /// lopdf can panic on malformed input, and an unwinding panic on the blocking
 /// thread would surface as a truncated stream; here it becomes an honest
 /// `INTERNAL` instead. `PdfError` maps by variant per the fleet contract.
-fn guarded<T>(call: impl FnOnce() -> Result<T, pdf_inspector::PdfError>) -> Result<T, Status> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+///
+/// An interrupt outranks whatever the call returned. A stream the guard
+/// refused reads as an undecodable one to code with no way to report it,
+/// so a pass that hit a limit can return a quietly incomplete answer, and
+/// the guard's own record is what says it is one.
+fn guarded<T>(
+    guard: &ParseGuard,
+    call: impl FnOnce() -> Result<T, pdf_inspector::PdfError>,
+) -> Result<T, Abort> {
+    let (outcome, interrupt) =
+        guard.run(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)));
+    if let Some(why) = interrupt {
+        return Err(interrupted(guard, why));
+    }
+    match outcome {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(map_error(error)),
+        Ok(Err(pdf_inspector::PdfError::Interrupted(why))) => Err(interrupted(guard, why)),
+        Ok(Err(error)) => Err(map_error(error).into()),
         Err(payload) => {
             let detail = payload
                 .downcast_ref::<&str>()
@@ -820,8 +1064,41 @@ fn guarded<T>(call: impl FnOnce() -> Result<T, pdf_inspector::PdfError>) -> Resu
                 .unwrap_or_else(|| "unknown panic".to_owned());
             Err(Status::internal(format!(
                 "the parser panicked, which is a bug in grpc-pdf-inspector: {detail}"
-            )))
+            ))
+            .into())
         }
+    }
+}
+
+/// Stop if the call's deadline has passed or its caller has gone.
+fn check(guard: &ParseGuard) -> Result<(), Abort> {
+    match guard.interrupted() {
+        Some(why) => Err(interrupted(guard, why)),
+        None => Ok(()),
+    }
+}
+
+/// How a call the guard stopped ends.
+///
+/// A caller that cancelled is not told anything: it is gone. A passed
+/// deadline is `DEADLINE_EXCEEDED`, and a document that inflates past its
+/// limits is `RESOURCE_EXHAUSTED`, the code an oversize upload gets,
+/// because it is the same complaint about a different measure of size.
+fn interrupted(guard: &ParseGuard, why: Interrupt) -> Abort {
+    match why {
+        Interrupt::Cancelled => Abort::Gone,
+        Interrupt::Deadline => Status::deadline_exceeded(
+            "the parse ran past its time budget; raise GRPC_PDF_MAX_PARSE_SECONDS if the \
+             document genuinely needs longer",
+        )
+        .into(),
+        Interrupt::DecompressionLimit => Status::resource_exhausted(format!(
+            "the document inflates past its decompression limits: a stream past {} bytes, or \
+             one read past {} bytes in all; raise GRPC_PDF_MAX_STREAM_BYTES or \
+             GRPC_PDF_MAX_DECOMPRESSED_BYTES if the document is genuinely this large",
+            guard.max_stream_bytes, guard.max_run_bytes
+        ))
+        .into(),
     }
 }
 
@@ -843,6 +1120,15 @@ fn map_error(error: pdf_inspector::PdfError) -> Status {
             "the PDF is encrypted; supply its password in `options.password`".to_owned(),
         ),
         PdfError::Io(error) => Status::internal(format!("unexpected I/O error: {error}")),
+        // `guarded` turns an interrupt into its own abort before it gets
+        // here; this is the code each one would carry.
+        PdfError::Interrupted(Interrupt::Deadline) => {
+            Status::deadline_exceeded("the parse ran past its time budget")
+        }
+        PdfError::Interrupted(Interrupt::DecompressionLimit) => {
+            Status::resource_exhausted("the document inflates past its decompression limits")
+        }
+        PdfError::Interrupted(Interrupt::Cancelled) => Status::cancelled("the call was cancelled"),
     }
 }
 
@@ -937,5 +1223,88 @@ mod tests {
     #[test]
     fn nothing_is_reported_for_a_page_with_no_runs_to_report_on() {
         assert!(missing(&[], "some markdown").is_empty());
+    }
+
+    /// One extracted item of the given kind on page 1.
+    fn item(text: &str, item_type: pdf_inspector::types::ItemType) -> pdf_inspector::TextItem {
+        pdf_inspector::TextItem {
+            text: text.to_owned(),
+            x: 72.0,
+            y: 700.0,
+            width: 100.0,
+            height: 10.0,
+            font: String::new(),
+            font_tag: String::new(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type,
+            mcid: None,
+        }
+    }
+
+    /// One Form XObject placement on page 1.
+    fn form() -> pdf_inspector::PdfForm {
+        pdf_inspector::PdfForm {
+            name: "Fx1".to_owned(),
+            x: 72.0,
+            y: 300.0,
+            width: 400.0,
+            height: 200.0,
+            page: 1,
+        }
+    }
+
+    #[test]
+    fn a_page_that_drew_only_a_picture_is_a_scan() {
+        use pdf_inspector::types::ItemType;
+        let image = item("[Image: Im1]", ItemType::Image);
+        assert_eq!(
+            untexted_page_reason(std::slice::from_ref(&image), None),
+            Some(pb::OcrReason::Scanned)
+        );
+        // Show operators that showed nothing are not text either.
+        assert_eq!(
+            untexted_page_reason(&[image, item("  ", ItemType::Text)], None),
+            Some(pb::OcrReason::Scanned)
+        );
+    }
+
+    #[test]
+    fn a_page_that_drew_only_a_form_has_no_text_to_read() {
+        assert_eq!(
+            untexted_page_reason(&[], Some(&vec![form()])),
+            Some(pb::OcrReason::NoText)
+        );
+    }
+
+    #[test]
+    fn a_page_with_any_text_or_with_nothing_at_all_is_not_flagged_here() {
+        use pdf_inspector::types::ItemType;
+        let image = item("[Image: Im1]", ItemType::Image);
+        assert_eq!(
+            untexted_page_reason(&[image.clone(), item("Figure 1", ItemType::Text)], None),
+            None
+        );
+        assert_eq!(
+            untexted_page_reason(&[image, item("Name: Ada", ItemType::FormField)], None),
+            None
+        );
+        // A link annotation's target is not words on the page.
+        assert_eq!(
+            untexted_page_reason(
+                &[item(
+                    "https://example.org",
+                    ItemType::Link("https://example.org".to_owned())
+                )],
+                None
+            ),
+            None,
+            "a blank page with a link stays a blank page"
+        );
+        assert_eq!(untexted_page_reason(&[], None), None, "a blank page");
     }
 }

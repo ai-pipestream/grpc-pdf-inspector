@@ -42,6 +42,14 @@ fn env_usize(name: &str, default: usize) -> usize {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before anything is bound: a limit set to something unusable stops the
+    // process here, naming the variable, rather than serving under a limit
+    // nobody chose.
+    let limits = Limits::from_env().unwrap_or_else(|error| {
+        eprintln!("grpc-pdf-inspector: refusing to start: {error}");
+        std::process::exit(2);
+    });
+
     let workers = env_usize(
         "GRPC_PDF_WORKERS",
         std::thread::available_parallelism().map_or(4, usize::from),
@@ -52,15 +60,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .worker_threads(workers)
         .build()?;
 
-    runtime.block_on(serve())
+    runtime.block_on(serve(limits))
 }
 
 /// Bind the listener and serve until a shutdown signal arrives.
-async fn serve() -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(limits: Limits) -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("GRPC_PDF_ADDR")
         .unwrap_or_else(|_| DEFAULT_ADDR.to_owned())
         .parse()?;
-    let limits = Limits::from_env();
 
     let counters: Arc<Metrics> = Metrics::new();
     metrics::spawn_reporter(

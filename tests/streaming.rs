@@ -246,3 +246,99 @@ async fn dropping_the_stream_early_frees_the_parser() {
         "the parser finished the whole document for a client that had gone away"
     );
 }
+
+/// Time the service's own extraction pass over `pdf`: the one library call
+/// between `info` and the first page, which no send or read interrupts.
+fn extraction_pass_cost(pdf: &[u8]) -> Duration {
+    let started = Instant::now();
+    let extracted =
+        pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(pdf, None)
+            .expect("extract");
+    assert!(!extracted.extraction.0.is_empty());
+    started.elapsed()
+}
+
+/// A caller that hangs up during the extraction pass stops the pass there.
+///
+/// The parser used to notice a departed caller only when it next tried to
+/// send, and between `info` and the first page there is one long library
+/// call that sends nothing. So a hung-up call kept its parse slot for the
+/// whole of the pass. The server now hears the response stream drop and
+/// the parser stops at the next page of the pass.
+#[tokio::test]
+async fn hanging_up_stops_the_extraction_pass_not_just_the_next_send() {
+    let harness = common::start().await;
+    // Twice the usual document, so the pass is long enough in a release
+    // build that the margin below is not scheduling jitter.
+    let pdf = common::text_pdf(2 * PAGES, WORDS, "hang-up-marker");
+    let pass = extraction_pass_cost(&pdf);
+
+    let mut client = harness.client.clone();
+    let frames = vec![
+        pb::ParsePdfRequest {
+            frame: Some(pb::parse_pdf_request::Frame::Options(
+                pb::PdfOptions::default(),
+            )),
+        },
+        pb::ParsePdfRequest {
+            frame: Some(pb::parse_pdf_request::Frame::Chunk(pdf)),
+        },
+    ];
+    let before = harness.metrics.snapshot().parses_failed;
+    let mut stream = client
+        .parse_pdf(tokio_stream::iter(frames))
+        .await
+        .expect("open the call")
+        .into_inner();
+    let _info = stream.message().await.expect("no error").expect("an event");
+    drop(stream);
+    let dropped = Instant::now();
+
+    while harness.metrics.snapshot().parses_failed == before {
+        assert!(
+            dropped.elapsed() < pass * 10,
+            "the abandoned parse never ended"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    // A parse that ran the pass out ends about a whole pass after the
+    // hang-up, because the hang-up lands as the pass begins.
+    let stopped_after = dropped.elapsed();
+    assert!(
+        stopped_after < pass / 2,
+        "the parse ended {stopped_after:?} after its caller hung up, when the extraction pass \
+         it was in takes {pass:?}; it ran the pass out for nobody"
+    );
+    assert_eq!(harness.metrics.snapshot().pages_emitted, 0);
+}
+
+/// A parse past its deadline stops inside the extraction pass with
+/// `DEADLINE_EXCEEDED`, rather than running to the end of the document.
+#[tokio::test]
+async fn a_parse_stops_at_its_deadline_inside_the_extraction_pass() {
+    let pdf = common::text_pdf(PAGES, WORDS, "deadline-marker");
+    let pass = extraction_pass_cost(&pdf);
+
+    let metrics = Metrics::new();
+    let (tx, mut rx) = mpsc::channel(PAGES as usize + 8);
+    let counters = Arc::clone(&metrics);
+    let guard = grpc_pdf_inspector::Limits::default()
+        .parse_guard()
+        .with_deadline(Instant::now() + pass / 4);
+    let parser = tokio::task::spawn_blocking(move || {
+        let sink = Sink::new(tx, Duration::from_secs(10));
+        parse::run_guarded(&pdf, &pb::PdfOptions::default(), &counters, &sink, &guard)
+    });
+    while rx.recv().await.is_some() {}
+
+    match parser.await.expect("the parser thread") {
+        parse::Outcome::Failed(status) => {
+            assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status:?}");
+        }
+        other => panic!("a parse past its deadline must fail, got {other:?}"),
+    }
+    assert!(
+        metrics.snapshot().pages_emitted < u64::from(PAGES),
+        "the parse finished the document after its deadline"
+    );
+}

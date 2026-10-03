@@ -23,6 +23,14 @@ It is the fleet's cheap routing answer for PDF:
   OCRs.
 - **Mixed** PDFs get both: text pages stream, the rest are reported.
 
+Every page is judged on its own content, so a scanned page inside a
+text-based document is named too, sampled or not. A scan made searchable
+(an OCRmyPDF, ABBYY or Acrobat page image with an invisible OCR layer
+behind it) is mixed: every page is named as needing OCR, because no reader
+sees that text, and in FULL mode each page's markdown is its OCR layer, as
+the parser's own OCR-layer fallback reads it, so a caller without OCR still
+gets the words.
+
 Nothing is written to disk at any point: the upload lives in one `Vec<u8>`
 and every library call is a `*_mem` entry point.
 
@@ -116,8 +124,10 @@ per-page OCR verdicts and the garble score.
   table with no rules at all falls through to inferring columns from
   alignment.
 - **`page.invisible`** — with `report_invisible` set, the runs the page drew
-  with text rendering mode 3, each with its box. They are never in the
-  markdown, because no reader saw them.
+  with text rendering mode 3, each with its box. They are not in the
+  markdown, because no reader saw them, except on a scanned page with no
+  visible text at all, whose OCR layer is its markdown and whose
+  `needs_ocr` is set.
 - **`page.garble_score`** — how far the page's letter frequencies sit from
   where a Latin-script language puts them, 0.0 for ordinary prose and
   rising towards 1.0 for a text layer whose CMap substituted every
@@ -143,7 +153,11 @@ collector's parse of the same document:
   from the markdown's ATX levels when it is not. Lists become `ListItem`s
   inside a list `GroupItem`, fenced blocks become `CodeItem`s, and a
   detected table becomes a `TableItem` with typed cells rather than pipe
-  characters inside a paragraph.
+  characters inside a paragraph. The grids and the pipe blocks come from
+  different detectors, so a pipe block takes the grid on its page that sits
+  where it sits (or, when its runs could not be located, whose cells it
+  carries); a grid no block matches stays on the `tables` event, and a
+  block no grid matches stays as the renderer printed it.
 - Every item carries a `ProvenanceItem` naming its page, with a bounding
   box whenever the page's runs could be located behind the item's text.
   `PageItem.unit` says those boxes are in points, and `PageItem.size`
@@ -185,10 +199,23 @@ collector's parse of the same document:
 - Default off costs nothing: no fold is built and no markdown is
   retained.
 
-Errors: oversize upload → `RESOURCE_EXHAUSTED`; not-a-PDF / truncated /
-malformed / encrypted-without-password / page 0 → `INVALID_ARGUMENT`;
-parser panic → `INTERNAL`. Events already delivered before a failure remain
-valid.
+Errors: oversize upload, or a document that inflates past its
+decompression limits → `RESOURCE_EXHAUSTED`; not-a-PDF / truncated /
+malformed / encrypted-without-password / a page selection with no usable
+page → `INVALID_ARGUMENT`; a
+call that holds its parse slot past `GRPC_PDF_MAX_PARSE_SECONDS`, an
+upload still arriving after `GRPC_PDF_MAX_UPLOAD_SECONDS`, or an upload
+that sends no bytes for 30 seconds (empty chunks are not bytes) →
+`DEADLINE_EXCEEDED`; parser panic → `INTERNAL`. Events already delivered
+before a failure remain valid. Every parser pass runs under those limits:
+each stream is decoded against the per-stream cap and the read's budget,
+and the parse checks its deadline, and whether its caller is still there,
+between pages, so a hung-up or overdue call gives its slot back within a
+page rather than at the end of the document. That does not hold while the
+document is loading: lopdf decodes the cross-reference and object streams
+before the first page with no check of either, so a call whose document is
+slow to load keeps its slot until loading ends (see
+`docs/capture-deferrals.md`).
 
 Passwords: supply `options.password` for an encrypted PDF. The library's
 per-page extraction API takes no password, so FULL mode with a password
@@ -198,6 +225,14 @@ plus a `PARSE_WARNING_CODE_PASSWORD_FALLBACK` warning.
 Page indexing: the wire is 1-indexed everywhere. The library's per-page
 extraction API is 0-indexed; the conversion lives in `src/parse.rs`, at the
 library boundary, and nowhere else.
+
+Page selection: `options.pages` lists pages, each processed once in the
+order first listed; a listed page past the end is left out and the trailer
+says so with `PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE`. `options.first_page`
+and `options.last_page` select an inclusive span instead, clamped to the
+document, so "page 5 to the end" is `first_page: 5`. A selection that
+names page 0, sets both forms, runs backwards, or leaves no page of the
+document selected is `INVALID_ARGUMENT`, before any event is sent.
 
 ## Run
 
@@ -216,7 +251,11 @@ Configuration is environment-only:
 | `GRPC_PDF_ADDR` | `0.0.0.0:50067` | Listen address. |
 | `GRPC_PDF_MAX_BYTES` | `134217728` (128 MiB) | Largest accepted upload. |
 | `GRPC_PDF_MAX_CHUNK_BYTES` | `16777216` (16 MiB) | Largest single `chunk` frame. |
-| `GRPC_PDF_MAX_CONCURRENT_PARSES` | `8` | Concurrent parse calls; further calls wait. |
+| `GRPC_PDF_MAX_CONCURRENT_PARSES` | `8` | Concurrent calls, uploading or parsing; further calls wait, before their upload is read. |
+| `GRPC_PDF_MAX_STREAM_BYTES` | `268435456` (256 MiB) | Largest size any one stream of a document may decompress to. |
+| `GRPC_PDF_MAX_DECOMPRESSED_BYTES` | `4294967296` (4 GiB) | Largest total one read of a document may decompress to. |
+| `GRPC_PDF_MAX_PARSE_SECONDS` | `300` | Longest a call may hold its parse slot, upload included. At most `86400` (a day), or the server refuses to start. |
+| `GRPC_PDF_MAX_UPLOAD_SECONDS` | `60` | Longest a call's upload may take once it holds its slot; it also spends the parse budget. Must be a whole number of seconds from 1 to `86400`, or the server refuses to start. |
 | `GRPC_PDF_WORKERS` | CPU count | Tokio worker threads. |
 | `GRPC_PDF_WINDOW_BYTES` | `4194304` | HTTP/2 initial window (stream and connection). |
 | `GRPC_PDF_METRICS_INTERVAL_SECS` | `60` | Seconds between metrics lines; 0 disables. |

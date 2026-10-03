@@ -13,13 +13,16 @@
 //! - **Nothing touches disk.** The upload lives in one `Vec<u8>` and every
 //!   library call is the `*_mem` entry point; the container runs read-only.
 //! - **The stream is the product.** `info` goes out the moment detection
-//!   returns, each `page` goes out as that page's markdown is ready, and
+//!   returns, each `page` goes out as that page's markdown is rendered
+//!   (extraction itself reads the selected pages in one pass first), and
 //!   `status` is a trailer of counts, never the payload.
 //! - **Hostile input is the normal case.** Every call into the parser is
 //!   wrapped in [`std::panic::catch_unwind`] (lopdf can panic on malformed
 //!   input) and runs on [`tokio::task::spawn_blocking`] (extraction is
 //!   CPU-bound and parallelizes internally with rayon). A panic becomes an
-//!   `INTERNAL` status, never a wedged stream.
+//!   `INTERNAL` status, never a wedged stream. Every call also runs under a
+//!   [`pdf_inspector::ParseGuard`]: streams decode within the configured
+//!   limits, and the parse stops at a deadline or when its caller leaves.
 
 pub mod document_fold;
 pub mod emphasis;
@@ -35,7 +38,7 @@ pub mod spans;
 pub mod structure;
 pub mod tables;
 
-pub use limits::Limits;
+pub use limits::{InvalidLimit, Limits};
 pub use metrics::Metrics;
 pub use service::PdfGrpc;
 

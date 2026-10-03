@@ -12,13 +12,14 @@
 //! slow reader slows the parser rather than growing a queue behind it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::limits::Limits;
+use crate::limits::{Limits, MAX_TIME_BUDGET_SECONDS};
 use crate::metrics::Metrics;
 use crate::parse::{self, Outcome, Sink};
 use crate::proto::v1 as pb;
@@ -38,6 +39,15 @@ const OUTBOUND_BUFFER: usize = 4;
 /// restarted.
 const CONSUMER_STALL: Duration = Duration::from_secs(30);
 
+/// How long an admitted call may go without sending any upload bytes.
+///
+/// The call holds a parse slot while it uploads, so a client that opens a
+/// stream and then sends nothing would hold the slot for its whole upload
+/// budget. One that has sent nothing for this long has abandoned the call.
+/// Only bytes count: a frame with an empty chunk, or with no frame at all,
+/// is not progress.
+const UPLOAD_STALL: Duration = Duration::from_secs(30);
+
 /// The `ai.pipestream.pdf.v1.PdfParseService` implementation.
 pub struct PdfGrpc {
     /// The ceilings this server enforces.
@@ -47,6 +57,9 @@ pub struct PdfGrpc {
     /// Bounds how many calls may parse at once, capping CPU and heap rather
     /// than shedding load: a call past the bound waits for a permit.
     parse_slots: Arc<tokio::sync::Semaphore>,
+    /// How long an upload may go without a byte; [`UPLOAD_STALL`] unless a
+    /// test shortened it.
+    upload_stall: Duration,
 }
 
 impl PdfGrpc {
@@ -68,7 +81,19 @@ impl PdfGrpc {
             limits,
             metrics,
             parse_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent_parses)),
+            upload_stall: UPLOAD_STALL,
         }
+    }
+
+    /// Give up on an upload after `stall` without a byte, instead of
+    /// [`UPLOAD_STALL`].
+    ///
+    /// Not a deployment setting: it exists so a test can watch a stall end
+    /// without waiting half a minute for it.
+    #[must_use]
+    pub fn with_upload_stall(mut self, stall: Duration) -> Self {
+        self.upload_stall = stall;
+        self
     }
 
     /// The counters this service reports into.
@@ -125,32 +150,67 @@ impl pb::pdf_parse_service_server::PdfParseService for PdfGrpc {
             }
         };
 
-        let bytes = self.receive(&mut inbound).await?;
-
-        // Acquired before the upload is handed to a thread, so the memory
-        // ceiling counts calls that are actually parsing.
+        // Admission comes before the upload is buffered, so the memory
+        // ceiling (max_concurrent_parses uploads of max_document_bytes each)
+        // counts every buffered upload rather than only the ones being
+        // parsed. A call waiting for a slot holds nothing but what the
+        // transport's flow-control window lets its client send ahead.
         let permit = Arc::clone(&self.parse_slots)
             .acquire_owned()
             .await
             .map_err(|_| Status::unavailable("the server is shutting down"))?;
+        // The call's time budget starts with its slot, and the upload
+        // spends it too: the slot is what the budget protects. The upload
+        // has a shorter budget of its own inside it, so a client trickling
+        // bytes cannot keep the slot for the whole parse budget.
+        let admitted = Instant::now();
+        let deadline = deadline_after(admitted, self.limits.max_parse_time);
+        let upload_deadline = deadline.min(deadline_after(admitted, self.limits.max_upload_time));
+
+        let bytes = self
+            .receive(&mut inbound, deadline, upload_deadline)
+            .await?;
+
+        // The call's limits: how far the document may inflate, how long the
+        // call may hold its slot, and a flag the supervisor below sets when
+        // nobody is listening any more. The parser checks the last two
+        // between pages, so a pathological document cannot hold a slot past
+        // its budget or past its caller.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let guard = self
+            .limits
+            .parse_guard()
+            .with_deadline(deadline)
+            .with_cancel(Arc::clone(&cancel));
 
         self.metrics.parse_started();
         let metrics = Arc::clone(&self.metrics);
         let (tx, rx) = mpsc::channel(OUTBOUND_BUFFER);
         let supervisor = tx.clone();
 
-        let handle = tokio::task::spawn_blocking(move || {
+        let mut handle = tokio::task::spawn_blocking(move || {
             let sink = Sink::new(tx, CONSUMER_STALL);
-            parse::run(&bytes, &options, &metrics, &sink)
+            parse::run_guarded(&bytes, &options, &metrics, &sink, &guard)
         });
 
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
+            // A caller that hangs up mid-parse is heard here, the moment the
+            // response stream is dropped, rather than at the parser's next
+            // send: a document's extraction pass can run a long time between
+            // two events, and the slot it holds is somebody else's.
+            let joined = tokio::select! {
+                joined = &mut handle => joined,
+                () = supervisor.closed() => {
+                    cancel.store(true, Ordering::Relaxed);
+                    handle.await
+                }
+            };
             // A panic drops the parser's sender, and without this the stream
             // would end *successfully* with whatever had been delivered — a
             // truncated document indistinguishable from a short one. The
             // supervisor's own sender is what makes the difference reportable.
-            let status = match handle.await {
+            let status = match joined {
                 Ok(Outcome::Complete) => {
                     metrics.parse_succeeded();
                     None
@@ -210,12 +270,43 @@ impl PdfGrpc {
     /// end of the file, so no page is readable until the last byte has
     /// arrived. The cap is checked as bytes land rather than at the end, so a
     /// hostile upload is cut off at the limit instead of after it.
+    ///
+    /// The call already holds its parse slot, so the upload is bounded in
+    /// time as well: it ends at `upload_deadline`, which is never later than
+    /// the call's `deadline`, and after the stall window without a byte.
     async fn receive(
         &self,
         inbound: &mut Streaming<pb::ParsePdfRequest>,
+        deadline: Instant,
+        upload_deadline: Instant,
     ) -> Result<Vec<u8>, Status> {
         let mut bytes: Vec<u8> = Vec::new();
-        while let Some(request) = inbound.message().await? {
+        let mut progressed = Instant::now();
+        loop {
+            let wait_until = upload_deadline.min(progressed + self.upload_stall);
+            let next = tokio::time::timeout_at(wait_until.into(), inbound.message()).await;
+            let Ok(next) = next else {
+                let now = Instant::now();
+                return Err(Status::deadline_exceeded(if now >= deadline {
+                    "the call ran past its time budget while its upload was still arriving; \
+                     raise GRPC_PDF_MAX_PARSE_SECONDS if uploads genuinely take this long"
+                        .to_owned()
+                } else if now >= upload_deadline {
+                    format!(
+                        "the upload was still arriving after its {} second budget; raise \
+                         GRPC_PDF_MAX_UPLOAD_SECONDS if uploads genuinely take this long",
+                        self.limits.max_upload_time.as_secs()
+                    )
+                } else {
+                    format!(
+                        "no upload bytes arrived for {:?}, so the call was abandoned",
+                        self.upload_stall
+                    )
+                }));
+            };
+            let Some(request) = next? else {
+                break;
+            };
             let chunk = match request.frame {
                 Some(pb::parse_pdf_request::Frame::Chunk(chunk)) => chunk,
                 Some(pb::parse_pdf_request::Frame::Options(_)) => {
@@ -227,6 +318,11 @@ impl PdfGrpc {
                 // rather than treat it as the end of the upload.
                 None => continue,
             };
+            // Nor does an empty chunk, and neither counts as progress: only
+            // bytes put off the stall.
+            if chunk.is_empty() {
+                continue;
+            }
             if chunk.len() as u64 > self.limits.max_chunk_bytes {
                 return Err(Status::invalid_argument(format!(
                     "chunk of {} bytes exceeds the {} byte frame limit; split the upload into \
@@ -244,6 +340,7 @@ impl PdfGrpc {
                 )));
             }
             bytes.extend_from_slice(&chunk);
+            progressed = Instant::now();
         }
         self.metrics.uploaded(bytes.len() as u64);
         if bytes.is_empty() {
@@ -251,6 +348,17 @@ impl PdfGrpc {
         }
         Ok(bytes)
     }
+}
+
+/// `start` plus `budget`, or plus [`MAX_TIME_BUDGET_SECONDS`] for a budget
+/// too long for an `Instant` to hold.
+///
+/// [`Limits::from_env`] refuses such a budget, but `Limits` is plain data
+/// and can be built without it; a call must not panic because of that.
+fn deadline_after(start: Instant, budget: Duration) -> Instant {
+    start
+        .checked_add(budget)
+        .unwrap_or_else(|| start + Duration::from_secs(MAX_TIME_BUDGET_SECONDS))
 }
 
 /// Render a `JoinError` into something worth putting on the wire.
