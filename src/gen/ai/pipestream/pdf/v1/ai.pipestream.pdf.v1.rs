@@ -10,6 +10,13 @@ pub struct PdfOptions {
     /// rejected with INVALID_ARGUMENT. Detection always covers the whole
     /// document; this selects which pages are analyzed or extracted.
     ///
+    /// A page listed twice is processed once, in the place it was first
+    /// listed. A page past the end of the document is left out and the
+    /// trailer carries PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE; a list in which
+    /// no page exists fails with INVALID_ARGUMENT rather than succeeding with
+    /// nothing. For a span of pages, prefer `first_page` and `last_page`:
+    /// they cost two numbers however long the span is.
+    ///
     /// Note the indexing: PDF page numbers on this wire are 1-indexed, as
     /// they are in every viewer. (The underlying library's per-page
     /// extraction API is 0-indexed; the server converts.)
@@ -128,6 +135,20 @@ pub struct PdfOptions {
     /// taken only for a document that actually drew invisible text.
     #[prost(bool, tag="10")]
     pub report_invisible: bool,
+    /// The first page of an inclusive span of pages to process, 1-indexed.
+    /// Absent means the first page. Setting it, or `last_page`, selects the
+    /// span instead of `pages`, and setting both a span and `pages` is
+    /// INVALID_ARGUMENT, as are page 0 and a span that ends before it starts.
+    /// A span that starts past the end of the document selects no page and
+    /// fails with INVALID_ARGUMENT.
+    #[prost(uint32, optional, tag="11")]
+    pub first_page: ::core::option::Option<u32>,
+    /// The last page of the span, inclusive. Absent means the last page of
+    /// the document, and so does any value past it: a span is clamped to the
+    /// document without a warning, so "from page 5 to the end" is
+    /// `first_page: 5` and nothing else.
+    #[prost(uint32, optional, tag="12")]
+    pub last_page: ::core::option::Option<u32>,
 }
 /// TableCells is one row of a detected table.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -744,8 +765,9 @@ pub struct ParseWarning {
 /// positions, after `info` has already gone out.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ParseStatus {
-    /// How many `page` events were emitted. Equals the number of requested
-    /// pages on a complete FULL stream; zero in DETECT_ONLY and ANALYZE.
+    /// How many `page` events were emitted. Equals the number of selected
+    /// pages that exist, each counted once, on a complete FULL stream; zero
+    /// in DETECT_ONLY and ANALYZE.
     #[prost(uint32, tag="1")]
     pub pages_extracted: u32,
     /// Non-fatal observations, in the order they occurred.
@@ -765,7 +787,8 @@ pub struct ParseStatus {
     pub processing_time_ms: u64,
     /// Per-page OCR reasons from the pass that read the text layer, as
     /// distinct from `PdfInfo.ocr_reasons`, which comes from the sampling
-    /// detection. Populated in ANALYZE and FULL.
+    /// detection. Populated in ANALYZE and FULL, for the selected pages only:
+    /// `PdfInfo` is about the whole document, this is about the pages read.
     ///
     /// In FULL this names every extracted page that needs OCR: the pages
     /// detection named, pages whose text decoded to mojibake, pages that drew
@@ -1347,6 +1370,9 @@ pub enum ParseWarningCode {
     /// read, so no `metadata` event was sent. The text extraction is
     /// unaffected: this reports a gap, not a failure.
     MetadataUnavailable = 2,
+    /// Some pages listed in `PdfOptions.pages` are past the end of the
+    /// document. They were left out; the pages that exist were processed.
+    PagesOutOfRange = 3,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1358,6 +1384,7 @@ impl ParseWarningCode {
             Self::Unspecified => "PARSE_WARNING_CODE_UNSPECIFIED",
             Self::PasswordFallback => "PARSE_WARNING_CODE_PASSWORD_FALLBACK",
             Self::MetadataUnavailable => "PARSE_WARNING_CODE_METADATA_UNAVAILABLE",
+            Self::PagesOutOfRange => "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1366,6 +1393,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_UNSPECIFIED" => Some(Self::Unspecified),
             "PARSE_WARNING_CODE_PASSWORD_FALLBACK" => Some(Self::PasswordFallback),
             "PARSE_WARNING_CODE_METADATA_UNAVAILABLE" => Some(Self::MetadataUnavailable),
+            "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE" => Some(Self::PagesOutOfRange),
             _ => None,
         }
     }

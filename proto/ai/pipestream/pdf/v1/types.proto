@@ -51,6 +51,13 @@ message PdfOptions {
   // rejected with INVALID_ARGUMENT. Detection always covers the whole
   // document; this selects which pages are analyzed or extracted.
   //
+  // A page listed twice is processed once, in the place it was first
+  // listed. A page past the end of the document is left out and the
+  // trailer carries PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE; a list in which
+  // no page exists fails with INVALID_ARGUMENT rather than succeeding with
+  // nothing. For a span of pages, prefer `first_page` and `last_page`:
+  // they cost two numbers however long the span is.
+  //
   // Note the indexing: PDF page numbers on this wire are 1-indexed, as
   // they are in every viewer. (The underlying library's per-page
   // extraction API is 0-indexed; the server converts.)
@@ -168,6 +175,20 @@ message PdfOptions {
   // themselves on, and it costs a second walk of the content streams,
   // taken only for a document that actually drew invisible text.
   bool report_invisible = 10;
+
+  // The first page of an inclusive span of pages to process, 1-indexed.
+  // Absent means the first page. Setting it, or `last_page`, selects the
+  // span instead of `pages`, and setting both a span and `pages` is
+  // INVALID_ARGUMENT, as are page 0 and a span that ends before it starts.
+  // A span that starts past the end of the document selects no page and
+  // fails with INVALID_ARGUMENT.
+  optional uint32 first_page = 11;
+
+  // The last page of the span, inclusive. Absent means the last page of
+  // the document, and so does any value past it: a span is clamped to the
+  // document without a warning, so "from page 5 to the end" is
+  // `first_page: 5` and nothing else.
+  optional uint32 last_page = 12;
 }
 
 // TableKind separates a real data table from a table of contents.
@@ -1039,6 +1060,10 @@ enum ParseWarningCode {
   // read, so no `metadata` event was sent. The text extraction is
   // unaffected: this reports a gap, not a failure.
   PARSE_WARNING_CODE_METADATA_UNAVAILABLE = 2;
+
+  // Some pages listed in `PdfOptions.pages` are past the end of the
+  // document. They were left out; the pages that exist were processed.
+  PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE = 3;
 }
 
 // ParseWarning is one non-fatal observation, carried on ParseStatus.
@@ -1058,8 +1083,9 @@ message ParseWarning {
 // rather than on `info` because it is computed from extracted text
 // positions, after `info` has already gone out.
 message ParseStatus {
-  // How many `page` events were emitted. Equals the number of requested
-  // pages on a complete FULL stream; zero in DETECT_ONLY and ANALYZE.
+  // How many `page` events were emitted. Equals the number of selected
+  // pages that exist, each counted once, on a complete FULL stream; zero
+  // in DETECT_ONLY and ANALYZE.
   uint32 pages_extracted = 1;
 
   // Non-fatal observations, in the order they occurred.
@@ -1079,7 +1105,8 @@ message ParseStatus {
 
   // Per-page OCR reasons from the pass that read the text layer, as
   // distinct from `PdfInfo.ocr_reasons`, which comes from the sampling
-  // detection. Populated in ANALYZE and FULL.
+  // detection. Populated in ANALYZE and FULL, for the selected pages only:
+  // `PdfInfo` is about the whole document, this is about the pages read.
   //
   // In FULL this names every extracted page that needs OCR: the pages
   // detection named, pages whose text decoded to mojibake, pages that drew

@@ -59,8 +59,10 @@ service PdfParseService {
   //                       (`ServerLimits.max_stream_bytes`,
   //                       `ServerLimits.max_decompressed_bytes`)
   //   INVALID_ARGUMENT    not a PDF, truncated or malformed, encrypted
-  //                       without a working password, or page 0 in
-  //                       `options.pages`
+  //                       without a working password, or a page selection
+  //                       that names page 0, sets both `options.pages`
+  //                       and a span, runs backwards, or selects no page
+  //                       the document has
   //   DEADLINE_EXCEEDED   the call held its parse slot past
   //                       `ServerLimits.max_parse_seconds`
   //   INTERNAL            a bug here; the parser panicked

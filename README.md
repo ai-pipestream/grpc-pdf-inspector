@@ -201,7 +201,8 @@ collector's parse of the same document:
 
 Errors: oversize upload, or a document that inflates past its
 decompression limits → `RESOURCE_EXHAUSTED`; not-a-PDF / truncated /
-malformed / encrypted-without-password / page 0 → `INVALID_ARGUMENT`; a
+malformed / encrypted-without-password / a page selection with no usable
+page → `INVALID_ARGUMENT`; a
 call that holds its parse slot past `GRPC_PDF_MAX_PARSE_SECONDS` →
 `DEADLINE_EXCEEDED`; parser panic → `INTERNAL`. Events already delivered
 before a failure remain valid. Every parser pass runs under those limits:
@@ -218,6 +219,14 @@ plus a `PARSE_WARNING_CODE_PASSWORD_FALLBACK` warning.
 Page indexing: the wire is 1-indexed everywhere. The library's per-page
 extraction API is 0-indexed; the conversion lives in `src/parse.rs`, at the
 library boundary, and nowhere else.
+
+Page selection: `options.pages` lists pages, each processed once in the
+order first listed; a listed page past the end is left out and the trailer
+says so with `PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE`. `options.first_page`
+and `options.last_page` select an inclusive span instead, clamped to the
+document, so "page 5 to the end" is `first_page: 5`. A selection that
+names page 0, sets both forms, runs backwards, or leaves no page of the
+document selected is `INVALID_ARGUMENT`, before any event is sent.
 
 ## Run
 

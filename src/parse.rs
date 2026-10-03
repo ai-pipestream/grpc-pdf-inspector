@@ -248,13 +248,9 @@ fn parse(
         known => known,
     };
 
-    // Page 0 cannot be rejected by the library — its 1-indexed filter would
-    // treat it as out of range and its 0-indexed extractor would treat it as
-    // the first page — so it is rejected here, where it is still a caller
-    // mistake rather than a silent wrong answer.
-    if options.pages.contains(&0) {
-        return Err(Status::invalid_argument("pages are 1-indexed; page 0 does not exist").into());
-    }
+    // What is wrong with the page selection whatever the document is, said
+    // before the document is read.
+    check_selection(options)?;
 
     // Pass one: classification. Cheap, and the reason this stream opens with
     // an answer instead of with work.
@@ -270,6 +266,12 @@ fn parse(
     // `extraction_ocr_reasons` is these merged with what reading the text
     // layer concludes, exactly as the analysis pass used to merge them.
     let detection_reasons = detected.ocr_reasons_by_page.clone();
+
+    // The pages the call selected, resolved against the document before
+    // anything is sent: a selection with no page in the document is a
+    // caller mistake, not an empty success.
+    let mut warnings = Vec::new();
+    let selection = select(options, detected.page_count, &mut warnings)?;
 
     // The optional second consumer of this stream: when the caller asked for
     // a Document, every event is folded on its way out and the folded
@@ -298,8 +300,6 @@ fn parse(
         detection_time_ms: detected.processing_time_ms,
         ocr_recommended: detected.ocr_recommended,
     }))?;
-
-    let mut warnings = Vec::new();
 
     // What the file says about itself, read from its own dictionaries by a
     // second reader. It goes out immediately after `info` so that a
@@ -350,7 +350,10 @@ fn parse(
         pb::ProcessMode::Analyze => {
             metrics.parser_pass();
             let analyzed = guarded(guard, || {
-                pdf_inspector::process_pdf_mem_with_options(bytes, analyze_options(options))
+                pdf_inspector::process_pdf_mem_with_options(
+                    bytes,
+                    analyze_options(options, &selection),
+                )
             })?;
             layout = Some(layout_proto(&analyzed.layout));
             has_encoding_issues = analyzed.has_encoding_issues;
@@ -361,8 +364,8 @@ fn parse(
             // document is extracted whole and delivered as one event. The
             // trailer says so; `page_no` 0 means "the document".
             let mut full = PdfOptions::new();
-            if !options.pages.is_empty() {
-                full = full.pages(options.pages.iter().copied());
+            if let Selection::Pages(pages) = &selection {
+                full = full.pages(pages.iter().copied());
             }
             full = full.password(options.password.clone());
             metrics.parser_pass();
@@ -413,8 +416,7 @@ fn parse(
             // in hand instead of being rendered away inside the library;
             // and the vector geometry with them, so the ruled-table
             // detectors are reachable at all.
-            let filter: Option<HashSet<u32>> =
-                (!options.pages.is_empty()).then(|| options.pages.iter().copied().collect());
+            let filter = selection.filter();
             metrics.parser_pass();
             // With the library's OCR-layer fallback: a scanned page made
             // searchable draws no visible text, and its runs are its
@@ -488,11 +490,10 @@ fn parse(
             // Untagged documents return an empty list, which is the honest
             // answer rather than a failure.
             let mut structure = if events.wanted(options.emit_structure) {
-                let selected: Option<Vec<u32>> =
-                    (!options.pages.is_empty()).then(|| options.pages.clone());
+                let selected = selection.listed();
                 metrics.parser_pass();
                 let elements = guarded(guard, || {
-                    pdf_inspector::extract_structure_elements_mem(bytes, selected.as_deref())
+                    pdf_inspector::extract_structure_elements_mem(bytes, selected)
                 })?;
                 structure::by_page(elements)
             } else {
@@ -504,7 +505,7 @@ fn parse(
             let mut pages_with_tables = Vec::new();
             let mut pages_with_columns = Vec::new();
 
-            for page_no in requested_pages(options, detected.page_count) {
+            for page_no in selection.pages(detected.page_count) {
                 // Rendering, tables and the fold run here rather than in
                 // the parser, so the call's time is checked here too.
                 check(guard)?;
@@ -678,6 +679,12 @@ fn parse(
         }
     }
 
+    // The trailer answers for the pages that were read. Detection's verdicts
+    // cover the whole document and went out on `info`.
+    if let Some(selected) = selection.filter() {
+        extraction_ocr_reasons.retain(|reasons| selected.contains(&reasons.page));
+    }
+
     // The fold has seen every content event now, so its Document goes out
     // here — after the last `page`, before the `status` trailer that closes
     // the stream.
@@ -764,33 +771,138 @@ fn replacement_runs(text: &str) -> u32 {
     runs
 }
 
-/// The 1-indexed pages a call asks for, in the order it asked for them.
-///
-/// An empty filter means every page. A page past the end of the document is
-/// dropped rather than answered with an empty event: the caller asked about
-/// something that does not exist, and inventing a page for it would be a
-/// worse answer than saying nothing.
-fn requested_pages(options: &pb::PdfOptions, page_count: u32) -> Vec<u32> {
-    if options.pages.is_empty() {
-        (1..=page_count).collect()
-    } else {
-        options
-            .pages
-            .iter()
-            .copied()
-            .filter(|page| *page <= page_count)
-            .collect()
+/// The pages a call selected, resolved against the document.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Selection {
+    /// Every page.
+    All,
+    /// These 1-indexed pages, in the order the call asked for them, each
+    /// once, and every one of them in the document.
+    Pages(Vec<u32>),
+}
+
+impl Selection {
+    /// The pages to walk, in order.
+    fn pages(&self, page_count: u32) -> Vec<u32> {
+        match self {
+            Self::All => (1..=page_count).collect(),
+            Self::Pages(pages) => pages.clone(),
+        }
+    }
+
+    /// The pages as a library page filter: `None` for every page. An empty
+    /// filter means "all pages" on the wire but "no pages" to the library,
+    /// so every page is spelled as no filter at all.
+    fn filter(&self) -> Option<HashSet<u32>> {
+        self.listed().map(|pages| pages.iter().copied().collect())
+    }
+
+    /// The selected pages, or `None` for every page.
+    fn listed(&self) -> Option<&[u32]> {
+        match self {
+            Self::All => None,
+            Self::Pages(pages) => Some(pages),
+        }
     }
 }
 
+/// Refuse what is wrong with a page selection whatever the document is.
+///
+/// Page 0 cannot be refused by the library — its 1-indexed filter would
+/// treat it as out of range and its 0-indexed extractor would treat it as
+/// the first page — so it is refused here, where it is still a caller
+/// mistake rather than a silent wrong answer. A list and a span at once
+/// would leave which one counts to a guess, so they are refused too.
+fn check_selection(options: &pb::PdfOptions) -> Result<(), Status> {
+    let zero = || Status::invalid_argument("pages are 1-indexed; page 0 does not exist");
+    if options.pages.contains(&0) || options.first_page == Some(0) || options.last_page == Some(0) {
+        return Err(zero());
+    }
+    let spanned = options.first_page.is_some() || options.last_page.is_some();
+    if spanned && !options.pages.is_empty() {
+        return Err(Status::invalid_argument(
+            "select pages with either `pages` or `first_page`/`last_page`, not both",
+        ));
+    }
+    if let (Some(first), Some(last)) = (options.first_page, options.last_page)
+        && first > last
+    {
+        return Err(Status::invalid_argument(format!(
+            "the page span ends on page {last}, before it starts on page {first}"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve a call's page selection against the document's page count.
+///
+/// A listed page is selected once, in the place it was first listed, and a
+/// listed page past the end is left out with a
+/// `PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE` warning: the caller asked about
+/// something that does not exist, and inventing a page for it would be a
+/// worse answer than saying so. A span is clamped to the document, which is
+/// what a span means. A selection with no page in the document at all is
+/// `INVALID_ARGUMENT`, because an empty success would read as a document
+/// with nothing in it.
+fn select(
+    options: &pb::PdfOptions,
+    page_count: u32,
+    warnings: &mut Vec<pb::ParseWarning>,
+) -> Result<Selection, Status> {
+    let none_exist = || {
+        Status::invalid_argument(format!(
+            "none of the selected pages exist; the document has {page_count} page(s)"
+        ))
+    };
+    if options.first_page.is_some() || options.last_page.is_some() {
+        let first = options.first_page.unwrap_or(1);
+        let last = options.last_page.unwrap_or(page_count).min(page_count);
+        if first > last {
+            return Err(none_exist());
+        }
+        return Ok(Selection::Pages((first..=last).collect()));
+    }
+    if options.pages.is_empty() {
+        return Ok(Selection::All);
+    }
+    let mut seen = vec![false; page_count as usize + 1];
+    let mut pages = Vec::new();
+    let mut out_of_range = 0usize;
+    let mut first_out_of_range = None;
+    for &page in &options.pages {
+        match seen.get_mut(page as usize) {
+            Some(seen) if !*seen => {
+                *seen = true;
+                pages.push(page);
+            }
+            Some(_) => {}
+            None => {
+                out_of_range += 1;
+                first_out_of_range.get_or_insert(page);
+            }
+        }
+    }
+    if pages.is_empty() {
+        return Err(none_exist());
+    }
+    if let Some(first) = first_out_of_range {
+        warnings.push(pb::ParseWarning {
+            code: pb::ParseWarningCode::PagesOutOfRange.into(),
+            message: format!(
+                "{out_of_range} listed page(s), the first of them page {first}, are past the end \
+                 of the {page_count}-page document and were left out"
+            ),
+        });
+    }
+    Ok(Selection::Pages(pages))
+}
+
 /// The library options for the analysis pass, honouring the call's page
-/// filter and password.
-fn analyze_options(options: &pb::PdfOptions) -> PdfOptions {
+/// selection and password.
+fn analyze_options(options: &pb::PdfOptions, selection: &Selection) -> PdfOptions {
     let mut analyze = PdfOptions::new().mode(ProcessMode::Analyze);
-    // An empty filter means "all pages" on the wire but "no pages" to the
-    // library, so it is only set when the caller named pages.
-    if !options.pages.is_empty() {
-        analyze = analyze.pages(options.pages.iter().copied());
+    if let Selection::Pages(pages) = selection {
+        analyze = analyze.pages(pages.iter().copied());
     }
     if !options.password.is_empty() {
         analyze = analyze.password(options.password.clone());
