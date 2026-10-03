@@ -213,6 +213,9 @@ pub(crate) fn detect_from_document(
     let mut pages_with_images = 0u32;
     let mut pages_with_template_images = 0u32;
     let mut pages_with_vector_text = 0u32;
+    // Pages whose text is all drawn invisibly over an image: a scan carrying
+    // an OCR layer.
+    let mut pages_with_ocr_layer = 0u32;
     let mut total_text_ops = 0u32;
     // Cache Phase 1 results to avoid re-analyzing sampled pages in Phase 2
     let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
@@ -239,13 +242,19 @@ pub(crate) fn detect_from_document(
             } else {
                 config.min_text_ops_per_page
             };
-            if analysis.text_operator_count >= effective_min_ops
+            let is_text_page = analysis.text_operator_count >= effective_min_ops
                 && !is_image_dominated
                 && analysis.unique_text_chars >= 5
                 && !analysis.has_vector_text
-                && !analysis.has_only_type3_fonts
-            {
+                && !analysis.has_only_type3_fonts;
+            if is_text_page {
                 pages_with_text += 1;
+            }
+            // A scan carrying an OCR layer (OCRmyPDF, ABBYY, "make
+            // searchable"): its text is drawn invisibly over the image, and
+            // what little is visible does not make it a text page.
+            if !is_text_page && analysis.has_images && analysis.invisible_text_operator_count > 0 {
+                pages_with_ocr_layer += 1;
             }
             if analysis.has_images {
                 pages_with_images += 1;
@@ -306,8 +315,14 @@ pub(crate) fn detect_from_document(
     // 2. PDF is scanned/image-based
     let ocr_recommended: bool;
 
+    // A scan carrying an OCR layer is Mixed rather than Scanned: no reader
+    // sees its text, so every such page needs OCR, but the layer is still a
+    // text layer that extraction can recover, which a Scanned verdict would
+    // skip. It is the template case with the text drawn invisibly.
+    let is_template = (has_template_images && pages_with_text > 0) || pages_with_ocr_layer > 0;
+
     // Classification logic
-    let (pdf_type, confidence) = if has_template_images && pages_with_text > 0 {
+    let (pdf_type, confidence) = if is_template {
         ocr_recommended = true;
         // Template-based PDF: has text but images provide essential context
         (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
@@ -376,11 +391,17 @@ pub(crate) fn detect_from_document(
         ocr_recommended
     };
 
-    // Phase 2: Build per-page OCR list
+    // Phase 2: Build per-page OCR list.
+    //
+    // A page's own content decides whether it needs OCR, whatever the sample
+    // made of the document. A text-based verdict rests on a handful of
+    // sampled pages, and the scanned appendix the sample never reached is a
+    // scan all the same: it used to be listed for a mixed document and
+    // silently dropped from a text-based one. Phase 3 below reads every page
+    // that is not cached here anyway, so this costs no extra pass.
     let mut pages_needing_ocr = match pdf_type {
-        PdfType::TextBased => Vec::new(),
         PdfType::Scanned | PdfType::ImageBased => (1..=total_pages).collect(),
-        PdfType::Mixed => {
+        PdfType::TextBased | PdfType::Mixed => {
             let mut ocr_pages = Vec::new();
             for page_num in 1..=total_pages {
                 let analysis = if let Some(cached) = analysis_cache.get(&page_num) {
@@ -522,7 +543,12 @@ fn distribute_pages(n: u32, total: u32) -> Vec<u32> {
 /// Page content analysis result
 #[derive(Clone, Default)]
 struct PageAnalysis {
+    /// Text-showing operators drawn in a rendering mode that paints glyphs.
     text_operator_count: u32,
+    /// Text-showing operators drawn with rendering mode 3, which paints
+    /// nothing. A scan with an OCR layer behind its raster has these and no
+    /// visible text at all.
+    invisible_text_operator_count: u32,
     has_images: bool,
     /// Whether page has a large background/template image (>50% coverage)
     has_template_image: bool,
@@ -740,11 +766,7 @@ fn resolve_with_shadowing(
 
 /// Analyze a page's content stream for text operators and images
 fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
-    let mut text_ops = 0u32;
-    let mut has_images = false;
-    let mut image_count = 0u32;
-    let mut path_ops = 0u32;
-    let mut font_changes = 0u32;
+    let mut scan = ContentScan::default();
     let mut all_unique_chars: HashSet<u8> = HashSet::new();
     // Collect font ObjectIds (not names) to avoid cross-scope name collisions.
     // Each content stream resolves its Tf font names against its own resource
@@ -772,16 +794,11 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
-            let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+            scan.add(scan_content_stream(
                 &content,
                 &mut all_unique_chars,
                 &mut page_font_names,
-            );
-            text_ops += ops;
-            image_count += imgs;
-            path_ops += paths;
-            font_changes += fonts;
-            has_images = has_images || imgs > 0;
+            ));
 
             // Resolve font names against the page's resource dictionaries,
             // respecting PDF resource inheritance shadowing: the most-specific
@@ -804,46 +821,41 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         let mut visited = HashSet::new();
         if let Some(resources) = resource_dict {
             collect_fonts_from_resource_dict(doc, resources, &mut font_map);
-            let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
+            scan.add(scan_xobjects_in_resources(
                 doc,
                 resources,
                 &mut visited,
                 &mut all_unique_chars,
                 &mut used_font_ids,
                 &mut font_map,
-            );
-            text_ops += ops;
-            image_count += imgs;
-            path_ops += paths;
-            font_changes += fonts;
-            has_images = has_images || imgs > 0;
+            ));
         }
         for resource_id in resource_ids {
             if let Ok(resources) = doc.get_dictionary(resource_id) {
                 collect_fonts_from_resource_dict(doc, resources, &mut font_map);
-                let (ops, imgs, paths, fonts) = scan_xobjects_in_resources(
+                scan.add(scan_xobjects_in_resources(
                     doc,
                     resources,
                     &mut visited,
                     &mut all_unique_chars,
                     &mut used_font_ids,
                     &mut font_map,
-                );
-                text_ops += ops;
-                image_count += imgs;
-                path_ops += paths;
-                font_changes += fonts;
-                has_images = has_images || imgs > 0;
+                ));
             }
         }
     }
+    let ContentScan {
+        text_ops,
+        invisible_text_ops,
+        image_count,
+        path_ops,
+        font_changes,
+    } = scan;
 
     // Check for XObject images and calculate coverage
     let (found_images, total_image_area, has_template_image) = analyze_page_images(doc, page_id);
 
-    if found_images {
-        has_images = true;
-    }
+    let has_images = image_count > 0 || found_images;
 
     let unique_alphanum_chars = all_unique_chars
         .iter()
@@ -880,6 +892,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     PageAnalysis {
         text_operator_count: text_ops,
+        invisible_text_operator_count: invisible_text_ops,
         has_images,
         has_template_image,
         total_image_area,
@@ -1273,11 +1286,8 @@ fn scan_xobjects_in_resources(
     unique_chars: &mut HashSet<u8>,
     used_font_ids: &mut HashSet<ObjectId>,
     font_map: &mut HashMap<ObjectId, FontInfo>,
-) -> (u32, u32, u32, u32) {
-    let mut text_ops = 0u32;
-    let mut image_count = 0u32;
-    let mut path_ops = 0u32;
-    let mut font_changes = 0u32;
+) -> ContentScan {
+    let mut scan = ContentScan::default();
 
     let xobjects = match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d.clone()),
@@ -1308,15 +1318,11 @@ fn scan_xobjects_in_resources(
                         .unwrap_or_else(|_| stream.content.clone());
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
-                    let (ops, imgs, paths, fonts) = scan_content_for_text_operators(
+                    scan.add(scan_content_stream(
                         &content,
                         unique_chars,
                         &mut xobj_font_names,
-                    );
-                    text_ops += ops;
-                    image_count += imgs;
-                    path_ops += paths;
-                    font_changes += fonts;
+                    ));
 
                     // Resolve the Form XObject's /Resources — handle both inline
                     // dicts and indirect references (P2 fix: indirect refs were
@@ -1338,30 +1344,82 @@ fn scan_xobjects_in_resources(
                         // Collect font definitions from this scope
                         collect_fonts_from_resource_dict(doc, res, font_map);
                         // Recurse into nested XObjects
-                        let (ops2, imgs2, paths2, fonts2) = scan_xobjects_in_resources(
+                        scan.add(scan_xobjects_in_resources(
                             doc,
                             res,
                             visited,
                             unique_chars,
                             used_font_ids,
                             font_map,
-                        );
-                        text_ops += ops2;
-                        image_count += imgs2;
-                        path_ops += paths2;
-                        font_changes += fonts2;
+                        ));
                     }
                 }
                 Some(b"Image") => {
-                    image_count += 1;
+                    scan.image_count += 1;
                 }
                 _ => {}
             }
         }
     }
 
-    (text_ops, image_count, path_ops, font_changes)
+    scan
 }
+
+/// Operator counts from a content stream, or from a page's whole tree of
+/// them.
+#[derive(Clone, Copy, Default)]
+struct ContentScan {
+    /// Text-showing operators drawn in a rendering mode that paints glyphs.
+    text_ops: u32,
+    /// Text-showing operators drawn with rendering mode 3, which paints
+    /// nothing: the OCR layer behind a scan, a hidden watermark. They are
+    /// text the page carries and no reader sees, so they are counted here
+    /// rather than as evidence of a text layer.
+    invisible_text_ops: u32,
+    /// Image XObjects.
+    image_count: u32,
+    /// Path construction and painting operators.
+    path_ops: u32,
+    /// `Tf` operators.
+    font_changes: u32,
+}
+
+impl ContentScan {
+    fn add(&mut self, other: ContentScan) {
+        self.text_ops += other.text_ops;
+        self.invisible_text_ops += other.invisible_text_ops;
+        self.image_count += other.image_count;
+        self.path_ops += other.path_ops;
+        self.font_changes += other.font_changes;
+    }
+}
+
+/// [`scan_content_stream`] as the tuple the scanner's tests read:
+/// (visible text_op_count, image_count, path_op_count, font_change_count).
+#[cfg(test)]
+fn scan_content_for_text_operators(
+    content: &[u8],
+    unique_chars: &mut HashSet<u8>,
+    used_font_names: &mut HashSet<Vec<u8>>,
+) -> (u32, u32, u32, u32) {
+    let scan = scan_content_stream(content, unique_chars, used_font_names);
+    (
+        scan.text_ops,
+        scan.image_count,
+        scan.path_ops,
+        scan.font_changes,
+    )
+}
+
+/// How deep the scanner follows `q`/`Q` nesting before it stops saving
+/// rendering modes. Real files stay within a few dozen levels; past this,
+/// the deeper pairs save and restore nothing, and a mode set inside them
+/// outlives its scope. The bound keeps a stream of nothing but `q` from
+/// growing the stack with it.
+const MAX_SAVED_RENDER_MODES: usize = 64;
+
+/// Text rendering mode 3: neither fill nor stroke, so no glyph is painted.
+const INVISIBLE_RENDER_MODE: i32 = 3;
 
 /// Fast scan of content stream bytes for text operators
 ///
@@ -1371,17 +1429,29 @@ fn scan_xobjects_in_resources(
 /// - "'" - move to next line and show text
 /// - "\"" - set word/char spacing, move to next line, show text
 ///
-/// Returns (text_op_count, image_count, path_op_count, font_change_count).
-/// Unique non-whitespace text characters are collected into `unique_chars`.
-fn scan_content_for_text_operators(
+/// It also follows the text rendering mode (`Tr`), with the extractor's own
+/// rules: `BT` resets it, `q` saves it and `Q` restores it. A show operator
+/// drawn in mode 3 paints nothing, so it is counted as invisible text and
+/// its characters are not collected: a scan carrying an OCR layer has
+/// hundreds of them per page, and counting them as a text layer is how such
+/// a scan classified as text-based and then extracted as empty pages.
+///
+/// Unique non-whitespace characters of visible text are collected into
+/// `unique_chars`.
+fn scan_content_stream(
     content: &[u8],
     unique_chars: &mut HashSet<u8>,
     used_font_names: &mut HashSet<Vec<u8>>,
-) -> (u32, u32, u32, u32) {
+) -> ContentScan {
     let mut text_ops = 0u32;
+    let mut invisible_text_ops = 0u32;
     let image_count = 0u32;
     let mut path_ops = 0u32;
     let mut font_changes = 0u32;
+    let mut render_mode = 0i32;
+    let mut saved_render_modes: Vec<i32> = Vec::new();
+    // `q` operators past MAX_SAVED_RENDER_MODES whose `Q` restores nothing.
+    let mut unsaved_depth = 0usize;
 
     // Helper: check if position is a word boundary (start of content or preceded by whitespace)
     let is_word_start = |pos: usize| -> bool { pos == 0 || content[pos - 1].is_ascii_whitespace() };
@@ -1411,8 +1481,21 @@ fn scan_content_for_text_operators(
                     || content[i + 2] == b'\r')
                     && preceding_operand_closer(content, i, operand_floor)
                 {
-                    text_ops += 1;
-                    collect_text_chars_before(content, i, unique_chars, operand_floor);
+                    if render_mode == INVISIBLE_RENDER_MODE {
+                        invisible_text_ops += 1;
+                    } else {
+                        text_ops += 1;
+                        collect_text_chars_before(content, i, unique_chars, operand_floor);
+                    }
+                    operand_floor = i;
+                }
+            } else if next == b'r'
+                && is_word_start(i)
+                && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace())
+            {
+                // Tr = set text rendering mode
+                if let Some(mode) = render_mode_before_tr(content, i, operand_floor) {
+                    render_mode = mode;
                     operand_floor = i;
                 }
             } else if next == b'f' {
@@ -1435,6 +1518,29 @@ fn scan_content_for_text_operators(
                         operand_floor = i;
                     }
                 }
+            }
+        }
+
+        // The rendering mode's scope, as the extractor keeps it: BT starts
+        // every text object visible, q saves the mode and Q restores it.
+        if b == b'B'
+            && i + 1 < content.len()
+            && content[i + 1] == b'T'
+            && is_word_start(i)
+            && (i + 2 >= content.len() || content[i + 2].is_ascii_whitespace())
+        {
+            render_mode = 0;
+        } else if b == b'q' && is_word_start(i) && is_word_end(i) {
+            if saved_render_modes.len() < MAX_SAVED_RENDER_MODES {
+                saved_render_modes.push(render_mode);
+            } else {
+                unsaved_depth += 1;
+            }
+        } else if b == b'Q' && is_word_start(i) && is_word_end(i) {
+            if unsaved_depth > 0 {
+                unsaved_depth -= 1;
+            } else if let Some(saved) = saved_render_modes.pop() {
+                render_mode = saved;
             }
         }
 
@@ -1475,7 +1581,32 @@ fn scan_content_for_text_operators(
         i += 1;
     }
 
-    (text_ops, image_count, path_ops, font_changes)
+    ContentScan {
+        text_ops,
+        invisible_text_ops,
+        image_count,
+        path_ops,
+        font_changes,
+    }
+}
+
+/// The rendering mode a `Tr` operator at `op_pos` sets: the number before
+/// it, truncated as the extractor truncates it. `None` when no number
+/// precedes the operator; the lookback does not cross `floor`.
+fn render_mode_before_tr(content: &[u8], op_pos: usize, floor: usize) -> Option<i32> {
+    let mut end = op_pos;
+    while end > floor && content[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > floor && (content[start - 1].is_ascii_digit() || content[start - 1] == b'.') {
+        start -= 1;
+    }
+    if start > floor && matches!(content[start - 1], b'+' | b'-') {
+        start -= 1;
+    }
+    let token = std::str::from_utf8(&content[start..end]).ok()?;
+    token.parse::<f32>().ok().map(|mode| mode as i32)
 }
 
 /// True when the token before `op_pos` (skipping whitespace, not crossing
@@ -2025,6 +2156,35 @@ mod tests {
             page_ocr_reasons(&text_with_image),
             vec![crate::OCR_REASON_SCANNED]
         );
+    }
+
+    #[test]
+    fn invisible_show_operators_are_not_a_text_layer() {
+        // A searchable scan: the page image, then every word of its OCR
+        // layer drawn in rendering mode 3.
+        let mut uchars = HashSet::new();
+        let content =
+            b"q 612 0 0 792 0 0 cm /Im1 Do Q\nBT\n3 Tr\n/F1 10 Tf\n(Invoice) Tj\n(Total) Tj\nET";
+        let scan = scan_content_stream(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(scan.text_ops, 0);
+        assert_eq!(scan.invisible_text_ops, 2);
+        assert!(
+            uchars.is_empty(),
+            "hidden characters are no evidence of a text layer: {uchars:?}"
+        );
+    }
+
+    #[test]
+    fn the_rendering_mode_is_scoped_as_the_extractor_scopes_it() {
+        // BT starts every text object visible; q saves the mode and Q
+        // restores it.
+        let mut uchars = HashSet::new();
+        let content = b"BT 3 Tr (one) Tj ET\n\
+                        BT (two) Tj ET\n\
+                        BT 3 Tr q 0 Tr (three) Tj Q (four) Tj ET";
+        let scan = scan_content_stream(content, &mut uchars, &mut HashSet::new());
+        assert_eq!(scan.text_ops, 2, "two and three are drawn visibly");
+        assert_eq!(scan.invisible_text_ops, 2, "one and four are not");
     }
 
     #[test]
