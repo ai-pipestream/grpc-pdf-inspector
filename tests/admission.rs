@@ -276,3 +276,20 @@ async fn frames_without_bytes_do_not_keep_an_upload_alive() {
     );
     assert_the_slot_is_free(&harness).await;
 }
+
+#[tokio::test]
+async fn a_time_budget_too_long_for_a_deadline_does_not_break_the_call() {
+    // The environment cannot set this, but `Limits` is plain data.
+    let harness = common::start_with(Limits {
+        max_parse_time: Duration::MAX,
+        max_upload_time: Duration::MAX,
+        ..Limits::default()
+    })
+    .await;
+    let pdf = common::text_pdf(2, 20, "far-deadline-marker");
+    let events = harness
+        .parse(&pdf, pb::PdfOptions::default())
+        .await
+        .expect("the call is parsed under the longest budget there is");
+    assert_eq!(common::pages(&events).len(), 2);
+}

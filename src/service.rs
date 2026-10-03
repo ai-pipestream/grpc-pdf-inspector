@@ -19,7 +19,7 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::limits::Limits;
+use crate::limits::{Limits, MAX_TIME_BUDGET_SECONDS};
 use crate::metrics::Metrics;
 use crate::parse::{self, Outcome, Sink};
 use crate::proto::v1 as pb;
@@ -164,8 +164,8 @@ impl pb::pdf_parse_service_server::PdfParseService for PdfGrpc {
         // has a shorter budget of its own inside it, so a client trickling
         // bytes cannot keep the slot for the whole parse budget.
         let admitted = Instant::now();
-        let deadline = admitted + self.limits.max_parse_time;
-        let upload_deadline = deadline.min(admitted + self.limits.max_upload_time);
+        let deadline = deadline_after(admitted, self.limits.max_parse_time);
+        let upload_deadline = deadline.min(deadline_after(admitted, self.limits.max_upload_time));
 
         let bytes = self
             .receive(&mut inbound, deadline, upload_deadline)
@@ -348,6 +348,17 @@ impl PdfGrpc {
         }
         Ok(bytes)
     }
+}
+
+/// `start` plus `budget`, or plus [`MAX_TIME_BUDGET_SECONDS`] for a budget
+/// too long for an `Instant` to hold.
+///
+/// [`Limits::from_env`] refuses such a budget, but `Limits` is plain data
+/// and can be built without it; a call must not panic because of that.
+fn deadline_after(start: Instant, budget: Duration) -> Instant {
+    start
+        .checked_add(budget)
+        .unwrap_or_else(|| start + Duration::from_secs(MAX_TIME_BUDGET_SECONDS))
 }
 
 /// Render a `JoinError` into something worth putting on the wire.

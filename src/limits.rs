@@ -70,6 +70,13 @@ pub const DEFAULT_MAX_PARSE_SECONDS: u64 = 300;
 /// about 18 Mbit/s; a deployment fed over slower links raises it.
 pub const DEFAULT_MAX_UPLOAD_SECONDS: u64 = 60;
 
+/// The longest either time budget may be set to: a day.
+///
+/// A deadline is an [`std::time::Instant`], which cannot reach arbitrarily
+/// far into the future, so a budget past this is refused at startup rather
+/// than overflowing on the first call. No parse is worth a slot for longer.
+pub const MAX_TIME_BUDGET_SECONDS: u64 = 24 * 60 * 60;
+
 /// Ceilings the process enforces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -155,13 +162,25 @@ fn env_seconds(
             value,
             reason: "must be at least one second",
         }),
-        Ok(seconds) => Ok(seconds),
+        Ok(seconds) => at_most_a_day(name, seconds),
         Err(_) => Err(InvalidLimit {
             name,
             value,
             reason: "is not a whole number of seconds",
         }),
     }
+}
+
+/// Refuse a time budget past [`MAX_TIME_BUDGET_SECONDS`].
+fn at_most_a_day(name: &'static str, seconds: u64) -> Result<u64, InvalidLimit> {
+    if seconds > MAX_TIME_BUDGET_SECONDS {
+        return Err(InvalidLimit {
+            name,
+            value: seconds.to_string(),
+            reason: "is longer than the 86400 second (one day) ceiling",
+        });
+    }
+    Ok(seconds)
 }
 
 impl Limits {
@@ -202,11 +221,14 @@ impl Limits {
                 "GRPC_PDF_MAX_DECOMPRESSED_BYTES",
                 DEFAULT_MAX_DECOMPRESSED_BYTES,
             ),
-            max_parse_time: Duration::from_secs(env_u64(
-                &var,
+            max_parse_time: Duration::from_secs(at_most_a_day(
                 "GRPC_PDF_MAX_PARSE_SECONDS",
-                DEFAULT_MAX_PARSE_SECONDS,
-            )),
+                env_u64(
+                    &var,
+                    "GRPC_PDF_MAX_PARSE_SECONDS",
+                    DEFAULT_MAX_PARSE_SECONDS,
+                ),
+            )?),
             max_upload_time: Duration::from_secs(env_seconds(
                 &var,
                 "GRPC_PDF_MAX_UPLOAD_SECONDS",
@@ -283,6 +305,19 @@ mod tests {
                 .expect_err("the server must not start with this");
             assert_eq!(error.name, "GRPC_PDF_MAX_UPLOAD_SECONDS", "{value:?}");
             assert_eq!(error.value, value);
+        }
+    }
+
+    #[test]
+    fn a_time_budget_past_a_day_stops_startup() {
+        for name in ["GRPC_PDF_MAX_PARSE_SECONDS", "GRPC_PDF_MAX_UPLOAD_SECONDS"] {
+            let a_day = MAX_TIME_BUDGET_SECONDS.to_string();
+            assert!(read(&[(name, &a_day)]).is_ok(), "{name} of a day");
+            for value in ["86401", "18446744073709551615"] {
+                let error = read(&[(name, value)]).expect_err("past the ceiling");
+                assert_eq!(error.name, name);
+                assert_eq!(error.value, value);
+            }
         }
     }
 }

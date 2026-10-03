@@ -250,8 +250,8 @@ Configuration is environment-only:
 | `GRPC_PDF_MAX_CONCURRENT_PARSES` | `8` | Concurrent calls, uploading or parsing; further calls wait, before their upload is read. |
 | `GRPC_PDF_MAX_STREAM_BYTES` | `268435456` (256 MiB) | Largest size any one stream of a document may decompress to. |
 | `GRPC_PDF_MAX_DECOMPRESSED_BYTES` | `4294967296` (4 GiB) | Largest total one read of a document may decompress to. |
-| `GRPC_PDF_MAX_PARSE_SECONDS` | `300` | Longest a call may hold its parse slot, upload included. |
-| `GRPC_PDF_MAX_UPLOAD_SECONDS` | `60` | Longest a call's upload may take once it holds its slot; it also spends the parse budget. Must be a whole number of seconds, at least 1, or the server refuses to start. |
+| `GRPC_PDF_MAX_PARSE_SECONDS` | `300` | Longest a call may hold its parse slot, upload included. At most `86400` (a day), or the server refuses to start. |
+| `GRPC_PDF_MAX_UPLOAD_SECONDS` | `60` | Longest a call's upload may take once it holds its slot; it also spends the parse budget. Must be a whole number of seconds from 1 to `86400`, or the server refuses to start. |
 | `GRPC_PDF_WORKERS` | CPU count | Tokio worker threads. |
 | `GRPC_PDF_WINDOW_BYTES` | `4194304` | HTTP/2 initial window (stream and connection). |
 | `GRPC_PDF_METRICS_INTERVAL_SECS` | `60` | Seconds between metrics lines; 0 disables. |
