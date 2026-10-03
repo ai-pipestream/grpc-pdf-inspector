@@ -10,9 +10,17 @@
 //!
 //! What is not forced is buffering the *output*. Detection runs first and
 //! `info` goes out the moment it returns — the ~10-50ms routing answer —
-//! before a single page has been extracted. In FULL mode each `page` goes
-//! out as that page's markdown comes back. `tests/streaming.rs` holds the
+//! before a single page has been extracted. `tests/streaming.rs` holds the
 //! test that fails if someone turns this back into a batch.
+//!
+//! Past `info` the stream is incremental in rendering, not in extraction.
+//! The extraction pass below is one library call that reads every selected
+//! page before it returns; only then are the pages rendered, one at a time,
+//! each `page` going out as its markdown is rendered. Between `info` and
+//! the first page there is therefore a stretch that sends nothing, which is
+//! why the parse checks its deadline and its caller's presence inside that
+//! pass (see [`pdf_inspector::ParseGuard`]) rather than relying on the next
+//! send to notice that nobody is listening.
 //!
 //! # Two library passes in FULL, and not three
 //!
@@ -22,7 +30,7 @@
 //! content streams, not glyphs.
 //!
 //! FULL then runs exactly one more:
-//! `extract_text_with_positions_rects_and_forms_mem_with_invisible`, whose
+//! `extract_text_with_positions_rects_and_forms_mem_with_ocr_layer`, whose
 //! runs, rectangles, line segments and form placements answer everything
 //! the rest of the mode needs. The markdown is rendered from those runs here with
 //! [`to_markdown_from_items_with_rects_and_page_count`]; the tables come

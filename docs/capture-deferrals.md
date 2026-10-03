@@ -232,12 +232,60 @@ therefore had no picture item, only their captions.
   paths and one label placed between two paragraphs, and over a page drawn
   entirely through one form.
 
+**Routing review (2026-10-02): scans the fast path dropped.** gRParse
+takes a text-based classification with no OCR pages as finished and never
+runs its own models, so a scanned page this service does not name
+disappears from its output. A searchable scan (a page image behind an
+invisible OCR layer) classified text-based and extracted as empty pages,
+and a scanned page outside detection's eight-page sample was never named.
+
+- *Patch* `47c55a9`: detection follows `Tr` with the extractor's scoping
+  and counts invisible show operators apart; an image page whose text is
+  all invisible is a scan carrying an OCR layer, its document is Mixed, and
+  the per-page OCR list is built from every page's own analysis for
+  text-based documents as well as mixed ones.
+- *Patch* `667c916`: `extract_text_with_positions_rects_and_forms_mem_with_ocr_layer`
+  applies the region extractor's OCR-layer fallback to the positioned runs
+  and names the pages that adopted their layer.
+- *Patch* `fbdf5fb`: `PdfProcessResult.ocr_recommended`.
+- *Wired*: an adopted page's markdown is its OCR layer and the page is
+  flagged `needs_ocr` with `OCR_REASON_SCANNED`; a page that drew a picture
+  and no text is flagged on its page event and in
+  `extraction_ocr_reasons`; `has_invisible_text` covers an adopted layer;
+  `PdfInfo.ocr_recommended` carries the newspaper and template verdicts.
+- *Tests*: `tests/ocr_routing.rs`, over a generated searchable scan and a
+  twenty-page text document with two unsampled scanned pages.
+
+**Hostile-input review (2026-10-02): bounded decoding.** Only the metadata
+reader capped decompression; every pass of the parser decoded content,
+font, CMap and Form XObject streams without limit.
+
+- *Patch* `f92e3fc`: the guard module. Every decoding call site goes
+  through it; documents load with the per-stream ceiling as lopdf's
+  `max_decompressed_size`; a caller's `ParseGuard` adds a per-run budget, a
+  deadline and a cancellation flag checked at page boundaries.
+  `PdfError::Interrupted` reports the stop.
+- *Wired*: every parser pass runs under a guard built from
+  `GRPC_PDF_MAX_STREAM_BYTES`, `GRPC_PDF_MAX_DECOMPRESSED_BYTES` and
+  `GRPC_PDF_MAX_PARSE_SECONDS` (also on `ServerLimits`), and the
+  supervisor cancels it when the response stream is dropped.
+- *Tests*: `tests/errors.rs` (a one-stream bomb, a many-stream budget, a
+  call past its time), `tests/metadata.rs` (an XMP bomb) and
+  `tests/streaming.rs` (a hang-up and a deadline inside the extraction
+  pass); the crate's own `guard` and `detector` modules test the pieces.
+- *Not covered*: lopdf skips an object stream past the ceiling while it
+  loads and reports nothing, so a document whose object stream is a bomb
+  loads without that stream's objects rather than failing; and lopdf's
+  load-time decoding has no total budget of its own, only the per-stream
+  ceiling.
+
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page
 statistics, which are collapsed into one of four reason strings and several
 of which the crate already marks dead; and **U4**, `pages_sampled` /
-`pages_with_text` / `ocr_recommended`, which are on `PdfTypeResult` and
-reachable with a second detection call this service chooses not to make.
+`pages_with_text`, which are on `PdfTypeResult` and reachable with a
+second detection call this service chooses not to make. (`ocr_recommended`
+was the third, and is wired now: see the routing review above.)
 
 ### What the patches did not change
 

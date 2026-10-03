@@ -17,10 +17,13 @@
 //! - **Structure is markdown-derived.** The `page` events carry markdown,
 //!   and that markdown is all the fold parses: ATX headings (`#` through
 //!   `####`) become section headers with their level, blank-line-separated
-//!   blocks become paragraphs. Lists, emphasis and tables inside a block
-//!   stay as their markdown source in `text`; the extraction markdown has
-//!   already flattened the layout, so there is little more to recover, and
-//!   parsing deeper would pretend to structure the source does not have.
+//!   blocks become paragraphs, `-` and `1.` items become `ListItem`s inside
+//!   a list group, fenced blocks become `CodeItem`s, and a pipe-syntax
+//!   block becomes a `TableItem` when a detected grid on its page is the
+//!   same table. Emphasis comes off the text onto `InlineSpan.formatting`.
+//!   Beyond that the extraction markdown has already flattened the layout,
+//!   and parsing deeper would pretend to structure the source does not
+//!   have.
 //! - **Pages are measured when the file was asked about itself.** `pages`
 //!   carries one `PageItem` per page the `info` event reported, with
 //!   `page_no` and `unit` always set and `size` set from the page's own
