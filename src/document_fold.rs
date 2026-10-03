@@ -44,7 +44,9 @@
 //!   hangs off the same group under `CONTENT_LAYER_INVISIBLE`, with the
 //!   box the content stream put it at, so a hidden watermark or an OCR
 //!   layer behind a scan becomes an item a coordinator can act on instead
-//!   of text that was simply never mentioned.
+//!   of text that was simply never mentioned. The exception is a scanned
+//!   page with no visible text at all: its OCR layer is that page's
+//!   markdown, so it is the body, and the page's quality recommends OCR.
 //! - **Metadata is the file's own.** `source_meta`, `outline`,
 //!   `attachments` and `anchors` come from the document's dictionaries
 //!   rather than from its text — an authored outline is better evidence of

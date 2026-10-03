@@ -387,38 +387,49 @@ fn parse(
             let filter: Option<HashSet<u32>> =
                 (!options.pages.is_empty()).then(|| options.pages.iter().copied().collect());
             metrics.parser_pass();
-            let ((items, rects, lines), forms, skipped_invisible) = guarded(|| {
-                pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_invisible(
+            // With the library's OCR-layer fallback: a scanned page made
+            // searchable draws no visible text, and its runs are its
+            // invisible OCR layer instead of nothing, exactly as the
+            // library's own region and whole-document pipelines read it.
+            let pdf_inspector::OcrLayerExtraction {
+                extraction: (items, rects, lines),
+                forms,
+                skipped_invisible,
+                ocr_layer_pages,
+            } = guarded(|| {
+                pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
                     bytes,
                     filter.as_ref(),
-                    false,
                 )
             })?;
             // Where the page invoked Form XObjects. A vector figure is one,
             // and it draws no image run, so this is the only record of
             // where it sits. They ride the spans event, after the runs.
             let mut forms = spans::forms_by_page(forms);
-            // What the walk left out, said whether or not anyone asked for
-            // the runs themselves. A text layer nobody is told about is
-            // what this reports.
-            has_invisible_text = skipped_invisible;
+            // Whether any page drew invisible text, said whether or not
+            // anyone asked for the runs themselves: the layer the walk left
+            // out, and the OCR layers it adopted as a scan's text. A text
+            // layer nobody is told about is what this reports.
+            has_invisible_text = skipped_invisible || !ocr_layer_pages.is_empty();
 
             // The text-quality verdicts, from the runs this call already
             // holds rather than from a second read of the file.
             let quality = pdf_inspector::analyze_text_quality(&items);
             has_encoding_issues = quality.has_encoding_issues;
-            let verdicts = page_verdicts(&detection_reasons, &quality);
-            extraction_ocr_reasons = verdicts
-                .iter()
-                .map(|(page, reasons)| pb::PageOcrReasons {
-                    page: *page,
-                    reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
-                })
-                .collect();
+            let mut verdicts = page_verdicts(&detection_reasons, &quality);
+            // A page whose text is its OCR layer is a scan. The layer is
+            // what the markdown carries, so a caller without OCR still gets
+            // the words, but no reader saw them and a caller with OCR
+            // should read the page again.
+            for page in &ocr_layer_pages {
+                add_verdict(&mut verdicts, *page, pb::OcrReason::Scanned);
+            }
 
             // The invisible layer's own runs, which need the walk run again
             // with the layer kept. Taken only when someone is listening and
-            // only when the first walk said there is something to find.
+            // only when the first walk said it left something out; an
+            // adopted OCR layer is in the runs already, so the difference
+            // the second walk is read against has none of it.
             let mut invisible = if events.wanted(options.report_invisible) && skipped_invisible {
                 metrics.parser_pass();
                 let (kept, _) = guarded(|| {
@@ -466,6 +477,15 @@ fn parse(
 
             for page_no in requested_pages(options, detected.page_count) {
                 let page_items = by_page.remove(&page_no).unwrap_or_default();
+
+                // A page that drew a picture and no text at all is a scan,
+                // or a page whose words are in a figure, and it needs OCR
+                // either way. Sampling detection may never have looked at
+                // it and the quality pass only scores pages that have text,
+                // so this is the check that reads every page it extracts.
+                if let Some(reason) = untexted_page_reason(&page_items, forms.get(&page_no)) {
+                    add_verdict(&mut verdicts, page_no, reason);
+                }
 
                 // The roles go out before the runs they describe, so a
                 // consumer reading the whole stream never has to look
@@ -616,6 +636,13 @@ fn parse(
                 pages_with_tables,
                 pages_with_columns,
             });
+            extraction_ocr_reasons = verdicts
+                .iter()
+                .map(|(page, reasons)| pb::PageOcrReasons {
+                    page: *page,
+                    reasons: reasons.iter().map(|reason| (*reason).into()).collect(),
+                })
+                .collect();
         }
     }
 
@@ -771,6 +798,46 @@ fn page_verdicts(
         verdicts.entry(*page).or_default();
     }
     verdicts
+}
+
+/// Add one reason to a page's verdict, once.
+fn add_verdict(verdicts: &mut BTreeMap<u32, Vec<pb::OcrReason>>, page: u32, reason: pb::OcrReason) {
+    let reasons = verdicts.entry(page).or_default();
+    if !reasons.contains(&reason) {
+        reasons.push(reason);
+    }
+}
+
+/// Why a page that drew no text at all needs OCR, or `None` when it drew
+/// text or drew nothing.
+///
+/// Text is a run of glyphs or a form field's value with something other
+/// than whitespace in it. A page without any that placed an image is a scan
+/// or a picture of words, which is `SCANNED`; one that placed only a Form
+/// XObject drew its content as paths the parser cannot read as characters,
+/// which is `NO_TEXT`. A page that drew none of these is blank, and a blank
+/// page stays a blank page.
+fn untexted_page_reason(
+    items: &[pdf_inspector::TextItem],
+    forms: Option<&Vec<pdf_inspector::PdfForm>>,
+) -> Option<pb::OcrReason> {
+    use pdf_inspector::types::ItemType;
+    let has_text = items.iter().any(|item| {
+        matches!(item.item_type, ItemType::Text | ItemType::FormField)
+            && !item.text.trim().is_empty()
+    });
+    if has_text {
+        None
+    } else if items
+        .iter()
+        .any(|item| matches!(item.item_type, ItemType::Image))
+    {
+        Some(pb::OcrReason::Scanned)
+    } else if forms.is_some_and(|forms| !forms.is_empty()) {
+        Some(pb::OcrReason::NoText)
+    } else {
+        None
+    }
 }
 
 /// How far a page's letters sit from where a natural language puts them, or
@@ -937,5 +1004,88 @@ mod tests {
     #[test]
     fn nothing_is_reported_for_a_page_with_no_runs_to_report_on() {
         assert!(missing(&[], "some markdown").is_empty());
+    }
+
+    /// One extracted item of the given kind on page 1.
+    fn item(text: &str, item_type: pdf_inspector::types::ItemType) -> pdf_inspector::TextItem {
+        pdf_inspector::TextItem {
+            text: text.to_owned(),
+            x: 72.0,
+            y: 700.0,
+            width: 100.0,
+            height: 10.0,
+            font: String::new(),
+            font_tag: String::new(),
+            font_size: 10.0,
+            page: 1,
+            is_bold: false,
+            is_italic: false,
+            is_underline: false,
+            is_strikeout: false,
+            item_type,
+            mcid: None,
+        }
+    }
+
+    /// One Form XObject placement on page 1.
+    fn form() -> pdf_inspector::PdfForm {
+        pdf_inspector::PdfForm {
+            name: "Fx1".to_owned(),
+            x: 72.0,
+            y: 300.0,
+            width: 400.0,
+            height: 200.0,
+            page: 1,
+        }
+    }
+
+    #[test]
+    fn a_page_that_drew_only_a_picture_is_a_scan() {
+        use pdf_inspector::types::ItemType;
+        let image = item("[Image: Im1]", ItemType::Image);
+        assert_eq!(
+            untexted_page_reason(std::slice::from_ref(&image), None),
+            Some(pb::OcrReason::Scanned)
+        );
+        // Show operators that showed nothing are not text either.
+        assert_eq!(
+            untexted_page_reason(&[image, item("  ", ItemType::Text)], None),
+            Some(pb::OcrReason::Scanned)
+        );
+    }
+
+    #[test]
+    fn a_page_that_drew_only_a_form_has_no_text_to_read() {
+        assert_eq!(
+            untexted_page_reason(&[], Some(&vec![form()])),
+            Some(pb::OcrReason::NoText)
+        );
+    }
+
+    #[test]
+    fn a_page_with_any_text_or_with_nothing_at_all_is_not_flagged_here() {
+        use pdf_inspector::types::ItemType;
+        let image = item("[Image: Im1]", ItemType::Image);
+        assert_eq!(
+            untexted_page_reason(&[image.clone(), item("Figure 1", ItemType::Text)], None),
+            None
+        );
+        assert_eq!(
+            untexted_page_reason(&[image, item("Name: Ada", ItemType::FormField)], None),
+            None
+        );
+        // A link annotation's target is not words on the page.
+        assert_eq!(
+            untexted_page_reason(
+                &[item(
+                    "https://example.org",
+                    ItemType::Link("https://example.org".to_owned())
+                )],
+                None
+            ),
+            None,
+            "a blank page with a link stays a blank page"
+        );
+        assert_eq!(untexted_page_reason(&[], None), None, "a blank page");
     }
 }

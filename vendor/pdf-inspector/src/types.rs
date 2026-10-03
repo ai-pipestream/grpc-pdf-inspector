@@ -110,6 +110,26 @@ pub struct PdfForm {
     pub page: u32,
 }
 
+/// One extraction walk with the OCR-layer fallback applied page by page:
+/// what [`crate::extractor::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer`]
+/// returns.
+#[derive(Debug, Clone, Default)]
+pub struct OcrLayerExtraction {
+    /// The runs, rectangles and line segments of the walk. On a page in
+    /// `ocr_layer_pages` the runs are the page's OCR layer.
+    pub extraction: PageExtraction,
+    /// Where the walk placed Form XObjects, page-level and nested.
+    pub forms: Vec<PdfForm>,
+    /// Whether some selected page drew text with rendering mode 3 that the
+    /// runs leave out. An adopted OCR layer is in the runs, so a page whose
+    /// layer was adopted does not set this on its own.
+    pub skipped_invisible: bool,
+    /// 1-indexed pages whose visible walk drew no text at all, whose
+    /// invisible layer carried real text, and whose runs are therefore that
+    /// layer: scanned pages made searchable, whose text no reader sees.
+    pub ocr_layer_pages: std::collections::BTreeSet<u32>,
+}
+
 /// A text item with position information
 #[derive(Debug, Clone)]
 pub struct TextItem {

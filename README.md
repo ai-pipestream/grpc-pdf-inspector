@@ -23,6 +23,14 @@ It is the fleet's cheap routing answer for PDF:
   OCRs.
 - **Mixed** PDFs get both: text pages stream, the rest are reported.
 
+Every page is judged on its own content, so a scanned page inside a
+text-based document is named too, sampled or not. A scan made searchable
+(an OCRmyPDF, ABBYY or Acrobat page image with an invisible OCR layer
+behind it) is mixed: every page is named as needing OCR, because no reader
+sees that text, and in FULL mode each page's markdown is its OCR layer, as
+the parser's own OCR-layer fallback reads it, so a caller without OCR still
+gets the words.
+
 Nothing is written to disk at any point: the upload lives in one `Vec<u8>`
 and every library call is a `*_mem` entry point.
 
@@ -116,8 +124,10 @@ per-page OCR verdicts and the garble score.
   table with no rules at all falls through to inferring columns from
   alignment.
 - **`page.invisible`** — with `report_invisible` set, the runs the page drew
-  with text rendering mode 3, each with its box. They are never in the
-  markdown, because no reader saw them.
+  with text rendering mode 3, each with its box. They are not in the
+  markdown, because no reader saw them, except on a scanned page with no
+  visible text at all, whose OCR layer is its markdown and whose
+  `needs_ocr` is set.
 - **`page.garble_score`** — how far the page's letter frequencies sit from
   where a Latin-script language puts them, 0.0 for ordinary prose and
   rising towards 1.0 for a text layer whose CMap substituted every

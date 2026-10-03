@@ -18,6 +18,7 @@
 
 mod common;
 
+use grpc_pdf_inspector::proto::ai::pipestream::document::v1 as doc;
 use grpc_pdf_inspector::proto::v1 as pb;
 
 /// Classify only.
@@ -120,4 +121,148 @@ async fn a_scan_with_no_text_layer_at_all_is_still_scanned() {
     let info = common::info(&events);
     assert_eq!(info.pdf_type(), pb::PdfType::Scanned);
     assert_eq!(info.pages_needing_ocr, [1, 2]);
+}
+
+/// Every `PageOcrReasons` page on the trailer, in order.
+fn trailer_pages(status: &pb::ParseStatus) -> Vec<u32> {
+    status
+        .extraction_ocr_reasons
+        .iter()
+        .map(|reasons| reasons.page)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_searchable_scan_comes_back_flagged_and_carrying_its_ocr_layer() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::searchable_scan_pdf(3),
+            pb::PdfOptions {
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    // Every page needs OCR, and says so on its own event: a caller that
+    // reads the pages, not only `info`, routes it.
+    let pages = common::pages(&events);
+    assert_eq!(pages.len(), 3);
+    for page in &pages {
+        assert!(page.needs_ocr, "page {} is a scan", page.page_no);
+        assert_eq!(page.ocr_reason(), pb::OcrReason::Scanned);
+        // The library's own OCR-layer fallback: the page's text is its
+        // layer, not nothing, so a caller without OCR still has the words.
+        assert!(
+            page.markdown.contains("analytical engine weaves"),
+            "page {} carries its OCR layer: {:?}",
+            page.page_no,
+            page.markdown
+        );
+    }
+
+    let status = common::status(&events);
+    assert!(status.has_invisible_text, "the layer was invisible");
+    assert_eq!(trailer_pages(status), [1, 2, 3]);
+    for reasons in &status.extraction_ocr_reasons {
+        assert!(
+            reasons
+                .reasons()
+                .any(|reason| reason == pb::OcrReason::Scanned),
+            "{reasons:?}"
+        );
+    }
+
+    // The Document says the same thing per page, and its body is the text
+    // rather than empty.
+    let document = common::documents(&events)[0];
+    for page_no in 1..=3 {
+        let quality = document.pages[&page_no]
+            .quality
+            .as_ref()
+            .expect("a page needing OCR has a quality record");
+        assert_eq!(quality.ocr_recommended, Some(true), "page {page_no}");
+    }
+    let body: Vec<String> = common::placed(document)
+        .into_iter()
+        .filter(|item| item.layer == doc::ContentLayer::Body as i32)
+        .map(|item| item.text)
+        .collect();
+    assert!(
+        body.iter()
+            .any(|text| text.contains("analytical engine weaves")),
+        "the body carries the OCR layer: {body:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_adopted_ocr_layer_is_not_reported_as_hidden_text_as_well() {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::searchable_scan_pdf(2),
+            pb::PdfOptions {
+                emit_document: true,
+                report_invisible: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    for page in common::pages(&events) {
+        assert!(
+            page.invisible.is_empty(),
+            "the layer is the page's markdown, so it is not also hidden runs: {:?}",
+            page.invisible
+        );
+    }
+    let document = common::documents(&events)[0];
+    let hidden = common::placed(document)
+        .into_iter()
+        .filter(|item| item.layer == doc::ContentLayer::Invisible as i32)
+        .count();
+    assert_eq!(
+        hidden, 0,
+        "nothing is in both the body and the hidden layer"
+    );
+}
+
+#[tokio::test]
+async fn scanned_pages_the_sample_missed_are_flagged_on_their_pages_and_the_trailer() {
+    let harness = common::start().await;
+    let events = harness
+        .parse_ok(&common::mixed_text_and_scan_pdf(20, &[16, 17]))
+        .await;
+
+    let flagged: Vec<u32> = common::pages(&events)
+        .into_iter()
+        .filter(|page| page.needs_ocr)
+        .map(|page| page.page_no)
+        .collect();
+    assert_eq!(flagged, [16, 17]);
+    assert_eq!(trailer_pages(common::status(&events)), [16, 17]);
+}
+
+#[tokio::test]
+async fn a_page_with_a_picture_and_no_text_is_flagged_where_detection_missed_it() {
+    let harness = common::start().await;
+    let events = harness.parse_ok(&common::photo_with_empty_text_pdf()).await;
+
+    // The empty show operators keep the page off detection's lists, which
+    // is what makes this the extraction's own verdict.
+    let info = common::info(&events);
+    assert_eq!(info.pdf_type(), pb::PdfType::TextBased);
+    assert!(info.pages_needing_ocr.is_empty(), "{info:?}");
+
+    let pages = common::pages(&events);
+    assert!(!pages[0].needs_ocr && !pages[2].needs_ocr);
+    assert!(
+        pages[1].needs_ocr,
+        "the photo page has no word that is not pixels"
+    );
+    assert_eq!(pages[1].ocr_reason(), pb::OcrReason::Scanned);
+    assert_eq!(trailer_pages(common::status(&events)), [2]);
 }

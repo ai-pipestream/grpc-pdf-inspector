@@ -14,11 +14,11 @@ mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
-use crate::types::{PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
+use crate::types::{OcrLayerExtraction, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
 use content_stream::extract_page_text_items_with_forms;
@@ -202,15 +202,54 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_invisible(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible) =
+    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, _ocr_layer_pages) =
         extract_positioned_text_impl_reporting_invisible(
             &doc,
             &font_cmaps,
             page_filter,
             include_invisible,
             None,
+            false,
         )?;
     Ok((extraction, forms, skipped_invisible))
+}
+
+/// [`extract_text_with_positions_rects_and_forms_mem_with_invisible`] with
+/// the library's OCR-layer fallback applied page by page.
+///
+/// A scan made searchable carries its text as an invisible (Tr 3) layer
+/// behind the page raster, so the visible walk finds nothing on such a page
+/// but image placeholders. [`crate::extract_text_in_regions_mem`] retries
+/// those pages with the layer kept and adopts it when it is real text, and
+/// the whole-document pipeline retries a mixed document the same way. This
+/// applies that rule, with the same gate and the same thresholds, to the
+/// positioned runs: a page whose visible walk drew no text at all but
+/// skipped invisible text is walked again with the layer kept, sharing the
+/// page's Form XObject budget, and its runs become the layer when the layer
+/// carries enough real, non-garbage text. Every other page is exactly what
+/// the sibling call returns.
+pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
+    buffer: &[u8],
+    page_filter: Option<&HashSet<u32>>,
+) -> Result<OcrLayerExtraction, PdfError> {
+    crate::validate_pdf_bytes(buffer)?;
+    let (doc, _) = crate::load_document_from_mem(buffer)?;
+    let font_cmaps = FontCMaps::from_doc(&doc);
+    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, ocr_layer_pages) =
+        extract_positioned_text_impl_reporting_invisible(
+            &doc,
+            &font_cmaps,
+            page_filter,
+            false,
+            None,
+            true,
+        )?;
+    Ok(OcrLayerExtraction {
+        extraction,
+        forms,
+        skipped_invisible,
+        ocr_layer_pages,
+    })
 }
 
 /// [`extract_text_with_positions_mem_pages`] with the invisible layer under
@@ -362,13 +401,14 @@ pub(crate) fn extract_positioned_text_from_doc_reporting_invisible(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, bool), PdfError> {
-    let (extraction, _forms, thresholds, gid_pages, skipped_invisible) =
+    let (extraction, _forms, thresholds, gid_pages, skipped_invisible, _ocr_layer_pages) =
         extract_positioned_text_impl_reporting_invisible(
             doc,
             font_cmaps,
             page_filter,
             include_invisible,
             None,
+            false,
         )?;
     Ok((extraction, thresholds, gid_pages, skipped_invisible))
 }
@@ -380,24 +420,44 @@ fn extract_positioned_text_impl(
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    let (extraction, _forms, thresholds, gid_pages, _skipped_invisible) =
+    let (extraction, _forms, thresholds, gid_pages, _skipped_invisible, _ocr_layer_pages) =
         extract_positioned_text_impl_reporting_invisible(
             doc,
             font_cmaps,
             page_filter,
             include_invisible,
             required_pages,
+            false,
         )?;
     Ok((extraction, thresholds, gid_pages))
 }
 
+/// The page walk every extraction entry point shares.
+///
+/// With `ocr_layer_fallback` set (and `include_invisible` not), a page
+/// whose walk drew no visible text but skipped invisible text is walked
+/// again with the layer kept, and adopts the layer when
+/// [`crate::is_adoptable_ocr_layer`] says it is real text; the last element
+/// of the result names the pages that did.
+#[allow(clippy::type_complexity)]
 fn extract_positioned_text_impl_reporting_invisible(
     doc: &Document,
     font_cmaps: &FontCMaps,
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
-) -> Result<(PageExtraction, Vec<PdfForm>, PageThresholds, HashSet<u32>, bool), PdfError> {
+    ocr_layer_fallback: bool,
+) -> Result<
+    (
+        PageExtraction,
+        Vec<PdfForm>,
+        PageThresholds,
+        HashSet<u32>,
+        bool,
+        BTreeSet<u32>,
+    ),
+    PdfError,
+> {
     let pages = doc.get_pages();
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
@@ -406,6 +466,7 @@ fn extract_positioned_text_impl_reporting_invisible(
     let mut page_thresholds: PageThresholds = HashMap::new();
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
     let mut skipped_invisible_anywhere = false;
+    let mut ocr_layer_pages: BTreeSet<u32> = BTreeSet::new();
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -420,6 +481,9 @@ fn extract_positioned_text_impl_reporting_invisible(
                 continue;
             }
         }
+        // One Form XObject budget per page, shared with the OCR-layer
+        // retry below so one page cannot spend two full expansions.
+        let mut form_budget = FormWalkBudget::new();
         let page_result = extract_page_text_items_with_forms(
             doc,
             page_id,
@@ -427,14 +491,14 @@ fn extract_positioned_text_impl_reporting_invisible(
             font_cmaps,
             include_invisible,
             &mut style_cache,
-            &mut FormWalkBudget::new(),
+            &mut form_budget,
         );
         let (
             (mut items, mut rects, mut lines),
             mut forms,
-            has_gid_fonts,
-            coords_rotated,
-            skipped_invisible,
+            mut has_gid_fonts,
+            mut coords_rotated,
+            mut skipped_invisible,
         ) = match page_result {
                 Ok(extraction) => extraction,
                 Err(error)
@@ -448,6 +512,36 @@ fn extract_positioned_text_impl_reporting_invisible(
                 }
                 Err(error) => return Err(error),
             };
+        // The OCR-layer fallback, with the region extractor's gate: only a
+        // page that skipped invisible text and drew no visible text at all
+        // pays the second walk, and the walk's runs replace the page's only
+        // when they are a real layer. The rectangles, lines and forms of
+        // the first walk stand: the rendering mode changes no path.
+        if ocr_layer_fallback
+            && !include_invisible
+            && skipped_invisible
+            && !crate::has_visible_text(&items)
+        {
+            if let Ok(((layer, _, _), _, layer_gid, layer_rotated, _)) =
+                extract_page_text_items_with_forms(
+                    doc,
+                    page_id,
+                    *page_num,
+                    font_cmaps,
+                    true,
+                    &mut style_cache,
+                    &mut form_budget,
+                )
+            {
+                if crate::is_adoptable_ocr_layer(&layer) {
+                    items = layer;
+                    has_gid_fonts = layer_gid;
+                    coords_rotated = layer_rotated;
+                    skipped_invisible = false;
+                    ocr_layer_pages.insert(*page_num);
+                }
+            }
+        }
         skipped_invisible_anywhere |= skipped_invisible;
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
@@ -591,6 +685,7 @@ fn extract_positioned_text_impl_reporting_invisible(
         page_thresholds,
         gid_encoded_pages,
         skipped_invisible_anywhere,
+        ocr_layer_pages,
     ))
 }
 

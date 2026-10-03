@@ -55,6 +55,7 @@ pub use extractor::{
     extract_text_with_positions_mem_pages_with_invisible, extract_text_with_positions_pages,
     extract_text_with_positions_pages_with_password,
     extract_text_with_positions_rects_and_forms_mem_with_invisible,
+    extract_text_with_positions_rects_and_forms_mem_with_ocr_layer,
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
@@ -65,7 +66,9 @@ pub use text_quality::{
     analyze_text_quality, detect_encoding_issues, LetterFrequencyScore, TextQualityReport,
     MIN_LETTERS_FOR_GARBLE_SCORE,
 };
-pub use types::{LayoutComplexity, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
+pub use types::{
+    LayoutComplexity, OcrLayerExtraction, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem,
+};
 
 use lopdf::Document;
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -998,6 +1001,30 @@ pub struct PageRegionResult {
 /// real OCR layer carries far more; a stray watermark or artifact does not.
 const OCR_LAYER_MIN_ALNUM: usize = 40;
 
+/// Whether a page walk found any visible text at all: an item that is not
+/// an image placeholder and holds something other than whitespace.
+/// Punctuation counts. This is the OCR-layer fallback's gate: an invisible
+/// OCR layer transcribes the raster, so any visible glyph has an invisible
+/// twin there and adopting the layer would duplicate it.
+pub(crate) fn has_visible_text(items: &[TextItem]) -> bool {
+    items
+        .iter()
+        .any(|it| !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty())
+}
+
+/// Whether a page walk that kept the invisible layer recovered an OCR layer
+/// worth adopting: at least [`OCR_LAYER_MIN_ALNUM`] alphanumerics of real,
+/// non-garbage text. The whole recovered layer is judged, not a prefix: a
+/// broken OCR layer can hide its garbage past any fixed sample size.
+pub(crate) fn is_adoptable_ocr_layer(items: &[TextItem]) -> bool {
+    let sample: String = items
+        .iter()
+        .filter(|it| !matches!(it.item_type, types::ItemType::Image))
+        .map(|it| it.text.as_str())
+        .collect();
+    non_placeholder_alnum(items) >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample)
+}
+
 /// Alphanumeric mass of extracted items, ignoring raster placeholders.
 /// `[Image: ...]` items (ItemType::Image) are synthesized for image
 /// XObjects — they mark that pixels exist, not that text was read, so they
@@ -1091,10 +1118,7 @@ pub fn extract_text_in_regions_mem(
         // has an invisible twin there and adoption would duplicate it
         // (review catches — strict gate, no fuzzy dedupe). Adopt the retry
         // only when it contributes real, non-garbage text.
-        let has_visible_text = items.iter().any(|it| {
-            !matches!(it.item_type, types::ItemType::Image) && !it.text.trim().is_empty()
-        });
-        if skipped_invisible && !has_visible_text {
+        if skipped_invisible && !has_visible_text(&items) {
             if let Ok(((inv_items, _inv_rects, _inv_lines), inv_gid, inv_rotated, _)) =
                 extractor::content_stream::extract_page_text_items(
                     &doc,
@@ -1106,16 +1130,10 @@ pub fn extract_text_in_regions_mem(
                     &mut form_budget,
                 )
             {
-                let inv_alnum = non_placeholder_alnum(&inv_items);
                 // Judge the WHOLE recovered layer, not a prefix — a broken
                 // OCR layer can hide its garbage past any fixed sample size
                 // (review catch).
-                let sample: String = inv_items
-                    .iter()
-                    .filter(|it| !matches!(it.item_type, types::ItemType::Image))
-                    .map(|it| it.text.as_str())
-                    .collect();
-                if inv_alnum >= OCR_LAYER_MIN_ALNUM && !is_garbage_text(&sample) {
+                if is_adoptable_ocr_layer(&inv_items) {
                     items = inv_items;
                     has_gid = inv_gid;
                     coords_rotated = inv_rotated;
