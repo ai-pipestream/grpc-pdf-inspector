@@ -232,7 +232,7 @@ Configuration is environment-only:
 | `GRPC_PDF_ADDR` | `0.0.0.0:50067` | Listen address. |
 | `GRPC_PDF_MAX_BYTES` | `134217728` (128 MiB) | Largest accepted upload. |
 | `GRPC_PDF_MAX_CHUNK_BYTES` | `16777216` (16 MiB) | Largest single `chunk` frame. |
-| `GRPC_PDF_MAX_CONCURRENT_PARSES` | `8` | Concurrent parse calls; further calls wait. |
+| `GRPC_PDF_MAX_CONCURRENT_PARSES` | `8` | Concurrent calls, uploading or parsing; further calls wait, before their upload is read. |
 | `GRPC_PDF_MAX_STREAM_BYTES` | `268435456` (256 MiB) | Largest size any one stream of a document may decompress to. |
 | `GRPC_PDF_MAX_DECOMPRESSED_BYTES` | `4294967296` (4 GiB) | Largest total one read of a document may decompress to. |
 | `GRPC_PDF_MAX_PARSE_SECONDS` | `300` | Longest a call may hold its parse slot, upload included. |

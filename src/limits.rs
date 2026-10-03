@@ -34,7 +34,8 @@ pub const DEFAULT_MAX_CHUNK_BYTES: u64 = 16 * MIB;
 /// The bound exists to cap CPU and heap, not to shed load: each in-flight
 /// call can hold its upload plus the extracted text, and extraction
 /// parallelizes across cores with rayon, so eight at once is already the
-/// whole machine. Calls past the bound wait.
+/// whole machine. Calls past the bound wait, and a call takes its slot
+/// before its upload is read, so the waiting ones hold no upload either.
 pub const DEFAULT_MAX_CONCURRENT_PARSES: usize = 8;
 
 /// Default ceiling on how far any one stream of a document may decompress:

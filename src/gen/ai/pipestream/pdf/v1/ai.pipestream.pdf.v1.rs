@@ -802,9 +802,10 @@ pub struct ServerLimits {
     /// stream. A larger upload is legal; split it across more frames.
     #[prost(uint64, tag="2")]
     pub max_chunk_bytes: u64,
-    /// How many ParsePdf calls may run concurrently. Further calls wait
-    /// rather than being refused, because the bound exists to cap CPU and
-    /// heap, not to shed load.
+    /// How many ParsePdf calls may run concurrently, uploading or parsing.
+    /// Further calls wait rather than being refused, because the bound exists
+    /// to cap CPU and heap, not to shed load, and a waiting call's upload is
+    /// not read until it has a slot, so waiting holds no upload in memory.
     #[prost(uint32, tag="3")]
     pub max_concurrent_parses: u32,
     /// Largest size, in bytes, any one stream of a document may decompress

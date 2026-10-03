@@ -1115,9 +1115,10 @@ message ServerLimits {
   // stream. A larger upload is legal; split it across more frames.
   uint64 max_chunk_bytes = 2;
 
-  // How many ParsePdf calls may run concurrently. Further calls wait
-  // rather than being refused, because the bound exists to cap CPU and
-  // heap, not to shed load.
+  // How many ParsePdf calls may run concurrently, uploading or parsing.
+  // Further calls wait rather than being refused, because the bound exists
+  // to cap CPU and heap, not to shed load, and a waiting call's upload is
+  // not read until it has a slot, so waiting holds no upload in memory.
   uint32 max_concurrent_parses = 3;
 
   // Largest size, in bytes, any one stream of a document may decompress
