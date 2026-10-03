@@ -256,6 +256,24 @@ and a scanned page outside detection's eight-page sample was never named.
 - *Tests*: `tests/ocr_routing.rs`, over a generated searchable scan and a
   twenty-page text document with two unsampled scanned pages.
 
+**Follow-up (2026-10-03): the rendering mode is graphics state.** Both the
+detector's scanner and the extractor set the text rendering mode back to 0
+at `BT`, which the PDF spec does not do (ISO 32000-1, 9.3.1): `Tr` holds
+across `BT` and `ET` until another `Tr` or a `Q`. A scan whose producer
+sets `3 Tr` once, before its text objects, classified text-based and
+extracted its hidden OCR layer as the body.
+
+- *Patch* `bd074fe`: neither resets the mode at `BT`; both keep it on
+  their `q`/`Q` stacks.
+- *Tests*: `tests/ocr_routing.rs`, over a searchable scan that sets the
+  mode before `BT`; the crate's `detector` and `extractor::content_stream`
+  modules test the scoping.
+- *CI* (`0d4fd39`): the crate's own unit tests run in the Rust job with
+  `--manifest-path vendor/pdf-inspector/Cargo.toml`. Upstream tests that
+  read `tests/fixtures`, which the published crate does not package, are
+  marked `#[ignore]`, and the crate's lock holds `aes` at 0.9.2 so the
+  1.88 job builds it.
+
 **Hostile-input review (2026-10-02): bounded decoding.** Only the metadata
 reader capped decompression; every pass of the parser decoded content,
 font, CMap and Form XObject streams without limit.
