@@ -35,6 +35,7 @@ pub mod adobe_korea1;
 pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
+pub mod guard;
 pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
@@ -61,6 +62,7 @@ pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
     to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
 };
+pub use guard::{Interrupt, ParseGuard};
 pub use process_mode::ProcessMode;
 pub use text_quality::{
     analyze_text_quality, detect_encoding_issues, LetterFrequencyScore, TextQualityReport,
@@ -3909,6 +3911,7 @@ pub(crate) fn load_document_from_mem_with_password(
         Ok(doc) => doc,
         Err(first_err) => {
             for repaired in repair_pdf_container_candidates(buf) {
+                guard::checkpoint()?;
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
@@ -3930,7 +3933,7 @@ pub(crate) fn load_document_from_mem_with_password(
 }
 
 fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
-    match Document::load_mem(buf) {
+    match Document::load_mem_with_options(buf, guard::load_options(None)) {
         // Some encrypted PDFs load structurally but leave their streams
         // encrypted (`is_encrypted()` stays true); reading them yields garbage
         // until we re-load with a password. Others fail load_mem outright with
@@ -3947,10 +3950,10 @@ fn load_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, l
 /// non-empty password was supplied but rejected.
 fn decrypt_document_bytes(buf: &[u8], password: Option<&str>) -> Result<Document, lopdf::Error> {
     let pw = password.unwrap_or("");
-    match Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(pw)) {
+    match Document::load_mem_with_options(buf, guard::load_options(Some(pw))) {
         Ok(doc) => Ok(doc),
         Err(inner) if !pw.is_empty() => {
-            Document::load_mem_with_options(buf, lopdf::LoadOptions::with_password(""))
+            Document::load_mem_with_options(buf, guard::load_options(Some("")))
                 .map_err(|_| inner)
         }
         Err(inner) => Err(inner),
@@ -6350,6 +6353,10 @@ pub enum PdfError {
     InvalidStructure,
     #[error("Not a PDF: {0}")]
     NotAPdf(String),
+    /// The [`ParseGuard`] in force stopped the work: a stream past its
+    /// decompression limit, a passed deadline, or a cancellation.
+    #[error("Parse interrupted: {0}")]
+    Interrupted(Interrupt),
 }
 
 impl From<lopdf::Error> for PdfError {

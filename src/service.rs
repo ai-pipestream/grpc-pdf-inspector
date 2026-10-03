@@ -12,7 +12,8 @@
 //! slow reader slows the parser rather than growing a queue behind it.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -134,23 +135,46 @@ impl pb::pdf_parse_service_server::PdfParseService for PdfGrpc {
             .await
             .map_err(|_| Status::unavailable("the server is shutting down"))?;
 
+        // The call's limits: how far the document may inflate, how long the
+        // call may hold its slot, and a flag the supervisor below sets when
+        // nobody is listening any more. The parser checks the last two
+        // between pages, so a pathological document cannot hold a slot past
+        // its budget or past its caller.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let guard = self
+            .limits
+            .parse_guard()
+            .with_deadline(Instant::now() + self.limits.max_parse_time)
+            .with_cancel(Arc::clone(&cancel));
+
         self.metrics.parse_started();
         let metrics = Arc::clone(&self.metrics);
         let (tx, rx) = mpsc::channel(OUTBOUND_BUFFER);
         let supervisor = tx.clone();
 
-        let handle = tokio::task::spawn_blocking(move || {
+        let mut handle = tokio::task::spawn_blocking(move || {
             let sink = Sink::new(tx, CONSUMER_STALL);
-            parse::run(&bytes, &options, &metrics, &sink)
+            parse::run_guarded(&bytes, &options, &metrics, &sink, &guard)
         });
 
         let metrics = Arc::clone(&self.metrics);
         tokio::spawn(async move {
+            // A caller that hangs up mid-parse is heard here, the moment the
+            // response stream is dropped, rather than at the parser's next
+            // send: a document's extraction pass can run a long time between
+            // two events, and the slot it holds is somebody else's.
+            let joined = tokio::select! {
+                joined = &mut handle => joined,
+                () = supervisor.closed() => {
+                    cancel.store(true, Ordering::Relaxed);
+                    handle.await
+                }
+            };
             // A panic drops the parser's sender, and without this the stream
             // would end *successfully* with whatever had been delivered — a
             // truncated document indistinguishable from a short one. The
             // supervisor's own sender is what makes the difference reportable.
-            let status = match handle.await {
+            let status = match joined {
                 Ok(Outcome::Complete) => {
                     metrics.parse_succeeded();
                     None

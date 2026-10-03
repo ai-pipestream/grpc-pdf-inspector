@@ -10,13 +10,96 @@
 //!   Fixable by sending a different file; the server would behave the same
 //!   tomorrow.
 //! - `RESOURCE_EXHAUSTED` — "you gave me more than I am configured to hold."
+//!   That includes a document that inflates past the decompression limits,
+//!   which is the same complaint about a different measure of size.
+//! - `DEADLINE_EXCEEDED` — "this took longer than a call may hold a slot."
 //! - `INTERNAL` — a bug here. Nothing in this file should produce one, and a
 //!   test that starts to is reporting a real defect.
 
 mod common;
 
+use std::time::Duration;
+
 use grpc_pdf_inspector::proto::v1 as pb;
 use tonic::Code;
+
+/// One mebibyte.
+const MIB: usize = 1024 * 1024;
+
+/// A server whose streams may inflate to a mebibyte each and whose
+/// document reads may inflate to four, so a bomb test costs megabytes
+/// rather than the gigabytes the default limits allow.
+async fn small_inflation_limits() -> common::Harness {
+    common::start_with(grpc_pdf_inspector::Limits {
+        max_stream_bytes: MIB as u64,
+        max_decompressed_bytes: 4 * MIB as u64,
+        ..Default::default()
+    })
+    .await
+}
+
+#[tokio::test]
+async fn a_stream_that_inflates_past_its_limit_is_resource_exhausted() {
+    // Eight mebibytes of content from a few kilobytes of upload.
+    let bomb = common::inflating_pdf(1, 8 * MIB);
+    assert!(bomb.len() < 64 * 1024, "{} bytes", bomb.len());
+
+    let harness = small_inflation_limits().await;
+    for mode in [pb::ProcessMode::DetectOnly, pb::ProcessMode::Full] {
+        let status = harness
+            .parse(
+                &bomb,
+                pb::PdfOptions {
+                    mode: mode.into(),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("the bomb must be refused");
+        assert_eq!(
+            status.code(),
+            Code::ResourceExhausted,
+            "{mode:?}: {status:?}"
+        );
+        assert!(
+            status.message().contains("GRPC_PDF_MAX_STREAM_BYTES"),
+            "{status:?}"
+        );
+    }
+
+    // The limit is what refused it: under the default ceiling the same
+    // bytes are an ordinary one-line document.
+    let events = common::start().await.parse_ok(&bomb).await;
+    assert!(
+        common::pages(&events)[0]
+            .markdown
+            .contains("A line of text"),
+        "{events:?}"
+    );
+}
+
+#[tokio::test]
+async fn many_streams_under_the_limit_still_spend_the_documents_budget() {
+    // Twenty streams of three quarters of a mebibyte: every one fits its
+    // own ceiling and together they are fifteen mebibytes.
+    let pdf = common::inflating_pdf(20, 3 * MIB / 4);
+    let harness = small_inflation_limits().await;
+    let status = harness.parse_err(&pdf).await;
+    assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+}
+
+#[tokio::test]
+async fn a_call_past_its_time_budget_is_deadline_exceeded() {
+    let harness = common::start_with(grpc_pdf_inspector::Limits {
+        max_parse_time: Duration::from_nanos(1),
+        ..Default::default()
+    })
+    .await;
+    let status = harness
+        .parse_err(&common::text_pdf(2, 20, "deadline-marker"))
+        .await;
+    assert_eq!(status.code(), Code::DeadlineExceeded, "{status:?}");
+}
 
 #[tokio::test]
 async fn garbage_bytes_are_a_caller_error() {

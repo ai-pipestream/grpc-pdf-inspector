@@ -64,7 +64,7 @@
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
-use pdf_inspector::{MarkdownOptions, PdfOptions, PdfType, ProcessMode};
+use pdf_inspector::{Interrupt, MarkdownOptions, ParseGuard, PdfOptions, PdfType, ProcessMode};
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -194,7 +194,8 @@ impl<'a> Events<'a> {
     }
 }
 
-/// Classify `bytes` and stream the events the mode calls for into `sink`.
+/// Classify `bytes` and stream the events the mode calls for into `sink`,
+/// under the default limits and with no deadline.
 ///
 /// Synchronous on purpose: extraction is CPU-bound and parallelizes with
 /// rayon internally, so the caller runs this on
@@ -202,7 +203,27 @@ impl<'a> Events<'a> {
 /// channel. Everything stays in memory; nothing is written anywhere.
 #[must_use]
 pub fn run(bytes: &[u8], options: &pb::PdfOptions, metrics: &Metrics, sink: &Sink) -> Outcome {
-    match parse(bytes, options, metrics, sink) {
+    run_guarded(
+        bytes,
+        options,
+        metrics,
+        sink,
+        &crate::Limits::default().parse_guard(),
+    )
+}
+
+/// [`run`] under `guard`: every parser pass decodes within its
+/// decompression bounds, and the parse stops at the next page once its
+/// deadline passes or its caller cancels.
+#[must_use]
+pub fn run_guarded(
+    bytes: &[u8],
+    options: &pb::PdfOptions,
+    metrics: &Metrics,
+    sink: &Sink,
+    guard: &ParseGuard,
+) -> Outcome {
+    match parse(bytes, options, metrics, sink, guard) {
         Ok(()) => Outcome::Complete,
         Err(Abort::Gone) => Outcome::Abandoned,
         Err(Abort::Failed(status)) => Outcome::Failed(status),
@@ -215,8 +236,11 @@ fn parse(
     options: &pb::PdfOptions,
     metrics: &Metrics,
     sink: &Sink,
+    guard: &ParseGuard,
 ) -> Result<(), Abort> {
     let started = Instant::now();
+    // The upload may already have spent the call's time.
+    check(guard)?;
     let mode = pb::ProcessMode::try_from(options.mode)
         .map_err(|_| Status::invalid_argument(format!("unknown process mode {}", options.mode)))?;
     let mode = match mode {
@@ -239,7 +263,9 @@ fn parse(
         detect = detect.password(options.password.clone());
     }
     metrics.parser_pass();
-    let detected = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, detect))?;
+    let detected = guarded(guard, || {
+        pdf_inspector::process_pdf_mem_with_options(bytes, detect)
+    })?;
     // Detection's own per-page verdicts, kept because the trailer's
     // `extraction_ocr_reasons` is these merged with what reading the text
     // layer concludes, exactly as the analysis pass used to merge them.
@@ -287,7 +313,7 @@ fn parse(
         // extraction runs off its own reader and is unaffected.
         metrics.parser_pass();
         let metadata = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::metadata::read(bytes, password)
+            crate::metadata::read(bytes, password, guard.max_stream_bytes)
         }))
         .ok()
         .flatten();
@@ -323,7 +349,7 @@ fn parse(
         _ if !text_bearing => {}
         pb::ProcessMode::Analyze => {
             metrics.parser_pass();
-            let analyzed = guarded(|| {
+            let analyzed = guarded(guard, || {
                 pdf_inspector::process_pdf_mem_with_options(bytes, analyze_options(options))
             })?;
             layout = Some(layout_proto(&analyzed.layout));
@@ -340,7 +366,9 @@ fn parse(
             }
             full = full.password(options.password.clone());
             metrics.parser_pass();
-            let processed = guarded(|| pdf_inspector::process_pdf_mem_with_options(bytes, full))?;
+            let processed = guarded(guard, || {
+                pdf_inspector::process_pdf_mem_with_options(bytes, full)
+            })?;
             if let Some(markdown) = processed.markdown.filter(|md| !md.is_empty()) {
                 let markdown_bytes = markdown.len() as u64;
                 let replacement_runs = replacement_runs(&markdown);
@@ -397,7 +425,7 @@ fn parse(
                 forms,
                 skipped_invisible,
                 ocr_layer_pages,
-            } = guarded(|| {
+            } = guarded(guard, || {
                 pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
                     bytes,
                     filter.as_ref(),
@@ -433,7 +461,7 @@ fn parse(
             // the second walk is read against has none of it.
             let mut invisible = if events.wanted(options.report_invisible) && skipped_invisible {
                 metrics.parser_pass();
-                let (kept, _) = guarded(|| {
+                let (kept, _) = guarded(guard, || {
                     pdf_inspector::extract_text_with_positions_mem_pages_with_invisible(
                         bytes,
                         filter.as_ref(),
@@ -463,7 +491,7 @@ fn parse(
                 let selected: Option<Vec<u32>> =
                     (!options.pages.is_empty()).then(|| options.pages.clone());
                 metrics.parser_pass();
-                let elements = guarded(|| {
+                let elements = guarded(guard, || {
                     pdf_inspector::extract_structure_elements_mem(bytes, selected.as_deref())
                 })?;
                 structure::by_page(elements)
@@ -477,6 +505,9 @@ fn parse(
             let mut pages_with_columns = Vec::new();
 
             for page_no in requested_pages(options, detected.page_count) {
+                // Rendering, tables and the fold run here rather than in
+                // the parser, so the call's time is checked here too.
+                check(guard)?;
                 let page_items = by_page.remove(&page_no).unwrap_or_default();
 
                 // A page that drew a picture and no text at all is a scan,
@@ -650,6 +681,7 @@ fn parse(
     // The fold has seen every content event now, so its Document goes out
     // here — after the last `page`, before the `status` trailer that closes
     // the stream.
+    check(guard)?;
     if let Some(fold) = events.fold.as_mut() {
         sink.send(pb::parse_pdf_response::Event::Document(fold.take()))?;
     }
@@ -871,15 +903,30 @@ fn ocr_reasons_proto(pages: &[pdf_inspector::PageOcrReasons]) -> Vec<pb::PageOcr
         .collect()
 }
 
-/// Call a fallible parser entry point with a panic guard.
+/// Call a fallible parser entry point under the call's guard, with a panic
+/// guard.
 ///
 /// lopdf can panic on malformed input, and an unwinding panic on the blocking
 /// thread would surface as a truncated stream; here it becomes an honest
 /// `INTERNAL` instead. `PdfError` maps by variant per the fleet contract.
-fn guarded<T>(call: impl FnOnce() -> Result<T, pdf_inspector::PdfError>) -> Result<T, Status> {
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)) {
+///
+/// An interrupt outranks whatever the call returned. A stream the guard
+/// refused reads as an undecodable one to code with no way to report it,
+/// so a pass that hit a limit can return a quietly incomplete answer, and
+/// the guard's own record is what says it is one.
+fn guarded<T>(
+    guard: &ParseGuard,
+    call: impl FnOnce() -> Result<T, pdf_inspector::PdfError>,
+) -> Result<T, Abort> {
+    let (outcome, interrupt) =
+        guard.run(|| std::panic::catch_unwind(std::panic::AssertUnwindSafe(call)));
+    if let Some(why) = interrupt {
+        return Err(interrupted(guard, why));
+    }
+    match outcome {
         Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(map_error(error)),
+        Ok(Err(pdf_inspector::PdfError::Interrupted(why))) => Err(interrupted(guard, why)),
+        Ok(Err(error)) => Err(map_error(error).into()),
         Err(payload) => {
             let detail = payload
                 .downcast_ref::<&str>()
@@ -888,8 +935,41 @@ fn guarded<T>(call: impl FnOnce() -> Result<T, pdf_inspector::PdfError>) -> Resu
                 .unwrap_or_else(|| "unknown panic".to_owned());
             Err(Status::internal(format!(
                 "the parser panicked, which is a bug in grpc-pdf-inspector: {detail}"
-            )))
+            ))
+            .into())
         }
+    }
+}
+
+/// Stop if the call's deadline has passed or its caller has gone.
+fn check(guard: &ParseGuard) -> Result<(), Abort> {
+    match guard.interrupted() {
+        Some(why) => Err(interrupted(guard, why)),
+        None => Ok(()),
+    }
+}
+
+/// How a call the guard stopped ends.
+///
+/// A caller that cancelled is not told anything: it is gone. A passed
+/// deadline is `DEADLINE_EXCEEDED`, and a document that inflates past its
+/// limits is `RESOURCE_EXHAUSTED`, the code an oversize upload gets,
+/// because it is the same complaint about a different measure of size.
+fn interrupted(guard: &ParseGuard, why: Interrupt) -> Abort {
+    match why {
+        Interrupt::Cancelled => Abort::Gone,
+        Interrupt::Deadline => Status::deadline_exceeded(
+            "the parse ran past its time budget; raise GRPC_PDF_MAX_PARSE_SECONDS if the \
+             document genuinely needs longer",
+        )
+        .into(),
+        Interrupt::DecompressionLimit => Status::resource_exhausted(format!(
+            "the document inflates past its decompression limits: a stream past {} bytes, or \
+             one read past {} bytes in all; raise GRPC_PDF_MAX_STREAM_BYTES or \
+             GRPC_PDF_MAX_DECOMPRESSED_BYTES if the document is genuinely this large",
+            guard.max_stream_bytes, guard.max_run_bytes
+        ))
+        .into(),
     }
 }
 
@@ -911,6 +991,15 @@ fn map_error(error: pdf_inspector::PdfError) -> Status {
             "the PDF is encrypted; supply its password in `options.password`".to_owned(),
         ),
         PdfError::Io(error) => Status::internal(format!("unexpected I/O error: {error}")),
+        // `guarded` turns an interrupt into its own abort before it gets
+        // here; this is the code each one would carry.
+        PdfError::Interrupted(Interrupt::Deadline) => {
+            Status::deadline_exceeded("the parse ran past its time budget")
+        }
+        PdfError::Interrupted(Interrupt::DecompressionLimit) => {
+            Status::resource_exhausted("the document inflates past its decompression limits")
+        }
+        PdfError::Interrupted(Interrupt::Cancelled) => Status::cancelled("the call was cancelled"),
     }
 }
 

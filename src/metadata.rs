@@ -36,11 +36,6 @@ use crate::proto::v1 as pb;
 /// stack overflow.
 const MAX_DEPTH: usize = 32;
 
-/// Ceiling on how far any single stream may decompress while the document
-/// loads. Comfortably above what a real file's object streams need and far
-/// below what a decompression bomb wants.
-const MAX_DECOMPRESSED_BYTES: usize = 256 * 1024 * 1024;
-
 /// How many nodes one tree walk visits. A cycle is caught by the visited
 /// set, but a wide fan-out of distinct nodes is not a cycle and still has
 /// to end.
@@ -48,28 +43,37 @@ const MAX_NODES: usize = 100_000;
 
 /// Read everything the document says about itself.
 ///
+/// No stream is decoded past `max_stream_bytes`: not the object and
+/// cross-reference streams the load decodes, and not the XMP packet.
+///
 /// Returns `None` when the buffer cannot be loaded at all — which is not a
 /// parse failure, because the text extraction runs off its own reader and
 /// is unaffected. The caller reports the gap as a warning.
 #[must_use]
-pub fn read(bytes: &[u8], password: Option<&str>) -> Option<pb::PdfMetadata> {
+pub fn read(
+    bytes: &[u8],
+    password: Option<&str>,
+    max_stream_bytes: usize,
+) -> Option<pb::PdfMetadata> {
     let options = lopdf::LoadOptions {
         password: password.map(ToOwned::to_owned),
         // Object and cross-reference streams are decompressed eagerly while
         // the document loads, so an unbounded limit here is a decompression
         // bomb waiting for a hostile upload — and hostile uploads are the
         // normal case for this service.
-        max_decompressed_size: Some(MAX_DECOMPRESSED_BYTES),
+        max_decompressed_size: Some(max_stream_bytes),
         ..lopdf::LoadOptions::default()
     };
     let document = Document::load_mem_with_options(bytes, options).ok()?;
-    Some(Reader::new(&document).read())
+    Some(Reader::new(&document, max_stream_bytes).read())
 }
 
 /// One loaded document, plus the page lookup every destination needs.
 struct Reader<'a> {
     /// The document being read.
     doc: &'a Document,
+    /// The most any stream read here may decompress to.
+    max_stream_bytes: usize,
     /// 1-indexed page numbers by page object, for resolving destinations.
     page_numbers: HashMap<ObjectId, u32>,
     /// Page objects in page order, 1-indexed.
@@ -78,10 +82,11 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     /// Index a document's pages so destinations can be resolved.
-    fn new(doc: &'a Document) -> Self {
+    fn new(doc: &'a Document, max_stream_bytes: usize) -> Self {
         let pages = doc.get_pages();
         Self {
             doc,
+            max_stream_bytes,
             page_numbers: pages.iter().map(|(number, id)| (*id, *number)).collect(),
             page_ids: pages.into_iter().collect(),
         }
@@ -155,17 +160,26 @@ impl<'a> Reader<'a> {
 
     /// The XMP packet from `/Root /Metadata`, decompressed but otherwise
     /// untouched.
+    ///
+    /// A packet that would inflate past the stream ceiling is left out
+    /// rather than read: it is a bomb, and its raw bytes are not XML either.
+    /// One whose filter fails for any other reason is reported raw, as the
+    /// file holds it.
     fn xmp_packet(&self) -> Vec<u8> {
         self.doc
             .catalog()
             .ok()
             .and_then(|catalog| catalog.get_deref(b"Metadata", self.doc).ok())
             .and_then(|object| object.as_stream().ok())
-            .map(|stream| {
-                stream
-                    .decompressed_content()
-                    .unwrap_or_else(|_| stream.content.clone())
-            })
+            .map(
+                |stream| match stream.decompressed_content_with_limit(self.max_stream_bytes) {
+                    Ok(packet) => packet,
+                    Err(lopdf::Error::Decompress(
+                        lopdf::DecompressError::MemoryLimitExceeded { .. },
+                    )) => Vec::new(),
+                    Err(_) => stream.content.clone(),
+                },
+            )
             .unwrap_or_default()
     }
 

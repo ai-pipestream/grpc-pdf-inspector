@@ -195,10 +195,16 @@ collector's parse of the same document:
 - Default off costs nothing: no fold is built and no markdown is
   retained.
 
-Errors: oversize upload → `RESOURCE_EXHAUSTED`; not-a-PDF / truncated /
-malformed / encrypted-without-password / page 0 → `INVALID_ARGUMENT`;
-parser panic → `INTERNAL`. Events already delivered before a failure remain
-valid.
+Errors: oversize upload, or a document that inflates past its
+decompression limits → `RESOURCE_EXHAUSTED`; not-a-PDF / truncated /
+malformed / encrypted-without-password / page 0 → `INVALID_ARGUMENT`; a
+call that holds its parse slot past `GRPC_PDF_MAX_PARSE_SECONDS` →
+`DEADLINE_EXCEEDED`; parser panic → `INTERNAL`. Events already delivered
+before a failure remain valid. Every parser pass runs under those limits:
+each stream is decoded against the per-stream cap and the read's budget,
+and the parse checks its deadline, and whether its caller is still there,
+between pages, so a hung-up or overdue call gives its slot back within a
+page rather than at the end of the document.
 
 Passwords: supply `options.password` for an encrypted PDF. The library's
 per-page extraction API takes no password, so FULL mode with a password
@@ -227,6 +233,9 @@ Configuration is environment-only:
 | `GRPC_PDF_MAX_BYTES` | `134217728` (128 MiB) | Largest accepted upload. |
 | `GRPC_PDF_MAX_CHUNK_BYTES` | `16777216` (16 MiB) | Largest single `chunk` frame. |
 | `GRPC_PDF_MAX_CONCURRENT_PARSES` | `8` | Concurrent parse calls; further calls wait. |
+| `GRPC_PDF_MAX_STREAM_BYTES` | `268435456` (256 MiB) | Largest size any one stream of a document may decompress to. |
+| `GRPC_PDF_MAX_DECOMPRESSED_BYTES` | `4294967296` (4 GiB) | Largest total one read of a document may decompress to. |
+| `GRPC_PDF_MAX_PARSE_SECONDS` | `300` | Longest a call may hold its parse slot, upload included. |
 | `GRPC_PDF_WORKERS` | CPU count | Tokio worker threads. |
 | `GRPC_PDF_WINDOW_BYTES` | `4194304` | HTTP/2 initial window (stream and connection). |
 | `GRPC_PDF_METRICS_INTERVAL_SECS` | `60` | Seconds between metrics lines; 0 disables. |

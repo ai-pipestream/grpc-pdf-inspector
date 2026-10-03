@@ -70,7 +70,7 @@ fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
     let pages = doc.get_pages();
     let page_nums: Vec<u32> = pages.keys().cloned().collect();
 
-    doc.extract_text(&page_nums)
+    doc.extract_text_with_limit(&page_nums, crate::guard::max_stream_bytes())
         .map_err(|e| PdfError::Parse(e.to_string()))
 }
 
@@ -481,6 +481,7 @@ fn extract_positioned_text_impl_reporting_invisible(
                 continue;
             }
         }
+        crate::guard::checkpoint()?;
         // One Form XObject budget per page, shared with the OCR-layer
         // retry below so one page cannot spend two full expansions.
         let mut form_budget = FormWalkBudget::new();

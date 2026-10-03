@@ -1619,6 +1619,63 @@ pub fn photo_with_empty_text_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a `pages`-page document whose every content stream inflates to
+/// `inflated_bytes`: a line of real text and then that much white space,
+/// Flate-compressed.
+///
+/// White space is legal content, so a reader that decodes the stream finds
+/// one ordinary line in it. What it costs to get there is the point: Flate
+/// packs a run of spaces about a thousand to one, which is how a few
+/// kilobytes of upload ask for megabytes or gigabytes of memory.
+#[must_use]
+pub fn inflating_pdf(pages: u32, inflated_bytes: usize) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let mut content =
+            format!("BT /F1 12 Tf 72 700 Td (A line of text on page {page}) Tj ET\n").into_bytes();
+        content.resize(content.len() + inflated_bytes, b' ');
+        let mut stream = Stream::new(dictionary! {}, content);
+        stream.compress().expect("compress the content stream");
+        let content_id = doc.add_object(stream);
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {

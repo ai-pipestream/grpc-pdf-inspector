@@ -807,6 +807,26 @@ pub struct ServerLimits {
     /// heap, not to shed load.
     #[prost(uint32, tag="3")]
     pub max_concurrent_parses: u32,
+    /// Largest size, in bytes, any one stream of a document may decompress
+    /// to: a content, font, CMap, Form XObject, object or cross-reference
+    /// stream. A page's content streams share it. A document with a stream
+    /// past it fails with RESOURCE_EXHAUSTED rather than taking the server's
+    /// memory with it.
+    #[prost(uint64, tag="4")]
+    pub max_stream_bytes: u64,
+    /// Largest total, in bytes, one read of a document may decompress, summed
+    /// over every stream that read decodes. A FULL call reads the document
+    /// more than once and each read has its own budget. Past it the call fails
+    /// with RESOURCE_EXHAUSTED.
+    #[prost(uint64, tag="5")]
+    pub max_decompressed_bytes: u64,
+    /// Longest, in seconds, one ParsePdf call may hold a parse slot, from the
+    /// moment it is admitted to one until its trailer, upload included. Past
+    /// it the call fails with DEADLINE_EXCEEDED. A caller's own shorter
+    /// deadline ends the parse sooner: the server stops working as soon as the
+    /// caller cancels.
+    #[prost(uint64, tag="6")]
+    pub max_parse_seconds: u64,
 }
 /// ProcessMode selects how far the pipeline runs for one call.
 ///

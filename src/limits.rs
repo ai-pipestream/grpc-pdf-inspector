@@ -4,10 +4,11 @@
 //! made.
 //!
 //! Unlike the per-call options of some fleet siblings, these ceilings are
-//! process-wide only: a PDF call has nothing worth letting a caller narrow
-//! (no archive to inflate, no entry count), so [`Limits`] is what the
-//! process was started with, from defaults or the environment, and it is
-//! final.
+//! process-wide only: [`Limits`] is what the process was started with, from
+//! defaults or the environment, and it is final. A caller narrows nothing,
+//! because every one of them protects the process rather than the call.
+
+use std::time::Duration;
 
 use crate::proto::v1 as pb;
 
@@ -36,6 +37,28 @@ pub const DEFAULT_MAX_CHUNK_BYTES: u64 = 16 * MIB;
 /// whole machine. Calls past the bound wait.
 pub const DEFAULT_MAX_CONCURRENT_PARSES: usize = 8;
 
+/// Default ceiling on how far any one stream of a document may decompress:
+/// 256 MiB.
+///
+/// A Flate stream inflates about a thousand to one, so a few megabytes of
+/// upload can name tens of gigabytes. Real content, font and CMap streams
+/// stay far below this; a stream past it fails the call rather than the
+/// process.
+pub const DEFAULT_MAX_STREAM_BYTES: u64 = 256 * MIB;
+
+/// Default ceiling on how much one read of a document may decompress in
+/// all: 4 GiB.
+///
+/// The per-stream cap bounds memory; this bounds the work a document made
+/// of many streams just under that cap can demand. A FULL call reads the
+/// document more than once and each read has its own budget.
+pub const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 4096 * MIB;
+
+/// Default wall-clock budget for one call, from the moment it is admitted
+/// to a parse slot until its trailer: five minutes, which is also the
+/// longest gRParse waits for this collector.
+pub const DEFAULT_MAX_PARSE_SECONDS: u64 = 300;
+
 /// Ceilings the process enforces.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
@@ -45,6 +68,12 @@ pub struct Limits {
     pub max_chunk_bytes: u64,
     /// Largest number of calls that may parse at once.
     pub max_concurrent_parses: usize,
+    /// Largest size any one stream of a document may decompress to.
+    pub max_stream_bytes: u64,
+    /// Largest total one read of a document may decompress to.
+    pub max_decompressed_bytes: u64,
+    /// Longest a call may hold its parse slot, upload included.
+    pub max_parse_time: Duration,
 }
 
 impl Default for Limits {
@@ -53,6 +82,9 @@ impl Default for Limits {
             max_document_bytes: DEFAULT_MAX_DOCUMENT_BYTES,
             max_chunk_bytes: DEFAULT_MAX_CHUNK_BYTES,
             max_concurrent_parses: DEFAULT_MAX_CONCURRENT_PARSES,
+            max_stream_bytes: DEFAULT_MAX_STREAM_BYTES,
+            max_decompressed_bytes: DEFAULT_MAX_DECOMPRESSED_BYTES,
+            max_parse_time: Duration::from_secs(DEFAULT_MAX_PARSE_SECONDS),
         }
     }
 }
@@ -86,7 +118,27 @@ impl Limits {
                 defaults.max_concurrent_parses as u64,
             ))
             .unwrap_or(defaults.max_concurrent_parses),
+            max_stream_bytes: env_u64("GRPC_PDF_MAX_STREAM_BYTES", DEFAULT_MAX_STREAM_BYTES),
+            max_decompressed_bytes: env_u64(
+                "GRPC_PDF_MAX_DECOMPRESSED_BYTES",
+                DEFAULT_MAX_DECOMPRESSED_BYTES,
+            ),
+            max_parse_time: Duration::from_secs(env_u64(
+                "GRPC_PDF_MAX_PARSE_SECONDS",
+                DEFAULT_MAX_PARSE_SECONDS,
+            )),
         }
+    }
+
+    /// The decompression bounds one call parses under, as the parser's
+    /// guard takes them. The deadline and the cancellation flag are the
+    /// call's own and are added by the caller.
+    #[must_use]
+    pub fn parse_guard(self) -> pdf_inspector::ParseGuard {
+        pdf_inspector::ParseGuard::new(
+            usize::try_from(self.max_stream_bytes).unwrap_or(usize::MAX),
+            self.max_decompressed_bytes,
+        )
     }
 
     /// Render these limits for `GetServiceInfo`.
@@ -96,6 +148,9 @@ impl Limits {
             max_document_bytes: self.max_document_bytes,
             max_chunk_bytes: self.max_chunk_bytes,
             max_concurrent_parses: u32::try_from(self.max_concurrent_parses).unwrap_or(u32::MAX),
+            max_stream_bytes: self.max_stream_bytes,
+            max_decompressed_bytes: self.max_decompressed_bytes,
+            max_parse_seconds: self.max_parse_time.as_secs(),
         }
     }
 }
@@ -110,5 +165,8 @@ mod tests {
         assert_eq!(limits.max_document_bytes, 128 * MIB);
         assert_eq!(limits.max_chunk_bytes, 16 * MIB);
         assert_eq!(limits.max_concurrent_parses, 8);
+        assert_eq!(limits.max_stream_bytes, 256 * MIB);
+        assert_eq!(limits.max_decompressed_bytes, 4096 * MIB);
+        assert_eq!(limits.max_parse_time, Duration::from_secs(300));
     }
 }

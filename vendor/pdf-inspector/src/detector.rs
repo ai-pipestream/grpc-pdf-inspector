@@ -222,6 +222,7 @@ pub(crate) fn detect_from_document(
     let mut pages_actually_sampled = 0u32;
 
     for page_num in &sample_indices {
+        crate::guard::checkpoint()?;
         if let Some(&page_id) = pages.get(page_num) {
             let analysis = analyze_page_content(doc, page_id);
             pages_actually_sampled += 1;
@@ -404,6 +405,7 @@ pub(crate) fn detect_from_document(
         PdfType::TextBased | PdfType::Mixed => {
             let mut ocr_pages = Vec::new();
             for page_num in 1..=total_pages {
+                crate::guard::checkpoint()?;
                 let analysis = if let Some(cached) = analysis_cache.get(&page_num) {
                     cached.clone()
                 } else if let Some(&page_id) = pages.get(&page_num) {
@@ -462,6 +464,7 @@ pub(crate) fn detect_from_document(
             if analysis_cache.contains_key(&page_num) || pages_needing_ocr.contains(&page_num) {
                 continue;
             }
+            crate::guard::checkpoint()?;
             if let Some(&page_id) = pages.get(&page_num) {
                 let analysis = analyze_page_content(doc, page_id);
                 if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
@@ -787,10 +790,7 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
 
     for content_id in content_streams {
         if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = match stream.decompressed_content() {
-                Ok(data) => data,
-                Err(_) => stream.content.clone(),
-            };
+            let content = crate::guard::inflate_or_raw(stream);
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
@@ -1058,7 +1058,7 @@ fn embedded_font_has_cmap(doc: &Document, font_ref: lopdf::ObjectId) -> bool {
         Ok(s) => s,
         Err(_) => return false,
     };
-    let data = match stream.decompressed_content() {
+    let data = match crate::guard::inflate(stream) {
         Ok(d) => d,
         Err(_) => return false,
     };
@@ -1313,9 +1313,7 @@ fn scan_xobjects_in_resources(
                 .and_then(|o| o.as_name().ok());
             match subtype {
                 Some(b"Form") => {
-                    let content = stream
-                        .decompressed_content()
-                        .unwrap_or_else(|_| stream.content.clone());
+                    let content = crate::guard::inflate_or_raw(stream);
                     // Collect raw font names from this XObject's content stream
                     let mut xobj_font_names: HashSet<Vec<u8>> = HashSet::new();
                     scan.add(scan_content_stream(
