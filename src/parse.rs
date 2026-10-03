@@ -270,6 +270,7 @@ fn parse(
             })
             .collect(),
         detection_time_ms: detected.processing_time_ms,
+        ocr_recommended: detected.ocr_recommended,
     }))?;
 
     let mut warnings = Vec::new();

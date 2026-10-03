@@ -461,6 +461,15 @@ message PdfInfo {
   // Milliseconds the classification itself took, so a caller can check
   // that the cheap answer stayed cheap.
   uint64 detection_time_ms = 7;
+
+  // True when detection judged that OCR would read this document better
+  // than its own text layer does: images carry essential context (a
+  // template, a scan, a scan's OCR layer), or the pages are a dense
+  // newspaper layout whose reading order the text layer cannot be trusted
+  // to keep. It can be true for a TEXT_BASED document with no page named
+  // in `pages_needing_ocr`, which is the newspaper case: every page has a
+  // usable text layer, and reading it in order is the hard part.
+  bool ocr_recommended = 8;
 }
 
 // PageMarkdown is one extracted page, in requested page order.

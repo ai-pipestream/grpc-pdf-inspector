@@ -163,6 +163,11 @@ pub struct PdfProcessResult {
     /// `true` when broken font encodings are detected (garbled text,
     /// replacement characters). Clients should fall back to OCR.
     pub has_encoding_issues: bool,
+    /// Detection's [`PdfTypeResult::ocr_recommended`]: OCR would read this
+    /// document better than its text layer does, because images carry
+    /// essential context (a template or a scan) or the layout is a dense
+    /// newspaper the reading order cannot follow.
+    pub ocr_recommended: bool,
 }
 
 // =========================================================================
@@ -4145,6 +4150,7 @@ fn process_document(
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
     let confidence = detection.confidence;
+    let ocr_recommended = detection.ocr_recommended;
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
 
     // DetectOnly → return immediately
@@ -4160,6 +4166,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            ocr_recommended,
         });
     }
 
@@ -4176,6 +4183,7 @@ fn process_document(
             confidence,
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
+            ocr_recommended,
         });
     }
 
@@ -4510,6 +4518,7 @@ fn process_document(
         confidence,
         layout,
         has_encoding_issues,
+        ocr_recommended,
     })
 }
 

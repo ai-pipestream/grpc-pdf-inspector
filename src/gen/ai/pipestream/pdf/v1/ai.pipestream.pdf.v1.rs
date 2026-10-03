@@ -335,6 +335,15 @@ pub struct PdfInfo {
     /// that the cheap answer stayed cheap.
     #[prost(uint64, tag="7")]
     pub detection_time_ms: u64,
+    /// True when detection judged that OCR would read this document better
+    /// than its own text layer does: images carry essential context (a
+    /// template, a scan, a scan's OCR layer), or the pages are a dense
+    /// newspaper layout whose reading order the text layer cannot be trusted
+    /// to keep. It can be true for a TEXT_BASED document with no page named
+    /// in `pages_needing_ocr`, which is the newspaper case: every page has a
+    /// usable text layer, and reading it in order is the hard part.
+    #[prost(bool, tag="8")]
+    pub ocr_recommended: bool,
 }
 /// PageMarkdown is one extracted page, in requested page order.
 ///

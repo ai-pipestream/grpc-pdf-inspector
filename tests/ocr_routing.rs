@@ -266,3 +266,20 @@ async fn a_page_with_a_picture_and_no_text_is_flagged_where_detection_missed_it(
     assert_eq!(pages[1].ocr_reason(), pb::OcrReason::Scanned);
     assert_eq!(trailer_pages(common::status(&events)), [2]);
 }
+
+#[tokio::test]
+async fn info_says_when_detection_recommends_ocr() {
+    let harness = common::start().await;
+    for (pdf, recommended) in [
+        (common::searchable_scan_pdf(2), true),
+        (common::image_pdf(2), true),
+        (common::text_pdf(3, 60, "prose"), false),
+    ] {
+        let events = harness
+            .parse(&pdf, detect_only())
+            .await
+            .expect("the fixture should parse");
+        let info = common::info(&events);
+        assert_eq!(info.ocr_recommended, recommended, "{info:?}");
+    }
+}
