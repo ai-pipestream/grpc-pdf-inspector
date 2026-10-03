@@ -780,6 +780,11 @@ pub struct ParseStatus {
     /// True when broken font encodings were detected in the text layer
     /// (garbled text, replacement characters). Extraction output should not
     /// be trusted; route to OCR. Meaningful in ANALYZE and FULL only.
+    ///
+    /// A scanned page's OCR layer is an OCR engine's reading, not a
+    /// font-encoded text layer, so its misreadings do not set this: that
+    /// page is flagged `needs_ocr` on its own, and the document's other pages
+    /// keep their verdicts.
     #[prost(bool, tag="4")]
     pub has_encoding_issues: bool,
     /// Wall-clock milliseconds for the whole call, classification included.

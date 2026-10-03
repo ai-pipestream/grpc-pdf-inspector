@@ -283,3 +283,35 @@ async fn info_says_when_detection_recommends_ocr() {
         assert_eq!(info.ocr_recommended, recommended, "{info:?}");
     }
 }
+
+#[tokio::test]
+async fn a_misread_ocr_layer_flags_its_page_and_not_the_whole_document() {
+    // A document-wide encoding verdict sends every page to recognition,
+    // so one scanned page's misread OCR layer must not raise it: the
+    // born-digital pages around it have a perfectly good text layer.
+    let harness = common::start().await;
+    let events = harness
+        .parse_ok(&common::text_with_misread_scan_pdf())
+        .await;
+
+    let pages = common::pages(&events);
+    assert!(!pages[0].needs_ocr && !pages[2].needs_ocr);
+    assert!(pages[1].needs_ocr);
+    assert_eq!(pages[1].ocr_reason(), pb::OcrReason::Scanned);
+
+    let status = common::status(&events);
+    let reasons: Vec<pb::OcrReason> = status
+        .extraction_ocr_reasons
+        .iter()
+        .find(|reasons| reasons.page == 2)
+        .map(|reasons| reasons.reasons().collect())
+        .unwrap_or_default();
+    assert!(
+        reasons.contains(&pb::OcrReason::SuspectedGarbled),
+        "the misreading is still reported for its page: {reasons:?}"
+    );
+    assert!(
+        !status.has_encoding_issues,
+        "an OCR layer's misreadings are not a broken font encoding"
+    );
+}

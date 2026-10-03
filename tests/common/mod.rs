@@ -1432,11 +1432,16 @@ fn scan_image(doc: &mut Document) -> lopdf::ObjectId {
 /// word the way OCRmyPDF and Tesseract lay a layer down, in text
 /// rendering mode 3 behind the page image.
 fn ocr_layer(page: u32) -> String {
+    ocr_layer_reading(page, |line| line.to_owned())
+}
+
+/// An OCR layer whose engine read each line of [`PROSE`] as `reading` of it.
+fn ocr_layer_reading(page: u32, reading: impl Fn(&str) -> String) -> String {
     let mut content = String::from("BT\n3 Tr\n/F1 10 Tf\n");
     for (row, line) in PROSE.iter().enumerate() {
         let y = 700 - 14 * i32::try_from(row).expect("eight lines fit in an i32");
         let mut x = 72;
-        for word in line.split_whitespace() {
+        for word in reading(line).split_whitespace() {
             let word = word.replace(['(', ')'], "");
             content.push_str(&format!("1 0 0 1 {x} {y} Tm ({word}) Tj\n"));
             x += 6 * i32::try_from(word.len() + 1).expect("a word fits in an i32");
@@ -1556,6 +1561,78 @@ pub fn mixed_text_and_scan_pdf(pages: u32, scanned: &[u32]) -> Vec<u8> {
             "Type" => "Pages",
             "Kids" => kids,
             "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a three-page born-digital document whose middle page is a scan
+/// with an OCR layer that misread every letter: [`ciphered`] prose, drawn
+/// invisibly behind the page image.
+///
+/// The layer is real text by every measure the OCR-layer fallback applies,
+/// so it becomes the page's text, and its letter statistics are those of a
+/// garbled text layer. It is still not a broken font encoding, and the page
+/// needs OCR whatever it says.
+#[must_use]
+pub fn text_with_misread_scan_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let mut kids = Vec::new();
+    for page in 1..=3u32 {
+        let (content, resources) = if page == 2 {
+            let image_id = scan_image(&mut doc);
+            let mut content = String::from("q 612 0 0 792 0 0 cm /Im1 Do Q\n");
+            content.push_str(&ocr_layer_reading(page, ciphered));
+            (
+                content,
+                dictionary! {
+                    "Font" => dictionary! { "F1" => font_id },
+                    "XObject" => dictionary! { "Im1" => image_id },
+                },
+            )
+        } else {
+            let mut content = format!("BT /F1 12 Tf 72 740 Td (Born digital page {page}) Tj\n");
+            for line in PROSE {
+                content.push_str(&format!("0 -16 Td ({line}) Tj\n"));
+            }
+            content.push_str("ET");
+            (
+                content,
+                dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            )
+        };
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources,
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => 3,
         }),
     );
     let catalog_id = doc.add_object(dictionary! {

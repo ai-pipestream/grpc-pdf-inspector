@@ -454,7 +454,14 @@ fn parse(
             // The text-quality verdicts, from the runs this call already
             // holds rather than from a second read of the file.
             let quality = pdf_inspector::analyze_text_quality(&items);
-            has_encoding_issues = quality.has_encoding_issues;
+            // An OCR layer's misreadings are not a broken font encoding, and
+            // its page needs OCR already; letting them set the document's
+            // flag would send every page of a mostly born-digital document
+            // to recognition for one scanned page.
+            has_encoding_issues = quality
+                .pages_needing_ocr
+                .iter()
+                .any(|page| !ocr_layer_pages.contains(page));
             let mut verdicts = page_verdicts(&detection_reasons, &quality);
             // A page whose text is its OCR layer is a scan. The layer is
             // what the markdown carries, so a caller without OCR still gets
@@ -648,7 +655,9 @@ fn parse(
                 // The rendering is the last thing the encoding backstop can
                 // look at, and it catches a page whose runs were each
                 // individually unremarkable.
-                has_encoding_issues |= pdf_inspector::detect_encoding_issues(&markdown);
+                if !ocr_layer_pages.contains(&page_no) {
+                    has_encoding_issues |= pdf_inspector::detect_encoding_issues(&markdown);
+                }
                 events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
                     page_no,
                     markdown,
