@@ -245,6 +245,27 @@ impl DocumentFold {
         std::mem::replace(&mut self.document, Self::new().document)
     }
 
+    /// Measure `pages` as they are displayed, turned a quarter: their boxes
+    /// were moved onto the landscape page (see [`crate::frame`]), so the
+    /// page they are measured against is the crop box with its sides
+    /// exchanged. Pages the metadata did not size are left unsized.
+    pub fn turn_pages(&mut self, pages: impl IntoIterator<Item = u32>) {
+        for page_no in pages {
+            let Some(item) = i32::try_from(page_no)
+                .ok()
+                .and_then(|page_no| self.document.pages.get_mut(&page_no))
+            else {
+                continue;
+            };
+            for size in [item.size.as_mut(), item.media_size.as_mut()]
+                .into_iter()
+                .flatten()
+            {
+                std::mem::swap(&mut size.width, &mut size.height);
+            }
+        }
+    }
+
     /// `info` names the document, counts its pages, and carries the
     /// detection confidence every item inherits.
     fn on_info(&mut self, info: &pb::PdfInfo) {

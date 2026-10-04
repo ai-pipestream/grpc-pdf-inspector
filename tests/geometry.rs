@@ -216,3 +216,67 @@ async fn the_trailer_carries_the_extraction_passs_own_page_verdicts() {
         assert_eq!(page.ocr_reason, pb::OcrReason::Unspecified as i32);
     }
 }
+
+#[tokio::test]
+async fn a_landscape_page_drawn_turned_is_measured_as_it_is_shown() {
+    // Distiller's landscape output: a portrait sheet with /Rotate 90 and
+    // every line drawn turned a quarter. The runs used to come back with
+    // negative y, below the bottom of a page still measured as portrait.
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            &common::landscape_pdf(),
+            pb::PdfOptions {
+                emit_spans: true,
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+
+    let page = common::pages(&events)[0];
+    assert!(
+        page.markdown.starts_with("The analytical engine"),
+        "the reading order is unchanged: {:?}",
+        page.markdown
+    );
+
+    let runs = &common::spans(&events)[0].spans;
+    assert!(!runs.is_empty());
+    for run in runs {
+        let bbox = run.bbox.as_ref().expect("a box");
+        assert!(
+            bbox.x >= 0.0
+                && bbox.x + bbox.width <= 792.5
+                && bbox.y >= 0.0
+                && bbox.y + bbox.height <= 612.5,
+            "{:?} sits on the 792 x 612 page as shown: {bbox:?}",
+            run.text
+        );
+    }
+    let first = runs
+        .iter()
+        .find(|run| run.text.starts_with("The analytical"))
+        .and_then(|run| run.bbox.as_ref())
+        .expect("the first line has a box");
+    assert!(
+        (first.x - 54.0).abs() < 1.0,
+        "54 points from the left: {first:?}"
+    );
+    assert!(
+        (first.y - (612.0 - 60.0)).abs() < 2.0,
+        "its baseline 60 points from the top: {first:?}"
+    );
+
+    let document = common::documents(&events)[0];
+    let size = document.pages[&1]
+        .size
+        .as_ref()
+        .expect("the page is measured");
+    assert_eq!(
+        (size.width, size.height),
+        (792.0, 612.0),
+        "the page as shown"
+    );
+}

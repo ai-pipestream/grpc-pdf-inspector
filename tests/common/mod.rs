@@ -1302,6 +1302,59 @@ pub fn invisible_text_pdf(watermark: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page landscape PDF the way Acrobat Distiller writes one: a
+/// portrait 612 x 792 sheet with `/Rotate 90`, and every line of [`PROSE`]
+/// drawn with a text matrix turned a quarter, so the page reads as
+/// horizontal text on a 792 x 612 page.
+///
+/// Line `n` starts at user space `(60 + 16n, 54)`, which the page shows 54
+/// points from its left edge and `60 + 16n` points from its top.
+#[must_use]
+pub fn landscape_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let mut content = String::new();
+    for (index, line) in PROSE.iter().enumerate() {
+        let x = 60 + 16 * i32::try_from(index).expect("eight lines fit in an i32");
+        content.push_str(&format!(
+            "BT /F1 1 Tf 0 11 -11 0 {x} 54 Tm ({line}) Tj ET\n"
+        ));
+    }
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Rotate" => 90,
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Prose long enough for letter statistics to mean anything, one line per
 /// entry.
 const PROSE: [&str; 8] = [
