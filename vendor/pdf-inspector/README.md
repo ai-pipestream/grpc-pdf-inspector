@@ -64,6 +64,12 @@ The private APIs, and what each unblocks:
 8. **Detection's OCR recommendation** (`src/lib.rs`). `PdfTypeResult`
    carried `ocr_recommended` and `PdfProcessResult` dropped it;
    `PdfProcessResult.ocr_recommended` carries it.
+9. **Which pages the walk turned** (`src/extractor/mod.rs`, `src/types.rs`).
+   A page whose text is drawn at 90 degrees has its runs, rectangles and
+   lines swapped into a landscape frame with no translation, so their y
+   values are negative. The walk knew which pages it swapped and kept it to
+   itself. `OcrLayerExtraction.rotated_pages` names them, so the service can
+   move what it emits onto the page a reader sees.
 
 ## Patches that change what the crate does
 

@@ -128,6 +128,12 @@ pub struct OcrLayerExtraction {
     /// invisible layer carried real text, and whose runs are therefore that
     /// layer: scanned pages made searchable, whose text no reader sees.
     pub ocr_layer_pages: std::collections::BTreeSet<u32>,
+    /// 1-indexed pages whose text the walk found drawn at 90 degrees and
+    /// whose runs, rectangles and lines it therefore swapped into a
+    /// landscape frame: x is the user-space y, and y is the negated
+    /// user-space x. That frame keeps the reading order and has no
+    /// translation, so its y values are negative.
+    pub rotated_pages: std::collections::BTreeSet<u32>,
 }
 
 /// A text item with position information
