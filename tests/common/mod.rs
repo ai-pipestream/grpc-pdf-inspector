@@ -1351,6 +1351,40 @@ pub fn ciphered(source: &str) -> String {
 /// between them is where those letters fall.
 #[must_use]
 pub fn garbled_pdf() -> Vec<u8> {
+    prose_then(ciphered)
+}
+
+/// Map every letter of `source` to the low-ASCII symbol its glyph code would
+/// decode to under a font with no ToUnicode CMap and a custom encoding.
+///
+/// Type 3 fonts number their glyphs from 1 and subset fonts from a small
+/// offset, so with no CMap the codes land on `!"#$%&` and the digits. What
+/// comes out has almost no letters, which is why the letter statistics
+/// behind [`ciphered`] cannot measure it.
+#[must_use]
+pub fn symbol_soup(source: &str) -> String {
+    const GLYPHS: &[u8] = b"!\"#$%&'*+,-./0123456789:;<=>?";
+    source
+        .chars()
+        .map(|character| {
+            if !character.is_ascii_alphabetic() {
+                return character;
+            }
+            let letter = usize::from(character.to_ascii_lowercase() as u8 - b'a');
+            GLYPHS[letter % GLYPHS.len()] as char
+        })
+        .collect()
+}
+
+/// Build a two-page PDF whose first page is ordinary prose and whose second
+/// page is the same prose put through [`symbol_soup`].
+#[must_use]
+pub fn symbol_soup_pdf() -> Vec<u8> {
+    prose_then(symbol_soup)
+}
+
+/// Two pages of [`PROSE`], the second put through `second`.
+fn prose_then(second: fn(&str) -> String) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -1365,7 +1399,7 @@ pub fn garbled_pdf() -> Vec<u8> {
         for (index, line) in PROSE.iter().enumerate() {
             let y = 700 - 16 * i32::try_from(index).expect("eight lines fit in an i32");
             let text = if garble {
-                ciphered(line)
+                second(line)
             } else {
                 (*line).to_owned()
             };

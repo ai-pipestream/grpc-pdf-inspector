@@ -299,6 +299,24 @@ font, CMap and Form XObject streams without limit.
   the first checkpoint is after it, so a document slow to load holds its
   slot past its time and its caller until loading ends.
 
+**Real-corpus run (2026-10-04): symbol soup.** A font with no ToUnicode
+CMap and a custom encoding passes its glyph codes through; when they are
+small integers (Type 3 fonts number glyphs from 1) a page of prose
+extracts as `’!!"!9"5&%9`. That page has too few letters for the
+letter-frequency test, so 31 of 100 Sixth Circuit opinions were served as
+text-based with their body text in symbols.
+
+- *Patch* (`symbol-garble` branch): `SymbolSoupStats` in the crate's
+  `text_quality.rs`. A page with at least 200 counted characters whose
+  share of rare ASCII symbols reaches 0.15 is SUSPECTED_GARBLED; leader runs
+  and numeric `%`, `$` and `#` are not counted.
+- *Measured*: court pages routed to OCR went from 309 to 999 of 1352; no
+  verdict changed on 3,004 pages of DP-Bench, DocLayNet and NapierOne PDFs,
+  whose highest share is 0.111 (one NapierOne page at 0.24 is a broken
+  layer the old tests already caught).
+- *Tests*: the crate's `symbol_soup_tests` module and
+  `tests/quality.rs` (`symbol_soup_pdf`).
+
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page
 statistics, which are collapsed into one of four reason strings and several
