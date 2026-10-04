@@ -67,10 +67,14 @@ The private APIs, and what each unblocks:
 
 ## Patches that change what the crate does
 
-Two patches go further than visibility, because the service could not be
-made safe or correct from outside the crate. Both are recorded with their
+Three patches go further than visibility, because the service could not be
+made safe or correct from outside the crate. Each is written up with its
 reasons in `docs/capture-deferrals.md`.
 
+- **Symbol soup is garbled text** (`src/text_quality.rs`). A page whose
+  characters are mostly rare ASCII symbols (glyph codes passed through by a
+  font with no ToUnicode CMap) is SUSPECTED_GARBLED, which the letter
+  statistics could not say because such a page has almost no letters.
 - **Detection follows the text rendering mode** (`src/detector.rs`). The
   byte scanner counted every show operator as text, including the hundreds
   of invisible (Tr 3) ones behind a searchable scan's page image, so such a
@@ -94,7 +98,7 @@ The copy landed in its own commit, with the tree building and testing
 identically to the registry build, before any API was touched. Each patch is a
 separate commit after it, listed by SHA in `docs/capture-deferrals.md`. The
 visibility patches are additive: nothing that was public changed shape. The
-two patches under "Patches that change what the crate does" are the
+patches under "Patches that change what the crate does" are the
 exceptions, with their reasons there, and they bring their own tests beside
 the ones the crate shipped with. One more exception is listed there under
 "Vendored dependency moves": the lopdf dependency moved ahead of upstream at
