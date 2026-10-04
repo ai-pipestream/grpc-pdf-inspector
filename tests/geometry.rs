@@ -269,6 +269,22 @@ async fn a_landscape_page_drawn_turned_is_measured_as_it_is_shown() {
         "its baseline 60 points from the top: {first:?}"
     );
 
+    // The form the page invokes at user space (100, 200) rides the spans
+    // after the runs. It used to be turned twice, once by the library and
+    // once more on the way out, and landed at x = -150, off the page.
+    let form = runs
+        .iter()
+        .find(|run| run.kind == pb::SpanKind::Form as i32)
+        .and_then(|run| run.bbox.as_ref())
+        .expect("the form placement has a box");
+    assert!(
+        (form.x - 200.0).abs() < 0.5
+            && (form.y - 462.0).abs() < 0.5
+            && (form.width - 30.0).abs() < 0.5
+            && (form.height - 50.0).abs() < 0.5,
+        "the form sits 200 points from the left, 30 wide and 50 tall, bottom edge at 462: {form:?}"
+    );
+
     let document = common::documents(&events)[0];
     let size = document.pages[&1]
         .size

@@ -1309,6 +1309,11 @@ pub fn invisible_text_pdf(watermark: &str) -> Vec<u8> {
 ///
 /// Line `n` starts at user space `(60 + 16n, 54)`, which the page shows 54
 /// points from its left edge and `60 + 16n` points from its top.
+///
+/// The page also invokes one 50 x 30 Form XObject at user space (100, 200),
+/// a vector figure the way Distiller places one: the page shows it 200
+/// points from its left edge, 30 wide and 50 tall, with its bottom edge
+/// 612 - 150 = 462 points from the bottom.
 #[must_use]
 pub fn landscape_pdf() -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
@@ -1325,6 +1330,15 @@ pub fn landscape_pdf() -> Vec<u8> {
             "BT /F1 1 Tf 0 11 -11 0 {x} 54 Tm ({line}) Tj ET\n"
         ));
     }
+    let figure_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 50.into(), 30.into()],
+        },
+        b"0.5 w 2 2 46 26 re S".to_vec(),
+    ));
+    content.push_str("q 1 0 0 1 100 200 cm /Fx1 Do Q\n");
     let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
     let page_id = doc.add_object(dictionary! {
         "Type" => "Page",
@@ -1333,6 +1347,7 @@ pub fn landscape_pdf() -> Vec<u8> {
         "Rotate" => 90,
         "Resources" => dictionary! {
             "Font" => dictionary! { "F1" => font_id },
+            "XObject" => dictionary! { "Fx1" => figure_id },
         },
         "Contents" => content_id,
     });
