@@ -23,9 +23,9 @@
 //! its column detector, the table detectors and the chrome verdicts all
 //! keep the frame they were built against, so the page reads exactly as it
 //! did; the boxes on the runs, the grids and the runs reported beside the
-//! markdown are moved as they are emitted. Form XObject placements are not
-//! part of the library's swap and still sit in user space, so they take the
-//! whole mapping.
+//! markdown are moved as they are emitted. Form XObject placements come
+//! back swapped into the same frame as the runs (the library turns them
+//! with its rectangles), so they too need only the translation.
 //!
 //! Only `/Rotate 90` is moved. A page drawn at 90 degrees under any other
 //! rotation is not a pure translation of the library's frame (under
@@ -81,16 +81,19 @@ pub fn movable_pages(
         .collect()
 }
 
-/// Turn the form placements on `pages`, which are in user space, onto the
+/// Move the form placements on `pages` from the library's frame onto the
 /// displayed page.
+///
+/// The library already swaps a turned page's forms with its rectangles
+/// (`x = Y`, `y = -(X + width)`, width and height exchanged), so a form
+/// arrives here in the same frame as the runs and takes the same
+/// translation. Applying the whole user-space turn here a second time put
+/// every form on a landscape page off the sheet.
 pub fn place_forms(pages: &BTreeMap<u32, CropBox>, forms: &mut [PdfForm]) {
     for form in forms {
         if let Some(crop) = pages.get(&form.page) {
-            let (x, y, width, height) = (form.x, form.y, form.width, form.height);
-            form.x = y - crop.y0;
-            form.y = crop.x1 - (x + width);
-            form.width = height;
-            form.height = width;
+            form.x -= crop.y0;
+            form.y += crop.x1;
         }
     }
 }
@@ -206,14 +209,17 @@ mod tests {
     }
 
     #[test]
-    fn a_form_in_user_space_takes_the_whole_turn() {
-        // A form drawn at the user-space origin corner of the sheet sits at
-        // the displayed page's top left.
+    fn a_form_in_the_library_frame_lands_where_the_page_shows_it() {
+        // A 50 x 30 form drawn at user space (100, 200) on a letter sheet
+        // shown under /Rotate 90. The library hands it over already turned
+        // into its frame, as (200, -150) with the sides exchanged, exactly
+        // as it hands over the runs; the page shows it 200 points from the
+        // left with its bottom edge 612 - 150 = 462 points up.
         let mut forms = vec![PdfForm {
             name: "Fm0".to_owned(),
-            x: 0.0,
-            y: 0.0,
-            width: 100.0,
+            x: 200.0,
+            y: -150.0,
+            width: 30.0,
             height: 50.0,
             page: 1,
         }];
@@ -222,7 +228,7 @@ mod tests {
         let form = &forms[0];
         assert_eq!(
             (form.x, form.y, form.width, form.height),
-            (0.0, 512.0, 50.0, 100.0)
+            (200.0, 462.0, 30.0, 50.0)
         );
     }
 
