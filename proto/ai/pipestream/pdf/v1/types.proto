@@ -189,6 +189,17 @@ message PdfOptions {
   // document without a warning, so "from page 5 to the end" is
   // `first_page: 5` and nothing else.
   optional uint32 last_page = 12;
+
+  // Also send each page's share of the fold as one `page_document` event,
+  // immediately after that page's `page` event. Default false.
+  //
+  // This is the fold that `emit_document` sends whole at the end, cut at
+  // page boundaries as it is built, so a consumer that renders pages can
+  // show page one while the rest are still being read instead of waiting
+  // for the last page. Setting it builds the fold whether or not
+  // `emit_document` is set; the `document` event itself still goes out
+  // only when `emit_document` asks for it.
+  bool emit_page_documents = 13;
 }
 
 // TableKind separates a real data table from a table of contents.
@@ -593,6 +604,18 @@ message PageMarkdown {
   // of one or two characters is not looked for at all: it would match
   // somewhere by accident and the report would say it survived.
   repeated TextSpan dropped = 9;
+
+  // True when the markdown backstop for broken font encodings convicted
+  // this page's rendering: the per-page share of
+  // `ParseStatus.has_encoding_issues` that is only known once the page has
+  // been rendered. The pass over the runs that sets the rest of that flag
+  // also convicts its pages, and those already carry `needs_ocr`. An OCR
+  // layer's misreadings never set it, for the same reason they never set
+  // the document's flag.
+  //
+  // With this and `needs_ocr`, a consumer can judge each page's text layer
+  // as the page arrives instead of waiting for the trailer.
+  bool encoding_issues = 10;
 }
 
 // StructureRole is one standard structure type from a tagged PDF.

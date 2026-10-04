@@ -158,6 +158,24 @@ pub struct DocumentFold {
     open_list: Option<(bool, String)>,
 }
 
+/// The arena lengths at one point of a fold, taken before a page is folded
+/// so that page's share can be cut out after it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageMark {
+    /// `Document.texts` length.
+    texts: usize,
+    /// `Document.tables` length.
+    tables: usize,
+    /// `Document.pictures` length.
+    pictures: usize,
+    /// `Document.groups` length.
+    groups: usize,
+    /// `#/body` children.
+    body: usize,
+    /// `#/furniture` children.
+    furniture: usize,
+}
+
 impl Default for DocumentFold {
     fn default() -> Self {
         Self::new()
@@ -210,8 +228,8 @@ impl DocumentFold {
     /// refused: the fold is a projection, and an event it has no slot for
     /// is a gap in the projection, not a parse failure. `status` is counts
     /// and warnings, which describe the stream rather than the document; a
-    /// `document` event is a fold's own output, and folding one back in
-    /// would double the fragment.
+    /// `document` or `page_document` event is a fold's own output, and
+    /// folding one back in would double the fragment.
     pub fn consume(&mut self, event: &pb::parse_pdf_response::Event) {
         use pb::parse_pdf_response::Event;
         match event {
@@ -231,7 +249,7 @@ impl DocumentFold {
                 self.runs = Some(PageRuns::new(spans, internal, structure));
             }
             Event::Page(page) => self.on_page(page),
-            Event::Status(_) | Event::Document(_) => {}
+            Event::Status(_) | Event::Document(_) | Event::PageDocument(_) => {}
         }
     }
 
@@ -243,6 +261,87 @@ impl DocumentFold {
         self.open_list = None;
         self.internal_links.clear();
         std::mem::replace(&mut self.document, Self::new().document)
+    }
+
+    /// Where the fold stands now, so the items the next page adds can be
+    /// cut out afterwards by [`page_document`](Self::page_document).
+    #[must_use]
+    pub fn mark(&self) -> PageMark {
+        PageMark {
+            texts: self.document.texts.len(),
+            tables: self.document.tables.len(),
+            pictures: self.document.pictures.len(),
+            groups: self.document.groups.len(),
+            body: self
+                .document
+                .body
+                .as_ref()
+                .map_or(0, |body| body.children.len()),
+            furniture: self
+                .document
+                .furniture
+                .as_ref()
+                .map_or(0, |furniture| furniture.children.len()),
+        }
+    }
+
+    /// The share of the fold made since `mark`: the items folding page
+    /// `page_no` added, with the refs they carry in the whole Document, the
+    /// two root groups' children added since, and that page's `PageItem`.
+    ///
+    /// A page leaves nothing open behind it (it closes its list and drops
+    /// its grids), and nothing a later page folds reaches back into an
+    /// earlier page's items, so the slice is final the moment the page is
+    /// folded.
+    #[must_use]
+    pub fn page_document(&self, mark: &PageMark, page_no: u32) -> doc::Document {
+        let since = |children: Option<&doc::GroupItem>, from: usize| {
+            children.map_or_else(Vec::new, |group| {
+                group.children.get(from..).unwrap_or_default().to_vec()
+            })
+        };
+        let mut body = group(BODY_REF, doc::ContentLayer::Body);
+        body.children = since(self.document.body.as_ref(), mark.body);
+        let mut furniture = group(FURNITURE_REF, doc::ContentLayer::Furniture);
+        furniture.children = since(self.document.furniture.as_ref(), mark.furniture);
+        let page_no = i32::try_from(page_no).unwrap_or(i32::MAX);
+        doc::Document {
+            schema_name: Some(SCHEMA_NAME.to_owned()),
+            texts: self
+                .document
+                .texts
+                .get(mark.texts..)
+                .unwrap_or_default()
+                .to_vec(),
+            tables: self
+                .document
+                .tables
+                .get(mark.tables..)
+                .unwrap_or_default()
+                .to_vec(),
+            pictures: self
+                .document
+                .pictures
+                .get(mark.pictures..)
+                .unwrap_or_default()
+                .to_vec(),
+            groups: self
+                .document
+                .groups
+                .get(mark.groups..)
+                .unwrap_or_default()
+                .to_vec(),
+            body: Some(body),
+            furniture: Some(furniture),
+            pages: self
+                .document
+                .pages
+                .get(&page_no)
+                .map(|item| (page_no, item.clone()))
+                .into_iter()
+                .collect(),
+            ..doc::Document::default()
+        }
     }
 
     /// Measure `pages` as they are displayed, turned a quarter: their boxes

@@ -73,6 +73,9 @@ spans     only with options.emit_spans: one per page, the positioned text
           runs the markdown was rendered from
 page      FULL mode, text-bearing documents only: one per page,
           1-indexed, in requested page order
+page_document
+          only with options.emit_page_documents: one right after each
+          page, that page's share of the Document fold
 document  only when options.emit_document is set: the whole parse folded
           into one ai.pipestream.document.v1.Document, after the last
           page, before status
@@ -147,7 +150,11 @@ vendored byte-identical from gRParse) and sends it as a `document` event
 after the last `page` and before `status`. The event stream stays the
 primary, lossless wire; the Document is a coarse, self-contained
 projection of it that a coordinator can merge additively with another
-collector's parse of the same document:
+collector's parse of the same document. With `options.emit_page_documents`
+set, the same fold also goes out page by page: each `page` is followed by a
+`page_document` holding exactly the items folding that page added, under
+the refs they carry in the whole Document, so a consumer can show page one
+while the rest are still being read:
 
 - Headings come from the document's own tagging when it is tagged, and
   from the markdown's ATX levels when it is not. Lists become `ListItem`s

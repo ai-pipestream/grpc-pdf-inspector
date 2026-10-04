@@ -165,17 +165,42 @@ impl Sink {
 struct Events<'a> {
     /// The outbound half of the response stream.
     sink: &'a Sink,
-    /// The fold, when `options.emit_document` was set.
+    /// The fold, when `options.emit_document` or
+    /// `options.emit_page_documents` was set.
     fold: Option<DocumentFold>,
+    /// Whether each page's share of the fold goes out after its `page`.
+    page_documents: bool,
 }
 
 impl<'a> Events<'a> {
     /// A router for one call.
-    fn new(sink: &'a Sink, emit_document: bool) -> Self {
+    fn new(sink: &'a Sink, emit_document: bool, emit_page_documents: bool) -> Self {
         Self {
             sink,
-            fold: emit_document.then(DocumentFold::new),
+            fold: (emit_document || emit_page_documents).then(DocumentFold::new),
+            page_documents: emit_page_documents,
         }
+    }
+
+    /// Put one page's `page` event on the wire, through the fold, and then
+    /// the share of the fold that page made, when the caller asked for it.
+    fn send_page(&mut self, page: pb::PageMarkdown) -> Result<(), Abort> {
+        let page_no = page.page_no;
+        let mark = self.fold.as_ref().map(DocumentFold::mark);
+        self.send(pb::parse_pdf_response::Event::Page(page))?;
+        if !self.page_documents {
+            return Ok(());
+        }
+        let (Some(fold), Some(mark)) = (self.fold.as_ref(), mark) else {
+            return Ok(());
+        };
+        let document = fold.page_document(&mark, page_no);
+        self.sink.send(pb::parse_pdf_response::Event::PageDocument(
+            pb::PageDocument {
+                page_no,
+                document: Some(document),
+            },
+        ))
     }
 
     /// Put an event on the wire, and through the fold on its way.
@@ -283,9 +308,11 @@ fn parse(
 
     // The optional second consumer of this stream: when the caller asked for
     // a Document, every event is folded on its way out and the folded
-    // Document goes out after the last `page`, before the `status` trailer.
-    // With the flag off no fold is built and the path is what it was.
-    let mut events = Events::new(sink, options.emit_document);
+    // Document goes out after the last `page`, before the `status` trailer;
+    // when it asked for page documents, each page's share of the fold
+    // follows that page's `page` event. With both flags off no fold is
+    // built and the path is what it was.
+    let mut events = Events::new(sink, options.emit_document, options.emit_page_documents);
 
     events.send(pb::parse_pdf_response::Event::Info(pb::PdfInfo {
         pdf_type: pdf_type(detected.pdf_type).into(),
@@ -403,6 +430,9 @@ fn parse(
                     // No per-page runs came back either, so there is
                     // nothing to say a rendering left out.
                     dropped: Vec::new(),
+                    // The whole-document verdict rides the trailer's
+                    // `has_encoding_issues`; this event is not a page.
+                    encoding_issues: false,
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -683,9 +713,9 @@ fn parse(
                 // The rendering is the last thing the encoding backstop can
                 // look at, and it catches a page whose runs were each
                 // individually unremarkable.
-                if !ocr_layer_pages.contains(&page_no) {
-                    has_encoding_issues |= pdf_inspector::detect_encoding_issues(&markdown);
-                }
+                let encoding_issues = !ocr_layer_pages.contains(&page_no)
+                    && pdf_inspector::detect_encoding_issues(&markdown);
+                has_encoding_issues |= encoding_issues;
                 let mut page_invisible: Vec<pb::TextSpan> = invisible
                     .remove(&page_no)
                     .unwrap_or_default()
@@ -696,7 +726,7 @@ fn parse(
                     crate::frame::place_spans(*crop, &mut dropped);
                     crate::frame::place_spans(*crop, &mut page_invisible);
                 }
-                events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+                events.send_page(pb::PageMarkdown {
                     page_no,
                     markdown,
                     needs_ocr,
@@ -706,7 +736,8 @@ fn parse(
                     invisible: page_invisible,
                     garble_score: garble_score(&quality, page_no),
                     dropped,
-                }))?;
+                    encoding_issues,
+                })?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
                 // hides from the streaming tests.
@@ -739,7 +770,9 @@ fn parse(
     // here — after the last `page`, before the `status` trailer that closes
     // the stream.
     check(guard)?;
-    if let Some(fold) = events.fold.as_mut() {
+    if options.emit_document
+        && let Some(fold) = events.fold.as_mut()
+    {
         sink.send(pb::parse_pdf_response::Event::Document(fold.take()))?;
     }
     sink.send(pb::parse_pdf_response::Event::Status(pb::ParseStatus {
