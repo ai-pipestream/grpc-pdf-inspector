@@ -149,6 +149,17 @@ pub struct PdfOptions {
     /// `first_page: 5` and nothing else.
     #[prost(uint32, optional, tag="12")]
     pub last_page: ::core::option::Option<u32>,
+    /// Also send each page's share of the fold as one `page_document` event,
+    /// immediately after that page's `page` event. Default false.
+    ///
+    /// This is the fold that `emit_document` sends whole at the end, cut at
+    /// page boundaries as it is built, so a consumer that renders pages can
+    /// show page one while the rest are still being read instead of waiting
+    /// for the last page. Setting it builds the fold whether or not
+    /// `emit_document` is set; the `document` event itself still goes out
+    /// only when `emit_document` asks for it.
+    #[prost(bool, tag="13")]
+    pub emit_page_documents: bool,
 }
 /// TableCells is one row of a detected table.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -468,6 +479,18 @@ pub struct PageMarkdown {
     /// somewhere by accident and the report would say it survived.
     #[prost(message, repeated, tag="9")]
     pub dropped: ::prost::alloc::vec::Vec<TextSpan>,
+    /// True when the markdown backstop for broken font encodings convicted
+    /// this page's rendering: the per-page share of
+    /// `ParseStatus.has_encoding_issues` that is only known once the page has
+    /// been rendered. The pass over the runs that sets the rest of that flag
+    /// also convicts its pages, and those already carry `needs_ocr`. An OCR
+    /// layer's misreadings never set it, for the same reason they never set
+    /// the document's flag.
+    ///
+    /// With this and `needs_ocr`, a consumer can judge each page's text layer
+    /// as the page arrives instead of waiting for the trailer.
+    #[prost(bool, tag="10")]
+    pub encoding_issues: bool,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.
@@ -1434,7 +1457,7 @@ pub struct ParsePdfResponse {
     /// Unknown variants must be ignored rather than treated as failures: this
     /// oneof is the extension point, and a later server may add events an
     /// older client has no name for.
-    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5, 6, 7, 8")]
+    #[prost(oneof="parse_pdf_response::Event", tags="1, 2, 3, 4, 5, 6, 7, 8, 9")]
     pub event: ::core::option::Option<parse_pdf_response::Event>,
 }
 /// Nested message and enum types in `ParsePdfResponse`.
@@ -1488,8 +1511,37 @@ pub mod parse_pdf_response {
         /// produces no event.
         #[prost(message, tag="8")]
         Tables(super::PageTables),
+        /// One page's share of the Document fold, immediately after that page's
+        /// `page` event. FULL mode only, and only when
+        /// `PdfOptions.emit_page_documents` was set.
+        #[prost(message, tag="9")]
+        PageDocument(super::PageDocument),
     }
 }
+/// PageDocument is one page's share of the Document fold, sent right after
+/// that page's `page` event when `PdfOptions.emit_page_documents` is set.
+///
+/// Its `document` holds exactly the items the fold made while folding this
+/// page: the texts, tables, pictures and list groups, with the refs they
+/// carry in the whole Document (`#/texts/12` here is `#/texts/12` there),
+/// so the slices of one stream concatenate into the `document` event's
+/// arenas. `body` and `furniture` list this page's top-level children in
+/// reading order, and `pages` carries this page's `PageItem` as the fold
+/// knew it then. Document-wide fields (`name`, `origin`, the metadata the
+/// file carries about itself) are left to the `document` event.
+///
+/// The password fallback's whole-document `page` event (`page_no` 0) gets
+/// none: it is not a page.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct PageDocument {
+    /// The 1-indexed page this slice was folded from.
+    #[prost(uint32, tag="1")]
+    pub page_no: u32,
+    /// The page's items, as described above.
+    #[prost(message, optional, tag="2")]
+    pub document: ::core::option::Option<super::super::document::v1::Document>,
+}
+/// GetServiceInfoRequest asks for the server's build and limits. It carries
 /// GetServiceInfoRequest asks for the server's build and limits. It carries
 /// no arguments; the message exists so the RPC can gain them additively.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

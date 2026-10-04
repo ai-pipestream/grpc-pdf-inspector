@@ -2094,6 +2094,7 @@ pub fn shape(events: &[pb::parse_pdf_response::Event]) -> Vec<&'static str> {
             pb::parse_pdf_response::Event::Metadata(_) => "metadata",
             pb::parse_pdf_response::Event::Structure(_) => "structure",
             pb::parse_pdf_response::Event::Tables(_) => "tables",
+            pb::parse_pdf_response::Event::PageDocument(_) => "page_document",
         })
         .collect()
 }

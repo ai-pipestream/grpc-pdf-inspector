@@ -49,8 +49,8 @@ service PdfParseService {
   // A successful stream is exactly: one `info`, an optional `metadata`,
   // then — per page, in requested page order, in FULL mode and for
   // text-bearing documents only — an optional `structure` event, an
-  // optional `tables` event, an optional `spans` event, and that page's
-  // `page` event; then, only when
+  // optional `tables` event, an optional `spans` event, that page's
+  // `page` event, and an optional `page_document` event; then, only when
   // `options.emit_document` was set, one `document`; then one `status`.
   // A failed stream ends with a gRPC status and no `status` event:
   //
@@ -146,7 +146,34 @@ message ParsePdfResponse {
     // only when `PdfOptions.emit_tables` was set. A page with no tables
     // produces no event.
     PageTables tables = 8;
+
+    // One page's share of the Document fold, immediately after that page's
+    // `page` event. FULL mode only, and only when
+    // `PdfOptions.emit_page_documents` was set.
+    PageDocument page_document = 9;
   }
+}
+
+// PageDocument is one page's share of the Document fold, sent right after
+// that page's `page` event when `PdfOptions.emit_page_documents` is set.
+//
+// Its `document` holds exactly the items the fold made while folding this
+// page: the texts, tables, pictures and list groups, with the refs they
+// carry in the whole Document (`#/texts/12` here is `#/texts/12` there),
+// so the slices of one stream concatenate into the `document` event's
+// arenas. `body` and `furniture` list this page's top-level children in
+// reading order, and `pages` carries this page's `PageItem` as the fold
+// knew it then. Document-wide fields (`name`, `origin`, the metadata the
+// file carries about itself) are left to the `document` event.
+//
+// The password fallback's whole-document `page` event (`page_no` 0) gets
+// none: it is not a page.
+message PageDocument {
+  // The 1-indexed page this slice was folded from.
+  uint32 page_no = 1;
+
+  // The page's items, as described above.
+  ai.pipestream.document.v1.Document document = 2;
 }
 
 // GetServiceInfoRequest asks for the server's build and limits. It carries
