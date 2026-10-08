@@ -134,6 +134,26 @@ pub struct OcrLayerExtraction {
     /// user-space x. That frame keeps the reading order and has no
     /// translation, so its y values are negative.
     pub rotated_pages: std::collections::BTreeSet<u32>,
+    /// Every walked page's boxes and rotation, read from the page
+    /// dictionary and its ancestors by the same reader that walked the
+    /// content, so a caller can place the runs on the page a reader sees
+    /// without opening the file again.
+    pub page_boxes: std::collections::BTreeMap<u32, PageBox>,
+}
+
+/// A page's media box, crop box and rotation, as `[x0, y0, x1, y1]` in
+/// user space with the corners normalized, and `/Rotate` folded into
+/// `[0, 360)`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PageBox {
+    /// `/MediaBox`, inherited down the page tree; `None` when the page
+    /// declares none anywhere.
+    pub media_box: Option<[f32; 4]>,
+    /// `/CropBox`, inherited the same way; `None` when the page declares
+    /// none, which means the media box is the visible extent.
+    pub crop_box: Option<[f32; 4]>,
+    /// Clockwise degrees the page is turned for display.
+    pub rotation: u32,
 }
 
 /// A text item with position information

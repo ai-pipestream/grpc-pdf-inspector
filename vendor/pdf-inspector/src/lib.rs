@@ -69,7 +69,8 @@ pub use text_quality::{
     MIN_LETTERS_FOR_GARBLE_SCORE,
 };
 pub use types::{
-    LayoutComplexity, OcrLayerExtraction, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem,
+    LayoutComplexity, OcrLayerExtraction, PageBox, PageExtraction, PdfForm, PdfLine, PdfRect,
+    TextItem,
 };
 
 use lopdf::Document;

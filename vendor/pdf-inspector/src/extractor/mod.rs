@@ -14,7 +14,7 @@ mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
-use crate::types::{OcrLayerExtraction, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
+use crate::types::{OcrLayerExtraction, PageBox, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
@@ -244,13 +244,65 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
             None,
             true,
         )?;
+    let page_boxes = doc
+        .get_pages()
+        .iter()
+        .filter(|(page_num, _)| page_filter.is_none_or(|filter| filter.contains(page_num)))
+        .map(|(page_num, &page_id)| (*page_num, page_box(&doc, page_id)))
+        .collect();
     Ok(OcrLayerExtraction {
         extraction,
         forms,
         skipped_invisible,
         ocr_layer_pages,
         rotated_pages,
+        page_boxes,
     })
+}
+
+/// A page's boxes and rotation, each inherited down the page tree.
+fn page_box(doc: &Document, page_id: ObjectId) -> PageBox {
+    let normalized = |v: Vec<f32>| [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])];
+    let rotation = inherited_page_attribute(doc, page_id, b"Rotate").and_then(|obj| match obj {
+        Object::Integer(i) => Some(*i),
+        Object::Real(r) => Some(*r as i64),
+        _ => None,
+    });
+    PageBox {
+        media_box: inherited_rect(doc, page_id, b"MediaBox").map(normalized),
+        crop_box: inherited_rect(doc, page_id, b"CropBox").map(normalized),
+        rotation: rotation.map_or(0, |degrees| degrees.rem_euclid(360) as u32),
+    }
+}
+
+/// A page attribute, looked up on the page and then up the page tree.
+fn inherited_page_attribute<'a>(doc: &'a Document, page_id: ObjectId, key: &[u8]) -> Option<&'a Object> {
+    let mut id = page_id;
+    for _ in 0..32 {
+        let dict = doc.get_dictionary(id).ok()?;
+        if let Ok(obj) = dict.get(key) {
+            return match obj {
+                Object::Reference(r) => doc.get_object(*r).ok(),
+                other => Some(other),
+            };
+        }
+        match dict.get(b"Parent") {
+            Ok(Object::Reference(p)) => id = *p,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// An inheritable rectangle attribute with at least four numbers.
+fn inherited_rect(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Vec<f32>> {
+    match inherited_page_attribute(doc, page_id, key)? {
+        Object::Array(a) => {
+            let vals: Vec<f32> = a.iter().filter_map(get_number).collect();
+            (vals.len() >= 4).then_some(vals)
+        }
+        _ => None,
+    }
 }
 
 /// [`extract_text_with_positions_mem_pages`] with the invisible layer under
@@ -3825,6 +3877,23 @@ mod tests {
             extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
         let texts: Vec<&str> = extraction.extraction.0.iter().map(|item| item.text.as_str()).collect();
         assert_eq!(texts, ["visible", "straddle"], "{texts:?}");
+    }
+
+    #[test]
+    fn the_walk_reports_each_pages_boxes_and_rotation() {
+        let bytes = page_bytes("BT /F1 10 Tf 1 0 0 1 100 300 Tm (visible) Tj ET", Some([36, 0, 432, 396]), None);
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        let page = extraction.page_boxes[&1];
+        assert_eq!(page.crop_box, Some([36.0, 0.0, 432.0, 396.0]));
+        assert_eq!(page.media_box, Some([0.0, 0.0, 612.0, 792.0]));
+        assert_eq!(page.rotation, 0);
+        let bytes = page_bytes("BT /F1 10 Tf 1 0 0 1 100 300 Tm (visible) Tj ET", None, Some(-90));
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        let page = extraction.page_boxes[&1];
+        assert_eq!(page.crop_box, None, "a page declaring no crop box says so");
+        assert_eq!(page.rotation, 270, "a negative /Rotate is folded into [0, 360)");
     }
 
     #[test]
