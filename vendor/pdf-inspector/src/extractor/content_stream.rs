@@ -706,6 +706,14 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        // A displacement before the segment's
+                                        // first glyph moves the pen, and so the
+                                        // segment's origin, before anything is
+                                        // shown: `[12719(31)]TJ` draws "31" a
+                                        // dozen ems to the left of the pen.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                        }
                                         if !is_invisible
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
@@ -741,6 +749,14 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        // A displacement before the segment's
+                                        // first glyph moves the pen, and so the
+                                        // segment's origin, before anything is
+                                        // shown: `[12719(31)]TJ` draws "31" a
+                                        // dozen ems to the left of the pen.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                        }
                                         if !is_invisible
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
@@ -2282,6 +2298,28 @@ end"#;
             .iter()
             .find(|item| item.text == text)
             .unwrap_or_else(|| panic!("no run {text:?} in {:?}", items.iter().map(|i| &i.text).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn a_leading_tj_displacement_moves_the_run_not_its_width() {
+        // `[12719(31)]TJ` moves the pen 12.719 em left before "31" is
+        // shown, and `[-13365(7)]TJ` moves it 13.365 em right. The run
+        // starts where the pen is when its first glyph is shown, and its
+        // width is its glyphs' (600/1000 em each in this fixture).
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 1 0 0 1 500 700 Tm [12719(31)]TJ ET\n\
+              BT /F1 10 Tf 1 0 0 1 200 650 Tm [-13365(7)]TJ ET",
+        );
+        let left = find_item(&items, "31");
+        assert!((left.x - (500.0 - 127.19)).abs() < 0.05, "{left:?}");
+        assert!((left.width - 12.0).abs() < 0.05, "{left:?}");
+        let right = find_item(&items, "7");
+        assert!((right.x - (200.0 + 133.65)).abs() < 0.05, "{right:?}");
+        assert!((right.width - 6.0).abs() < 0.05, "{right:?}");
+        for item in [left, right] {
+            let hull = item.hull.expect("a shown run is measured");
+            assert!((hull[0] - item.x).abs() < 0.05 && (hull[2] - (item.x + item.width)).abs() < 0.05, "{hull:?}");
+        }
     }
 
     #[test]

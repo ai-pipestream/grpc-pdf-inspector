@@ -796,6 +796,14 @@ fn extract_form_xobject_text_inner(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        // A displacement before the segment's
+                                        // first glyph moves the pen, and so the
+                                        // segment's origin, before anything is
+                                        // shown: `[12719(31)]TJ` draws "31" a
+                                        // dozen ems to the left of the pen.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                        }
                                         if !fill_is_white
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
@@ -831,6 +839,14 @@ fn extract_form_xobject_text_inner(
                                         sub_start_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        // A displacement before the segment's
+                                        // first glyph moves the pen, and so the
+                                        // segment's origin, before anything is
+                                        // shown: `[12719(31)]TJ` draws "31" a
+                                        // dozen ems to the left of the pen.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                        }
                                         if !fill_is_white
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
