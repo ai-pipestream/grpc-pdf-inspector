@@ -375,8 +375,16 @@ against an independent interpretation of its content stream:
   turned page places them. Grid edges are rebuilt from the bands between
   them, so `column_boundaries` stays ascending starts and
   `row_boundaries` descending bottoms under every turn. A real `/Rotate`
-  (`90.0`) reads the same in the metadata reader and the walk. The
-  ActualText first-glyph position is taken after a leading TJ offset.
+  (`90.0`, `269.5`) rounds the same in the metadata reader and the walk.
+  The ActualText first-glyph position is taken after a leading TJ offset.
+  Second round: an embedded CMap stream's `/WMode 1` (dictionary or body)
+  marks a vertical font; a form inherits its caller's Tz, Tc and Tw;
+  `TableCells.boxes` carries each cell's box, cut in the frame the grid
+  was read in and placed with the page, so a mirrored or quarter-turned
+  page keeps every cell with its text (the fold prefers it to cutting
+  cells from the placed lists); a ruled table keeps its outer fence when
+  mirrored; a page the library read sideways under `/Rotate 270` has its
+  bands cut the other way, since its frame is a half turn from the page.
 - *Not done*: a run's exact quadrilateral is not reported on
   `ProvenanceItem.polygon`; the hull is the axis-aligned box only, and it
   runs from the baseline (the `Rect` contract's `y`), not the descender.

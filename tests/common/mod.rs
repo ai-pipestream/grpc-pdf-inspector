@@ -562,6 +562,43 @@ pub fn table_pdf() -> Vec<u8> {
     bytes
 }
 
+/// The [`table_pdf`] grid on a page with `rotate`, drawn upright in user
+/// space, or drawn turned (`turned`) so that it reads upright on a
+/// `/Rotate 270` page: the text runs down the sheet, the rows advance
+/// along user-space x. The grid is laid out on the displayed page at
+/// columns 72, 240 and 400 and rows from 500 downwards, so the same cells
+/// land in the same displayed places whichever way the page is written.
+#[must_use]
+pub fn grid_pdf(rotate: Option<i64>, turned: bool) -> Vec<u8> {
+    const COLUMNS: [i32; 3] = [72, 240, 400];
+    const ROWS: [(&str, &str, &str); 4] = [
+        ("Year", "Engine", "Cards"),
+        ("1837", "Analytical", "Punched"),
+        ("1843", "Notes", "Woven"),
+        ("1854", "Difference", "None"),
+    ];
+    let mut content = String::new();
+    for (index, (first, second, third)) in ROWS.iter().enumerate() {
+        let shown_y = 500 - 24 * i32::try_from(index).expect("four rows fit in an i32");
+        for (shown_x, text) in COLUMNS.iter().zip([first, second, third]) {
+            if turned {
+                // Shown under /Rotate 270 on a letter sheet: a displayed
+                // point (x', y') is user space (y', 792 - x'), and the
+                // reading direction is down the sheet.
+                let (x, y) = (shown_y, 792 - shown_x);
+                content.push_str(&format!(
+                    "BT /F1 1 Tf 0 -11 11 0 {x} {y} Tm ({text}) Tj ET\n"
+                ));
+            } else {
+                content.push_str(&format!(
+                    "BT /F1 11 Tf {shown_x} {shown_y} Td ({text}) Tj ET\n"
+                ));
+            }
+        }
+    }
+    framed_pdf(&content, None, rotate)
+}
+
 /// Build a one-page PDF whose table is drawn with real rules and whose
 /// cells hold prose rather than short aligned tokens.
 ///

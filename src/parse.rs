@@ -594,7 +594,13 @@ fn parse(
                 // runs, one whole read of the file later. They go out
                 // before the markdown that flattens them into pipe
                 // characters.
-                let page_tables = tables::page_tables(page_no, &page_items, &rects, &lines);
+                let page_tables = tables::page_tables(
+                    page_no,
+                    &page_items,
+                    &rects,
+                    &lines,
+                    rotated_pages.contains(&page_no),
+                );
                 if page_tables.as_ref().is_some_and(tables::has_data_table) {
                     pages_with_tables.push(page_no);
                 }

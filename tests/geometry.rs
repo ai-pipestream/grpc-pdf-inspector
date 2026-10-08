@@ -536,6 +536,24 @@ async fn a_rotation_written_as_a_real_turns_the_page_all_the_same() {
         "{bbox:?}"
     );
     assert_inside(&document);
+
+    // A real off the multiple of 90 rounds the same way in both readers:
+    // 269.5 is a quarter turn anticlockwise for the fold and the walk.
+    let (_, document) = framed(&common::framed_pdf_with(common::FramedPage {
+        content: "BT /F1 1 Tf 0 -11 11 0 500 762 Tm (reading down the sheet) Tj ET".to_owned(),
+        rotate: Some(lopdf::Object::Real(269.5)),
+        ..common::FramedPage::default()
+    }))
+    .await;
+    assert_eq!(page_size(&document), (792.0, 612.0));
+    assert_eq!(
+        document.pages[&1]
+            .quality
+            .as_ref()
+            .and_then(|quality| quality.rotation_degrees),
+        Some(270.0)
+    );
+    assert_inside(&document);
 }
 
 #[tokio::test]

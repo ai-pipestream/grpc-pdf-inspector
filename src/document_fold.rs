@@ -1205,8 +1205,16 @@ fn table_data(region: &pb::TableRegion) -> doc::TableData {
     for (row_index, row) in region.rows.iter().enumerate() {
         let mut row_cells = Vec::new();
         for (column_index, text) in row.cells.iter().enumerate() {
+            // The box the detector cut and the page placed; a region
+            // that carries none (an older producer, or a table with no
+            // extent) is cut here from its boundaries, which is right
+            // only on a page shown as it was read.
             let cell = doc::TableCell {
-                bbox: cell_bbox(region, row_index, column_index),
+                bbox: row
+                    .boxes
+                    .get(column_index)
+                    .map(bounding_box)
+                    .or_else(|| cell_bbox(region, row_index, column_index)),
                 row_span: 1,
                 col_span: 1,
                 start_row_offset_idx: i32::try_from(row_index).unwrap_or(i32::MAX),
@@ -2530,9 +2538,11 @@ mod tests {
                 rows: vec![
                     pb::TableCells {
                         cells: vec!["Year".to_owned(), "Count".to_owned()],
+                        boxes: Vec::new(),
                     },
                     pb::TableCells {
                         cells: vec!["1843".to_owned(), "7".to_owned()],
+                        boxes: Vec::new(),
                     },
                 ],
                 kind: pb::TableKind::Data.into(),
@@ -2576,6 +2586,7 @@ mod tests {
             tables: vec![pb::TableRegion {
                 rows: vec![pb::TableCells {
                     cells: vec!["Chapter One".to_owned(), "3".to_owned()],
+                    boxes: Vec::new(),
                 }],
                 kind: pb::TableKind::Contents.into(),
                 ..pb::TableRegion::default()
@@ -2610,6 +2621,7 @@ mod tests {
                 .iter()
                 .map(|cells| pb::TableCells {
                     cells: cells.iter().map(|cell| (*cell).to_owned()).collect(),
+                    boxes: Vec::new(),
                 })
                 .collect(),
             kind: pb::TableKind::Data.into(),

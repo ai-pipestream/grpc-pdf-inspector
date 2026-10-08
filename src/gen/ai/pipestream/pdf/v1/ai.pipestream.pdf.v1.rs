@@ -162,12 +162,20 @@ pub struct PdfOptions {
     pub emit_page_documents: bool,
 }
 /// TableCells is one row of a detected table.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TableCells {
     /// The row's cells, left to right. A row shorter than the table's column
     /// count ends where the detector found it ending.
     #[prost(string, repeated, tag="1")]
     pub cells: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The box of each cell in `cells`, in the same order, on the page as
+    /// displayed. Each is cut from the grid in the frame the detector read
+    /// it in (this column's start to the next, this row's bottom to the
+    /// previous row's, the outermost from the extent) and then placed with
+    /// the page, so a turned or mirrored page keeps every cell with its
+    /// text. Empty when the table has no extent.
+    #[prost(message, repeated, tag="2")]
+    pub boxes: ::prost::alloc::vec::Vec<Rect>,
 }
 /// TableRegion is one detected table: its grid, its contents, and where its
 /// lines fall on the page.

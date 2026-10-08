@@ -240,7 +240,7 @@ impl PageFrame {
     }
 
     /// Move a page's grids onto the displayed page: their extents, their
-    /// column edges and their row edges.
+    /// column edges, their row edges and their cells.
     ///
     /// The wire's lists are the contract's: `column_boundaries` says where
     /// each column starts, ascending, the last column closed by the
@@ -249,51 +249,104 @@ impl PageFrame {
     /// extent's top. Neither is a bare list of lines: a turn that mirrors
     /// an axis makes a start edge an end edge, and a quarter turn makes a
     /// column edge a row edge. So each column and each row is taken as
-    /// the band between two edges, both edges are placed, and the lists
-    /// are rebuilt from the bands as they lie on the displayed page.
+    /// the band between two edges in the frame the grid was read in, each
+    /// cell as the crossing of its column's band and its row's, every edge
+    /// is placed, and the lists and the cells are rebuilt from where the
+    /// bands lie on the displayed page.
+    ///
+    /// On a page the library read sideways and shown under `/Rotate 270`
+    /// its frame is a half turn from the page: the text runs towards
+    /// smaller x in that frame, so a column's start is the far end of its
+    /// glyphs and its band reaches back to the previous start, and a row's
+    /// bottom is its top. The bands are cut that way there.
     pub fn place_tables(&self, tables: &mut pb::PageTables) {
+        let reversed = self.turned && self.rotation == 270;
         for table in &mut tables.tables {
-            // The far edge closing the last column and the first row: the
-            // extent's, unless the list already reaches past it (a ruled
-            // table reports its outer rule as one more edge, and the extent
-            // is measured from the runs inside it).
             let extent = table.bbox;
+            let starts = table.column_boundaries.clone();
+            let bottoms = table.row_boundaries.clone();
+            // The edges closing the last column and the first row (the
+            // first column and the last row on a reversed page): the
+            // extent's, unless the list already reaches past it (a ruled
+            // table reports its outer rule as one more edge, and the
+            // extent is measured from the runs inside it).
             let far_x = extent
                 .as_ref()
                 .map(|rect| rect.x + rect.width)
                 .into_iter()
-                .chain(table.column_boundaries.last().copied())
+                .chain(starts.last().copied())
                 .reduce(f64::max);
             let far_y = extent
                 .as_ref()
                 .map(|rect| rect.y + rect.height)
                 .into_iter()
-                .chain(table.row_boundaries.first().copied())
+                .chain(bottoms.first().copied())
                 .reduce(f64::max);
+            let near_x = extent
+                .as_ref()
+                .map(|rect| rect.x)
+                .into_iter()
+                .chain(starts.first().copied())
+                .reduce(f64::min);
+            let near_y = extent
+                .as_ref()
+                .map(|rect| rect.y)
+                .into_iter()
+                .chain(bottoms.last().copied())
+                .reduce(f64::min);
+            let column_band = |index: usize| -> Option<(f64, f64)> {
+                let start = *starts.get(index)?;
+                let other = if reversed {
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| starts.get(previous).copied())
+                        .or(near_x)
+                } else {
+                    starts.get(index + 1).copied().or(far_x)
+                };
+                Some((start, other.unwrap_or(start)))
+            };
+            let row_band = |index: usize| -> Option<(f64, f64)> {
+                let bottom = *bottoms.get(index)?;
+                let other = if reversed {
+                    bottoms.get(index + 1).copied().or(near_y)
+                } else {
+                    index
+                        .checked_sub(1)
+                        .and_then(|previous| bottoms.get(previous).copied())
+                        .or(far_y)
+                };
+                Some((bottom, other.unwrap_or(bottom)))
+            };
+            // A list that already names its outer edge (a ruled table's)
+            // is a list of fences, and every fence is kept: both ends of
+            // every band go in, so a mirrored axis keeps the far fence.
+            let fences_x = !reversed
+                && far_x.is_some_and(|far| starts.last().is_some_and(|last| *last >= far - 1e-6));
+            let fences_y = !reversed
+                && far_y
+                    .is_some_and(|far| bottoms.first().is_some_and(|first| *first >= far - 1e-6));
             let mut columns: Vec<f64> = Vec::new();
             let mut rows: Vec<f64> = Vec::new();
-            let mut land = |near: Edge, far: Edge| {
+            let mut land = |near: Edge, far: Edge, fences: bool| {
                 let (axis, a) = self.place_edge(near);
                 let (_, b) = self.place_edge(far);
-                let lower = a.min(b);
-                match axis {
-                    Axis::Column => columns.push(lower),
-                    Axis::Row => rows.push(lower),
+                let list = match axis {
+                    Axis::Column => &mut columns,
+                    Axis::Row => &mut rows,
+                };
+                list.push(a.min(b));
+                if fences {
+                    list.push(a.max(b));
                 }
             };
-            let starts = &table.column_boundaries;
-            for (index, &start) in starts.iter().enumerate() {
-                let end = starts.get(index + 1).copied().or(far_x).unwrap_or(start);
-                land(Edge::X(start), Edge::X(end));
+            for index in 0..starts.len() {
+                let (a, b) = column_band(index).expect("an index of the list");
+                land(Edge::X(a), Edge::X(b), fences_x);
             }
-            let bottoms = &table.row_boundaries;
-            for (index, &bottom) in bottoms.iter().enumerate() {
-                let top = index
-                    .checked_sub(1)
-                    .and_then(|previous| bottoms.get(previous).copied())
-                    .or(far_y)
-                    .unwrap_or(bottom);
-                land(Edge::Y(bottom), Edge::Y(top));
+            for index in 0..bottoms.len() {
+                let (a, b) = row_band(index).expect("an index of the list");
+                land(Edge::Y(a), Edge::Y(b), fences_y);
             }
             columns.sort_by(f64::total_cmp);
             columns.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
@@ -301,6 +354,28 @@ impl PageFrame {
             rows.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
             table.column_boundaries = columns;
             table.row_boundaries = rows;
+            // Each cell is the crossing of its bands, cut in the frame the
+            // grid was read in and placed with it, so it keeps its text
+            // whichever way the page is shown. A table with no extent
+            // places no cells.
+            for (row_index, row) in table.rows.iter_mut().enumerate() {
+                row.boxes = if extent.is_some() {
+                    (0..row.cells.len())
+                        .filter_map(|column| {
+                            let (x0, x1) = column_band(column)?;
+                            let (y0, y1) = row_band(row_index)?;
+                            Some(self.place_rect(&pb::Rect {
+                                x: x0.min(x1),
+                                y: y0.min(y1),
+                                width: (x1 - x0).abs(),
+                                height: (y1 - y0).abs(),
+                            }))
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+            }
             if let Some(rect) = table.bbox.as_mut() {
                 *rect = self.place_rect(rect);
             }
@@ -696,8 +771,12 @@ mod tests {
                     width: 200.0,
                     height: 100.0,
                 }),
-                column_boundaries: vec![100.0, 200.0],
+                column_boundaries: vec![200.0, 300.0],
                 row_boundaries: vec![-220.0, -260.0],
+                rows: vec![pb::TableCells {
+                    cells: vec!["a".to_owned(), "b".to_owned()],
+                    boxes: Vec::new(),
+                }],
                 ..Default::default()
             }],
         };
@@ -705,12 +784,18 @@ mod tests {
         let table = &tables.tables[0];
         let rect = table.bbox.as_ref().expect("a box");
         assert!(close(rect, 492.0, 200.0, 200.0, 100.0), "{rect:?}");
+        // The frame is a half turn from the page: a column's start (200,
+        // 300) is the far end of its glyphs, so the bands are 100..200 and
+        // 200..300, shown as 592..692 and 492..592.
         assert_eq!(table.column_boundaries, [492.0, 592.0]);
-        // Rows ending at -220 and -260 under a top of -200 are bands of
-        // user-space x 200..220 and 220..260, shown as y 200..220 and
-        // 220..260: descending bottoms 220 and 200, the top row closed by
-        // the extent's top (300).
-        assert_eq!(table.row_boundaries, [220.0, 200.0]);
+        // Rows ending at -220 and -260 are the tops of bands reaching to
+        // the next bottom (-260) and the extent's bottom (-300): user
+        // space x 220..260 and 260..300, shown as y 220..260 and 260..300,
+        // descending bottoms 260 and 220.
+        assert_eq!(table.row_boundaries, [260.0, 220.0]);
+        let boxes = &table.rows[0].boxes;
+        assert!(close(&boxes[0], 592.0, 220.0, 100.0, 40.0), "{boxes:?}");
+        assert!(close(&boxes[1], 492.0, 220.0, 100.0, 40.0), "{boxes:?}");
     }
 
     #[test]
@@ -735,6 +820,40 @@ mod tests {
         assert!(close(rect, 312.0, 192.0, 200.0, 100.0), "{rect:?}");
         assert_eq!(table.column_boundaries, [312.0, 412.0]);
         assert_eq!(table.row_boundaries, [242.0, 192.0]);
+    }
+
+    #[test]
+    fn a_ruled_grid_keeps_its_outer_fence_when_mirrored() {
+        // A ruled table names its outer edges: three fences for two
+        // columns, three for two rows. Upside down, every fence is still
+        // there, mirrored.
+        let mut tables = pb::PageTables {
+            page_no: 1,
+            tables: vec![pb::TableRegion {
+                bbox: Some(pb::Rect {
+                    x: 100.0,
+                    y: 500.0,
+                    width: 200.0,
+                    height: 100.0,
+                }),
+                column_boundaries: vec![100.0, 200.0, 300.0],
+                row_boundaries: vec![550.0, 500.0],
+                rows: vec![pb::TableCells {
+                    cells: vec!["a".to_owned(), "b".to_owned()],
+                    boxes: Vec::new(),
+                }],
+                ..Default::default()
+            }],
+        };
+        frame(180, LETTER, false).place_tables(&mut tables);
+        let table = &tables.tables[0];
+        assert_eq!(table.column_boundaries, [312.0, 412.0, 512.0]);
+        assert_eq!(table.row_boundaries, [242.0, 192.0]);
+        // The cells turn with their text: the first cell, top left as
+        // read, is bottom right as shown.
+        let boxes = &table.rows[0].boxes;
+        assert!(close(&boxes[0], 412.0, 192.0, 100.0, 50.0), "{boxes:?}");
+        assert!(close(&boxes[1], 312.0, 192.0, 100.0, 50.0), "{boxes:?}");
     }
 
     #[test]

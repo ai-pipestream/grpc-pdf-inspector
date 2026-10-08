@@ -248,3 +248,72 @@ async fn a_pipe_block_is_never_given_another_detectors_grid() {
     );
     common::assert_layers_and_parents_agree(document);
 }
+
+/// Every cell of the one table on the page holds the run that carries its
+/// text, wherever the page is turned: the grid is read in one frame and
+/// shown in another, and a cell must land with its text, not with the
+/// mirror cell's.
+async fn assert_cells_hold_their_text(pdf: &[u8], what: &str) {
+    let harness = common::start().await;
+    let events = harness
+        .parse(
+            pdf,
+            pb::PdfOptions {
+                emit_spans: true,
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+    let runs = &common::spans(&events)[0].spans;
+    let document = common::documents(&events)[0];
+    assert_eq!(document.tables.len(), 1, "{what}: one grid");
+    let size = document.pages[&1].size.as_ref().expect("a measured page");
+    let data = document.tables[0].data.as_ref().expect("the table's cells");
+    assert_eq!(data.table_cells.len(), 12, "{what}: every cell");
+    for cell in &data.table_cells {
+        let bbox = cell.bbox.as_ref().expect("every cell is placed");
+        assert!(
+            bbox.l >= -0.01
+                && bbox.r <= size.width + 0.01
+                && bbox.b >= -0.01
+                && bbox.t <= size.height + 0.01,
+            "{what}: cell {:?} {bbox:?} is on the {size:?} page",
+            cell.text
+        );
+        let run = runs
+            .iter()
+            .find(|run| run.text.trim() == cell.text.trim())
+            .and_then(|run| run.bbox.as_ref())
+            .unwrap_or_else(|| panic!("{what}: the run for cell {:?}", cell.text));
+        assert!(
+            run.x >= bbox.l - 0.5
+                && run.x + run.width <= bbox.r + 0.5
+                && run.y >= bbox.b - 0.5
+                && run.y + run.height <= bbox.t + 0.5,
+            "{what}: cell {:?} {bbox:?} holds its run {run:?}",
+            cell.text
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_cells_of_a_grid_shown_upside_down_hold_their_text() {
+    assert_cells_hold_their_text(&common::grid_pdf(Some(180), false), "/Rotate 180").await;
+}
+
+#[tokio::test]
+async fn the_cells_of_an_upright_grid_on_a_turned_sheet_hold_their_text() {
+    assert_cells_hold_their_text(&common::grid_pdf(Some(90), false), "upright on /Rotate 90").await;
+}
+
+#[tokio::test]
+async fn the_cells_of_a_turned_grid_shown_anticlockwise_hold_their_text() {
+    assert_cells_hold_their_text(&common::grid_pdf(Some(270), true), "turned on /Rotate 270").await;
+}
+
+#[tokio::test]
+async fn the_cells_of_an_unturned_grid_hold_their_text() {
+    assert_cells_hold_their_text(&common::grid_pdf(None, false), "no rotation").await;
+}
