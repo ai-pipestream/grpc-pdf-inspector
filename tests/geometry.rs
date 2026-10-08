@@ -491,3 +491,68 @@ async fn text_drawn_off_the_page_is_not_on_it() {
     );
     assert_inside(&document);
 }
+
+#[tokio::test]
+async fn an_upside_down_page_is_mirrored_both_ways_end_to_end() {
+    // /Rotate 180: a run at user space (100, 700), 12 points tall, is
+    // shown with its right edge 612 - 100 from the left and its baseline
+    // 792 - 712 = 80 up; the page keeps its portrait size.
+    let (runs, document) = framed(&common::framed_pdf(
+        "BT /F1 12 Tf 1 0 0 1 100 700 Tm (upside down) Tj ET",
+        None,
+        Some(180),
+    ))
+    .await;
+    assert_eq!(page_size(&document), (612.0, 792.0));
+    let bbox = run_box(&runs, "upside down");
+    assert!((bbox.x + bbox.width - 512.0).abs() < 0.01, "{bbox:?}");
+    assert!(
+        (bbox.y - 80.0).abs() < 0.01 && (bbox.height - 12.0).abs() < 0.01,
+        "{bbox:?}"
+    );
+    assert_inside(&document);
+}
+
+#[tokio::test]
+async fn a_rotation_written_as_a_real_turns_the_page_all_the_same() {
+    // `/Rotate 90.0`: the metadata reader and the extraction walk must
+    // agree, or the fold would say 612 x 792 over boxes placed on a
+    // 792 x 612 page.
+    let (runs, document) = framed(&common::framed_pdf_with(common::FramedPage {
+        content: "BT /F1 1 Tf 0 11 -11 0 60 54 Tm (The analytical engine) Tj ET".to_owned(),
+        rotate: Some(lopdf::Object::Real(90.0)),
+        ..common::FramedPage::default()
+    }))
+    .await;
+    assert_eq!(page_size(&document), (792.0, 612.0));
+    let quality = document.pages[&1]
+        .quality
+        .as_ref()
+        .expect("the turned page's quality");
+    assert_eq!(quality.rotation_degrees, Some(90.0));
+    let bbox = run_box(&runs, "The analytical engine");
+    assert!(
+        (bbox.x - 54.0).abs() < 0.01 && (bbox.y - (612.0 - 60.0)).abs() < 0.01,
+        "{bbox:?}"
+    );
+    assert_inside(&document);
+}
+
+#[tokio::test]
+async fn a_media_box_with_a_negative_origin_moves_every_box_by_its_corner() {
+    // MediaBox [-100 -100 512 692], no crop box: the page is letter-sized
+    // and a run at the user-space origin is 100 points in from both edges.
+    let (runs, document) = framed(&common::framed_pdf_with(common::FramedPage {
+        content: "BT /F1 12 Tf 1 0 0 1 0 0 Tm (at the origin) Tj ET".to_owned(),
+        media_box: [-100, -100, 512, 692],
+        ..common::FramedPage::default()
+    }))
+    .await;
+    assert_eq!(page_size(&document), (612.0, 792.0));
+    let bbox = run_box(&runs, "at the origin");
+    assert!(
+        (bbox.x - 100.0).abs() < 0.01 && (bbox.y - 100.0).abs() < 0.01,
+        "{bbox:?}"
+    );
+    assert_inside(&document);
+}

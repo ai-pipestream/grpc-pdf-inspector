@@ -365,8 +365,21 @@ against an independent interpretation of its content stream:
 - *Tests*: `tests/geometry.rs` (crop box offset, `/Rotate 270`, turned
   glyphs on an upright page, off-page text), `src/frame.rs`, and the
   crate's `content_stream` and `extractor` test modules.
+- *Review follow-up* (same branch): the drop trusts the hull only where
+  the text model holds. `Tz` is now applied to advances and offsets; a
+  TJ segment's hull covers the pen's furthest reach either way; a font
+  with no widths or a vertical font measures no hull and is never
+  dropped; a run continuing an on-page line pen to pen stays; the visible
+  box is the crop box cut to the media box, as `frame.rs` measures it.
+  Link annotations and form fields carry their rectangle as a hull, so a
+  turned page places them. Grid edges are rebuilt from the bands between
+  them, so `column_boundaries` stays ascending starts and
+  `row_boundaries` descending bottoms under every turn. A real `/Rotate`
+  (`90.0`) reads the same in the metadata reader and the walk. The
+  ActualText first-glyph position is taken after a leading TJ offset.
 - *Not done*: a run's exact quadrilateral is not reported on
-  `ProvenanceItem.polygon`; the hull is the axis-aligned box only.
+  `ProvenanceItem.polygon`; the hull is the axis-aligned box only, and it
+  runs from the baseline (the `Rect` contract's `y`), not the descender.
 
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page

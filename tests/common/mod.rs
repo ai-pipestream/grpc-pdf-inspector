@@ -1376,6 +1376,48 @@ pub fn landscape_pdf() -> Vec<u8> {
 /// page a reader sees.
 #[must_use]
 pub fn framed_pdf(content: &str, crop_box: Option<[i64; 4]>, rotate: Option<i64>) -> Vec<u8> {
+    framed_pdf_with(FramedPage {
+        content: content.to_owned(),
+        crop_box,
+        rotate: rotate.map(Object::Integer),
+        ..FramedPage::default()
+    })
+}
+
+/// What [`framed_pdf_with`] builds.
+#[derive(Debug, Clone)]
+pub struct FramedPage {
+    /// The page's content stream.
+    pub content: String,
+    /// The media box, letter when not said.
+    pub media_box: [i64; 4],
+    /// The crop box, when the page declares one.
+    pub crop_box: Option<[i64; 4]>,
+    /// `/Rotate`, as whatever object the fixture wants to write.
+    pub rotate: Option<Object>,
+}
+
+impl Default for FramedPage {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            media_box: [0, 0, 612, 792],
+            crop_box: None,
+            rotate: None,
+        }
+    }
+}
+
+/// A one-page document drawing `page.content` with the font `F1`
+/// (Helvetica) available, under the boxes and rotation the page says.
+#[must_use]
+pub fn framed_pdf_with(page: FramedPage) -> Vec<u8> {
+    let FramedPage {
+        content,
+        media_box,
+        crop_box,
+        rotate,
+    } = page;
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -1387,7 +1429,7 @@ pub fn framed_pdf(content: &str, crop_box: Option<[i64; 4]>, rotate: Option<i64>
     let mut page = dictionary! {
         "Type" => "Page",
         "Parent" => pages_id,
-        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "MediaBox" => media_box.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>(),
         "Resources" => dictionary! {
             "Font" => dictionary! { "F1" => font_id },
         },

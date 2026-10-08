@@ -240,32 +240,77 @@ impl PageFrame {
     }
 
     /// Move a page's grids onto the displayed page: their extents, their
-    /// column edges and their row edges. An edge is a line of constant x
-    /// or y in the library's frame; a quarter turn makes a column edge a
-    /// row edge and back, so the two lists are rebuilt from where each
-    /// line lands rather than moved in place.
+    /// column edges and their row edges.
+    ///
+    /// The wire's lists are the contract's: `column_boundaries` says where
+    /// each column starts, ascending, the last column closed by the
+    /// extent's right edge; `row_boundaries` says where each row's band
+    /// ends at the bottom, descending, the first row closed by the
+    /// extent's top. Neither is a bare list of lines: a turn that mirrors
+    /// an axis makes a start edge an end edge, and a quarter turn makes a
+    /// column edge a row edge. So each column and each row is taken as
+    /// the band between two edges, both edges are placed, and the lists
+    /// are rebuilt from the bands as they lie on the displayed page.
     pub fn place_tables(&self, tables: &mut pb::PageTables) {
         for table in &mut tables.tables {
+            // The far edge closing the last column and the first row: the
+            // extent's, unless the list already reaches past it (a ruled
+            // table reports its outer rule as one more edge, and the extent
+            // is measured from the runs inside it).
+            let extent = table.bbox;
+            let far_x = extent
+                .as_ref()
+                .map(|rect| rect.x + rect.width)
+                .into_iter()
+                .chain(table.column_boundaries.last().copied())
+                .reduce(f64::max);
+            let far_y = extent
+                .as_ref()
+                .map(|rect| rect.y + rect.height)
+                .into_iter()
+                .chain(table.row_boundaries.first().copied())
+                .reduce(f64::max);
+            let mut columns: Vec<f64> = Vec::new();
+            let mut rows: Vec<f64> = Vec::new();
+            let mut land = |near: Edge, far: Edge| {
+                let (axis, a) = self.place_edge(near);
+                let (_, b) = self.place_edge(far);
+                let lower = a.min(b);
+                match axis {
+                    Axis::Column => columns.push(lower),
+                    Axis::Row => rows.push(lower),
+                }
+            };
+            let starts = &table.column_boundaries;
+            for (index, &start) in starts.iter().enumerate() {
+                let end = starts.get(index + 1).copied().or(far_x).unwrap_or(start);
+                land(Edge::X(start), Edge::X(end));
+            }
+            let bottoms = &table.row_boundaries;
+            for (index, &bottom) in bottoms.iter().enumerate() {
+                let top = index
+                    .checked_sub(1)
+                    .and_then(|previous| bottoms.get(previous).copied())
+                    .or(far_y)
+                    .unwrap_or(bottom);
+                land(Edge::Y(bottom), Edge::Y(top));
+            }
+            columns.sort_by(f64::total_cmp);
+            columns.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+            rows.sort_by(|a, b| b.total_cmp(a));
+            rows.dedup_by(|a, b| (*a - *b).abs() < 1e-6);
+            table.column_boundaries = columns;
+            table.row_boundaries = rows;
             if let Some(rect) = table.bbox.as_mut() {
                 *rect = self.place_rect(rect);
             }
-            let mut columns = Vec::new();
-            let mut rows = Vec::new();
-            for &edge in &table.column_boundaries {
-                self.place_edge(Edge::X(edge), &mut columns, &mut rows);
-            }
-            for &edge in &table.row_boundaries {
-                self.place_edge(Edge::Y(edge), &mut columns, &mut rows);
-            }
-            table.column_boundaries = columns;
-            table.row_boundaries = rows;
         }
     }
 
-    /// Where a line of constant x or y in the library's frame lands: as a
-    /// column edge (constant displayed x) or a row edge (constant
-    /// displayed y).
-    fn place_edge(&self, edge: Edge, columns: &mut Vec<f64>, rows: &mut Vec<f64>) {
+    /// Where a line of constant x or y in the library's frame lands: on
+    /// which displayed axis (a column edge is a line of constant displayed
+    /// x, a row edge of constant displayed y) and at what value.
+    fn place_edge(&self, edge: Edge) -> (Axis, f64) {
         // In user space the line is X = c or Y = c.
         let (vertical, c) = match (edge, self.turned) {
             (Edge::X(c), false) => (true, c),
@@ -286,11 +331,12 @@ impl PageFrame {
             (false, 270) => y1 - c,
             (false, _) => c - y0,
         };
-        if vertical != quarter {
-            columns.push(value);
+        let axis = if vertical != quarter {
+            Axis::Column
         } else {
-            rows.push(value);
-        }
+            Axis::Row
+        };
+        (axis, value)
     }
 
     /// `rect` cut down to the displayed page. A box with nothing on the
@@ -315,6 +361,13 @@ impl PageFrame {
 enum Edge {
     X(f64),
     Y(f64),
+}
+
+/// The displayed axis an edge lies across.
+#[derive(Clone, Copy)]
+enum Axis {
+    Column,
+    Row,
 }
 
 /// The box with `a` and `b` as opposite corners.
@@ -604,7 +657,7 @@ mod tests {
                     height: 100.0,
                 }),
                 column_boundaries: vec![100.0, 200.0],
-                row_boundaries: vec![600.0, 550.0],
+                row_boundaries: vec![550.0, 500.0],
                 ..Default::default()
             }],
         };
@@ -617,8 +670,84 @@ mod tests {
             100.0,
             200.0
         ));
-        assert_eq!(table.column_boundaries, [600.0, 550.0]);
-        assert_eq!(table.row_boundaries, [512.0, 412.0]);
+        // The row bands 550..600 and 500..550 lie across displayed x and
+        // start at 500 and 550; the column bands 100..200 and 200..300 lie
+        // across displayed y as 412..512 and 312..412, ending at 412 and
+        // 312. Each list keeps the contract's order and meaning, so a
+        // consumer closing the last column with the extent's right edge
+        // (600) and the first row with its top (512) gets every cell.
+        assert_eq!(table.column_boundaries, [500.0, 550.0]);
+        assert_eq!(table.row_boundaries, [412.0, 312.0]);
+    }
+
+    #[test]
+    fn a_turned_grid_shown_anticlockwise_keeps_its_columns_ascending() {
+        // The library's frame for a /Rotate 270 page is a half turn from
+        // the shown page, so a column's start edge becomes its end edge.
+        // Columns starting at 100 and 200 in an extent reaching 300 are
+        // shown as bands 592..692 and 492..592: starts 492 and 592, with
+        // the extent's right edge (692) closing the last.
+        let mut tables = pb::PageTables {
+            page_no: 1,
+            tables: vec![pb::TableRegion {
+                bbox: Some(pb::Rect {
+                    x: 100.0,
+                    y: -300.0,
+                    width: 200.0,
+                    height: 100.0,
+                }),
+                column_boundaries: vec![100.0, 200.0],
+                row_boundaries: vec![-220.0, -260.0],
+                ..Default::default()
+            }],
+        };
+        frame(270, LETTER, true).place_tables(&mut tables);
+        let table = &tables.tables[0];
+        let rect = table.bbox.as_ref().expect("a box");
+        assert!(close(rect, 492.0, 200.0, 200.0, 100.0), "{rect:?}");
+        assert_eq!(table.column_boundaries, [492.0, 592.0]);
+        // Rows ending at -220 and -260 under a top of -200 are bands of
+        // user-space x 200..220 and 220..260, shown as y 200..220 and
+        // 220..260: descending bottoms 220 and 200, the top row closed by
+        // the extent's top (300).
+        assert_eq!(table.row_boundaries, [220.0, 200.0]);
+    }
+
+    #[test]
+    fn an_upside_down_grid_rebuilds_both_lists_from_the_far_edges() {
+        let mut tables = pb::PageTables {
+            page_no: 1,
+            tables: vec![pb::TableRegion {
+                bbox: Some(pb::Rect {
+                    x: 100.0,
+                    y: 500.0,
+                    width: 200.0,
+                    height: 100.0,
+                }),
+                column_boundaries: vec![100.0, 200.0],
+                row_boundaries: vec![550.0, 500.0],
+                ..Default::default()
+            }],
+        };
+        frame(180, LETTER, false).place_tables(&mut tables);
+        let table = &tables.tables[0];
+        let rect = table.bbox.as_ref().expect("a box");
+        assert!(close(rect, 312.0, 192.0, 200.0, 100.0), "{rect:?}");
+        assert_eq!(table.column_boundaries, [312.0, 412.0]);
+        assert_eq!(table.row_boundaries, [242.0, 192.0]);
+    }
+
+    #[test]
+    fn a_link_annotation_on_a_turned_page_lands_where_the_page_shows_it() {
+        // A link's rectangle is user space whatever the library did to the
+        // page's runs, and the library marks it so with a hull. /Rect
+        // [100 200 150 210] on a letter sheet shown under /Rotate 90 is
+        // 200..210 from the left and 612 - 150 .. 612 - 100 up.
+        let frame = frame(90, LETTER, true);
+        let mut link = item(Some([100.0, 200.0, 150.0, 210.0]), 100.0, 200.0, 50.0, 10.0);
+        link.item_type = pdf_inspector::types::ItemType::Link("https://example.invalid".to_owned());
+        let rect = frame.place_item(&link);
+        assert!(close(&rect, 200.0, 462.0, 10.0, 50.0), "{rect:?}");
     }
 
     #[test]
