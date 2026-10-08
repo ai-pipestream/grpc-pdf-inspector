@@ -603,7 +603,7 @@ fn ocr_text_items(page: &RoutedOcrPage) -> (Vec<TextItem>, usize) {
             f64::from(right - left),
             f64::from(bottom - top),
         );
-        items.push(TextItem {
+        items.push(TextItem { hull: None,
             text: span.text.trim().to_string(),
             x: rect.x,
             y: rect.y,
@@ -1234,7 +1234,7 @@ mod tests {
     #[test]
     fn supplemental_table_detection_requires_multiple_rows() {
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "Metric".to_string(),
                 x: 10.0,
                 y: 40.0,
@@ -1251,7 +1251,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "Value".to_string(),
                 x: 110.0,
                 y: 40.0,
@@ -1278,7 +1278,7 @@ mod tests {
     #[test]
     fn supplemental_image_ocr_filters_spans_by_region_center() {
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "inside".to_string(),
                 x: 10.0,
                 y: 10.0,
@@ -1295,7 +1295,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "outside".to_string(),
                 x: 120.0,
                 y: 10.0,

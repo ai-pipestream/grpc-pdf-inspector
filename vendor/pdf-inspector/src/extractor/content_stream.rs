@@ -610,7 +610,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     }
                                 }
                             }
-                            items.push(TextItem {
+                            items.push(TextItem { hull: Some(super::run_hull(&combined, w_ts_opt.unwrap_or(0.0), current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -843,7 +843,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         rtl_visual_candidates.push(items.len());
                                     }
                                 }
-                                items.push(TextItem {
+                                items.push(TextItem { hull: Some(super::run_hull(&combined, if font_info.is_some() { end_w - start_w } else { 0.0 }, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
                                     text: expand_ligatures(text),
                                     x,
                                     y,
@@ -964,7 +964,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     rtl_logical_ops += 1;
                                 }
                             }
-                            items.push(TextItem {
+                            items.push(TextItem { hull: Some(super::run_hull(&combined, w_ts_opt.unwrap_or(0.0), current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -1013,7 +1013,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     // `[Image: Im0]` format that the markdown
                                     // emitter already recognizes.
                                     let (x, y, width, height) = image_bbox_from_ctm(&ctm);
-                                    items.push(TextItem {
+                                    items.push(TextItem { hull: Some([x, y, x + width, y + height]),
                                         text: format!("[Image: {}]", xobj_name),
                                         x,
                                         y,
@@ -1129,7 +1129,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     .get(&current_font)
                                     .copied()
                                     .unwrap_or((false, false));
-                                items.push(TextItem {
+                                items.push(TextItem { hull: Some(super::run_hull_between(&combined, &multiply_matrices(&rise_adjusted(&text_matrix, rise), &ctm), current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
                                     text: expand_ligatures(&at),
                                     x,
                                     y,
@@ -2275,5 +2275,45 @@ end"#;
             items.is_empty(),
             "pages over the operator cap must not be decoded"
         );
+    }
+
+    fn find_item<'a>(items: &'a [TextItem], text: &str) -> &'a TextItem {
+        items
+            .iter()
+            .find(|item| item.text == text)
+            .unwrap_or_else(|| panic!("no run {text:?} in {:?}", items.iter().map(|i| &i.text).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn a_turned_run_keeps_its_user_space_hull() {
+        // Two glyphs of 6 points each drawn with `0 1 -1 0 300 400 Tm` at
+        // 10 points: the advance runs 12 points up the page and the glyph
+        // height 10 points to the left, so the glyphs cover x 290..300 by
+        // y 400..412. The device-axis width is nothing, which is what the
+        // old box said about the run.
+        let items = extract_simple_items(b"BT /F1 10 Tf 0 1 -1 0 300 400 Tm (AB) Tj ET");
+        let run = find_item(&items, "AB");
+        assert!(run.width.abs() < 0.05, "{run:?}");
+        let hull = run.hull.expect("measured");
+        assert!(
+            (hull[0] - 290.0).abs() < 0.05
+                && (hull[1] - 400.0).abs() < 0.05
+                && (hull[2] - 300.0).abs() < 0.05
+                && (hull[3] - 412.0).abs() < 0.05,
+            "{hull:?}"
+        );
+        // An upright run's hull is its box.
+        let items = extract_simple_items(b"BT /F1 10 Tf 1 0 0 1 100 700 Tm (AB) Tj ET");
+        let run = find_item(&items, "AB");
+        assert_eq!(run.hull, Some([100.0, 700.0, 112.0, 710.0]));
+    }
+
+    #[test]
+    fn merged_runs_take_the_hull_around_both() {
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 1 0 0 1 100 700 Tm (AB) Tj ET BT /F1 10 Tf 1 0 0 1 113 700 Tm (CD) Tj ET",
+        );
+        let run = find_item(&items, "AB CD");
+        assert_eq!(run.hull, Some([100.0, 700.0, 125.0, 710.0]));
     }
 }

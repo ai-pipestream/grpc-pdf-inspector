@@ -185,6 +185,19 @@ pub struct TextItem {
     /// Marked Content ID from the content stream's BDC/BMC operator.
     /// Used to link this item to the PDF structure tree for tagged PDFs.
     pub mcid: Option<i64>,
+    /// The axis-aligned hull of the glyph frame in PDF user space, as
+    /// `[x0, y0, x1, y1]`, computed from the full text rendering matrix
+    /// (text matrix times CTM) at the show operator: the origin, the
+    /// advance along the text-space x axis and the font size along its y
+    /// axis, with every corner transformed. For an upright run it is
+    /// `x..x+width` by `y..y+height`; for a run drawn turned, mirrored or
+    /// skewed it is the box the glyphs really cover, where `x`, `y`,
+    /// `width` and `height` name only the origin and the extents along the
+    /// device axes. Never moved by the rotated-page correction, which keeps
+    /// `x` and `y` in a frame of its own; `None` for items that did not
+    /// come from a show operator or an image placement (link annotations,
+    /// form fields, split table tokens).
+    pub hull: Option<[f32; 4]>,
 }
 
 /// A line of text (grouped text items)
@@ -389,7 +402,7 @@ mod formatting_tests {
     use super::{ItemType, TextItem, TextLine};
 
     fn item(text: &str, x: f32, width: f32, strikeout: bool) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y: 100.0,

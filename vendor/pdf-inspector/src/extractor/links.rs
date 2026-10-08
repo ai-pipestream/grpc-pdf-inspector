@@ -107,7 +107,7 @@ pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> V
                     let uri = extract_link_uri(doc, annot_dict);
 
                     if let (Some((x, y, width, height)), Some(url)) = (rect, uri) {
-                        links.push(TextItem {
+                        links.push(TextItem { hull: None,
                             text: url.clone(),
                             x,
                             y,
@@ -441,7 +441,7 @@ pub(crate) fn walk_form_fields(
         format!("{}: {}", full_name, value_str)
     };
 
-    items.push(TextItem {
+    items.push(TextItem { hull: None,
         text,
         x,
         y,

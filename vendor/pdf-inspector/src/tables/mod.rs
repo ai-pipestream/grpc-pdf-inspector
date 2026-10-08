@@ -286,7 +286,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
                 .unwrap_or(raw_x)
         };
 
-        result.push(TextItem {
+        result.push(TextItem { hull: None,
             text: token.to_string(),
             x: snapped_x,
             width: token_width,
@@ -309,7 +309,7 @@ fn split_merged_numbers(item: &TextItem, col_boundaries: &[f32]) -> Vec<TextItem
     if leading_numeric < tokens.len() {
         let annotation = tokens[leading_numeric..].join(" ");
         let last_x = result.last().map(|i| i.x).unwrap_or(item.x);
-        result.push(TextItem {
+        result.push(TextItem { hull: None,
             text: annotation,
             x: last_x,
             width: token_width,
@@ -1486,7 +1486,7 @@ mod tests {
     use crate::types::{ItemType, TextItem};
 
     fn make_item(text: &str, x: f32, y: f32, font_size: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.into(),
             x,
             y,
@@ -1506,7 +1506,7 @@ mod tests {
     }
 
     fn make_char(text: &str, x: f32, y: f32, font_size: f32, width: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.into(),
             x,
             y,

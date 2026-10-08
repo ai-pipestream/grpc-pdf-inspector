@@ -832,6 +832,54 @@ pub(crate) fn image_bbox_from_ctm(ctm: &[f32; 6]) -> (f32, f32, f32, f32) {
     (x_min, y_min, x_max - x_min, y_max - y_min)
 }
 
+/// The axis-aligned hull, in user space, of a run shown with the combined
+/// matrix `m` (text matrix times CTM): its origin, `advance_ts` text-space
+/// units along the text x axis and `size_ts` along the text y axis, with
+/// every corner transformed. For an upright matrix this is the run's
+/// `(x, y, x + width, y + height)`; for a turned, mirrored or skewed one it
+/// is the box the glyphs cover, which the device-axis extents cannot say.
+pub(crate) fn run_hull(m: &[f32; 6], advance_ts: f32, size_ts: f32) -> [f32; 4] {
+    let corners = [
+        apply_ctm_point(m, 0.0, 0.0),
+        apply_ctm_point(m, advance_ts, 0.0),
+        apply_ctm_point(m, 0.0, size_ts),
+        apply_ctm_point(m, advance_ts, size_ts),
+    ];
+    hull_of(&corners)
+}
+
+/// The hull of a run whose origin and end are known as two combined
+/// matrices (the matrix before and after the glyphs were shown), `size_ts`
+/// text-space units tall along the start matrix's y axis.
+pub(crate) fn run_hull_between(start: &[f32; 6], end: &[f32; 6], size_ts: f32) -> [f32; 4] {
+    let corners = [
+        apply_ctm_point(start, 0.0, 0.0),
+        apply_ctm_point(end, 0.0, 0.0),
+        apply_ctm_point(start, 0.0, size_ts),
+        apply_ctm_point(end, 0.0, size_ts),
+    ];
+    hull_of(&corners)
+}
+
+fn hull_of(corners: &[(f32, f32)]) -> [f32; 4] {
+    let mut hull = [corners[0].0, corners[0].1, corners[0].0, corners[0].1];
+    for &(x, y) in &corners[1..] {
+        hull[0] = hull[0].min(x);
+        hull[1] = hull[1].min(y);
+        hull[2] = hull[2].max(x);
+        hull[3] = hull[3].max(y);
+    }
+    hull
+}
+
+/// The hull around two runs' hulls: known only when both are.
+pub(crate) fn union_hulls(a: Option<[f32; 4]>, b: Option<[f32; 4]>) -> Option<[f32; 4]> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some([a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]),
+        _ => None,
+    }
+}
+
 /// Multiply two 2D transformation matrices
 /// Matrix format: [a, b, c, d, e, f] representing:
 /// | a  b  0 |
@@ -1284,6 +1332,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
+            let mut hull = first.hull;
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
@@ -1363,6 +1412,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
+                hull = union_hulls(hull, next.hull);
                 let next_end = next.x + effective_merge_width(next);
                 end_x = if *preserve_stream_order {
                     end_x.max(next_end)
@@ -1373,6 +1423,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             }
 
             merged.push(TextItem {
+                hull,
                 text,
                 x: first.x,
                 y: first.y,
@@ -1490,6 +1541,7 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                             let raised = item.y > parent.y + parent.font_size * 0.1;
                             parent.text.push_str(&map_script_digits(&item.text, raised));
                             parent.width = (item.x + item.width) - parent.x;
+                            parent.hull = union_hulls(parent.hull, item.hull);
                             continue;
                         }
                     }
@@ -1676,7 +1728,7 @@ mod tests {
     }
 
     fn make_merge_item(text: &str, x: f32, width: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.into(),
             x,
             y: 700.0,
@@ -1935,7 +1987,7 @@ mod tests {
     #[test]
     fn test_group_into_lines() {
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "Hello".into(),
                 x: 100.0,
                 y: 700.0,
@@ -1952,7 +2004,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "World".into(),
                 x: 160.0,
                 y: 700.0,
@@ -1969,7 +2021,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "Next line".into(),
                 x: 100.0,
                 y: 680.0,
@@ -2756,7 +2808,7 @@ mod tests {
     fn test_word_level_items_get_spaces() {
         // Simulate CID font per-word items touching with gap=0
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "the".into(),
                 x: 100.0,
                 y: 500.0,
@@ -2773,7 +2825,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "Prague".into(),
                 x: 119.5,
                 y: 500.0,
@@ -2790,7 +2842,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "Rules".into(),
                 x: 161.5,
                 y: 500.0,
@@ -2818,7 +2870,7 @@ mod tests {
     fn test_single_char_items_still_join() {
         // Per-glyph positioning: single chars should join into words
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "N".into(),
                 x: 100.0,
                 y: 500.0,
@@ -2835,7 +2887,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "A".into(),
                 x: 108.0,
                 y: 500.0,
@@ -2852,7 +2904,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "V".into(),
                 x: 116.0,
                 y: 500.0,
@@ -2882,7 +2934,7 @@ mod tests {
         // separate TextItem. Intra-word gaps are ≈ 0, word gaps ≈ 2.0 at
         // font_size 13.3 (ratio 0.15). Must detect word boundaries correctly.
         fn char_item(ch: &str, x: f32, width: f32) -> TextItem {
-            TextItem {
+            TextItem { hull: None,
                 text: ch.into(),
                 x,
                 y: 719.3,
@@ -2919,7 +2971,7 @@ mod tests {
     fn test_per_glyph_words_not_merged() {
         // Verify multiple words from per-character rendering get spaces between them
         fn char_item(ch: &str, x: f32, width: f32) -> TextItem {
-            TextItem {
+            TextItem { hull: None,
                 text: ch.into(),
                 x,
                 y: 705.5,
@@ -2957,7 +3009,7 @@ mod tests {
     fn test_cjk_items_join_without_spaces() {
         // Japanese text items touching at gap=0 should join without spaces
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "である".into(),
                 x: 100.0,
                 y: 500.0,
@@ -2974,7 +3026,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "履行義務".into(),
                 x: 124.0,
                 y: 500.0,
@@ -2991,7 +3043,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "を識別す".into(),
                 x: 156.0,
                 y: 500.0,
@@ -3016,7 +3068,7 @@ mod tests {
     }
 
     fn make_item(text: &str, x: f32, y: f32, width: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.into(),
             x,
             y,
@@ -3156,7 +3208,7 @@ mod tests {
     #[test]
     fn test_rtl_line_sorting() {
         let mut items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "\u{05D0}".into(), // alef at x=100
                 x: 100.0,
                 y: 700.0,
@@ -3173,7 +3225,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "\u{05D1}".into(), // bet at x=200 (rightmost)
                 x: 200.0,
                 y: 700.0,
@@ -3200,7 +3252,7 @@ mod tests {
     #[test]
     fn test_ltr_unaffected() {
         let mut items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "Hello".into(),
                 x: 100.0,
                 y: 700.0,
@@ -3217,7 +3269,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "World".into(),
                 x: 200.0,
                 y: 700.0,
@@ -3260,7 +3312,7 @@ mod tests {
             y,
             page,
             adaptive_threshold: 0.10,
-            items: vec![TextItem {
+            items: vec![TextItem { hull: None,
                 text: "text".into(),
                 x,
                 y,
@@ -3307,7 +3359,7 @@ mod tests {
             y,
             page,
             adaptive_threshold: 0.10,
-            items: vec![TextItem {
+            items: vec![TextItem { hull: None,
                 text: "text".into(),
                 x,
                 y,
@@ -3354,7 +3406,7 @@ mod tests {
             y,
             page,
             adaptive_threshold: 0.10,
-            items: vec![TextItem {
+            items: vec![TextItem { hull: None,
                 text: "text".into(),
                 x,
                 y,
@@ -3394,7 +3446,7 @@ mod tests {
     }
 
     fn make_item_fs(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.into(),
             x,
             y,
@@ -3663,4 +3715,5 @@ mod tests {
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
     }
+
 }

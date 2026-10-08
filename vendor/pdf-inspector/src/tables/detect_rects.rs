@@ -3553,7 +3553,7 @@ mod tests {
     use crate::types::ItemType;
 
     fn make_item(text: &str, x: f32, y: f32, font_size: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,
@@ -5254,7 +5254,7 @@ mod tests {
         let mut items: Vec<TextItem> = Vec::new();
         for row in 0..4 {
             for col in 0..3 {
-                items.push(TextItem {
+                items.push(TextItem { hull: None,
                     text: format!("cell{}_{}", row, col),
                     x: 60.0 + col as f32 * 120.0,
                     y: 120.0 + row as f32 * 40.0,
@@ -5566,7 +5566,7 @@ mod tests {
         ];
         let mut items: Vec<TextItem> = Vec::new();
         for col in 0..8 {
-            items.push(TextItem {
+            items.push(TextItem { hull: None,
                 text: format!("hdr{}", col),
                 x: 55.0 + col as f32 * 50.0,
                 y: 655.0,

@@ -505,7 +505,7 @@ fn extract_form_xobject_text_inner(
                                 // inside Form XObjects (common in print-to-PDF
                                 // workflows) aren't silently dropped.
                                 let (x, y, width, height) = image_bbox_from_ctm(&ctm);
-                                items.push(TextItem {
+                                items.push(TextItem { hull: Some([x, y, x + width, y + height]),
                                     text: format!("[Image: {}]", xobj_name),
                                     x,
                                     y,
@@ -678,21 +678,21 @@ fn extract_form_xobject_text_inner(
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         let (x, y) = (combined[4], combined[5]);
-                        let width = if let Some(font_info) = font_widths.get(&current_font) {
-                            if let Some(raw_bytes) = get_operand_bytes(show_operand) {
-                                let w_ts = compute_string_width_ts(
+                        let w_ts_opt = font_widths.get(&current_font).and_then(|font_info| {
+                            get_operand_bytes(show_operand).map(|raw_bytes| {
+                                compute_string_width_ts(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
                                     char_spacing,
                                     word_spacing,
-                                );
-                                text_matrix[4] += w_ts * text_matrix[0];
-                                text_matrix[5] += w_ts * text_matrix[1];
-                                (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])).abs()
-                            } else {
-                                0.0
-                            }
+                                )
+                            })
+                        });
+                        let width = if let Some(w_ts) = w_ts_opt {
+                            text_matrix[4] += w_ts * text_matrix[0];
+                            text_matrix[5] += w_ts * text_matrix[1];
+                            (w_ts * (text_matrix[0] * ctm[0] + text_matrix[1] * ctm[2])).abs()
                         } else {
                             0.0
                         };
@@ -721,7 +721,7 @@ fn extract_form_xobject_text_inner(
                                     *rtl_logical_ops += 1;
                                 }
                             }
-                            items.push(TextItem {
+                            items.push(TextItem { hull: Some(super::run_hull(&combined, w_ts_opt.unwrap_or(0.0), current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -925,7 +925,7 @@ fn extract_form_xobject_text_inner(
                                         rtl_visual_candidates.push(items.len());
                                     }
                                 }
-                                items.push(TextItem {
+                                items.push(TextItem { hull: Some(super::run_hull(&combined_mat, if font_info.is_some() { end_w - start_w } else { 0.0 }, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
                                     text: expand_ligatures(text),
                                     x,
                                     y,

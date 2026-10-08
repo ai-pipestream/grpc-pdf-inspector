@@ -834,7 +834,7 @@ mod ocr_header_footer_tests {
     use super::*;
 
     fn item(page: u32, text: &str, y: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x: 10.0,
             y,
@@ -5417,7 +5417,7 @@ mod text_cluster_column_undercount_tests {
     use crate::types::ItemType;
 
     fn item(x: f32, y: f32, text: &str) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,
@@ -5694,7 +5694,7 @@ mod table_candidate_selection_tests {
     }
 
     fn item_at(text: &str, x: f32, y: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,
@@ -6529,7 +6529,7 @@ mod tests {
     use crate::types::ItemType;
 
     fn test_item(text: &str, x: f32, y: f32, width: f32, height: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,
@@ -6549,14 +6549,14 @@ mod tests {
     }
 
     fn test_text_item_on_page(page: u32, text: &str) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             page,
             ..test_item(text, 10.0, 10.0, text.len() as f32 * 5.0, 12.0)
         }
     }
 
     fn test_image_item(width: f32, height: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             item_type: ItemType::Image,
             ..test_item("[Image]", 20.0, 30.0, width, height)
         }
