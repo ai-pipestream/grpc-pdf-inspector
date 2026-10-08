@@ -2829,6 +2829,9 @@ fn split_item_into_token_subitems(item: &TextItem) -> Vec<TextItem> {
             sub.text = text;
             sub.x = item.x + start_idx as f32 * char_w;
             sub.width = (end_idx - start_idx) as f32 * char_w;
+            // The token's extent is an estimate of its own; the parent's
+            // hull would cover the whole line.
+            sub.hull = None;
             tokens.push(sub);
         };
 

@@ -47,6 +47,18 @@ impl FieldWalkBudget {
     }
 }
 
+/// An annotation rectangle as a hull: the rectangle is user space already,
+/// so this is the normalized box, which a caller placing the item on a
+/// turned page needs because the walk's own frame never touches it.
+fn rect_hull(x: f32, y: f32, width: f32, height: f32) -> [f32; 4] {
+    [
+        x.min(x + width),
+        y.min(y + height),
+        x.max(x + width),
+        y.max(y + height),
+    ]
+}
+
 pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> Vec<TextItem> {
     let mut links = Vec::new();
 
@@ -107,7 +119,8 @@ pub fn extract_page_links(doc: &Document, page_id: ObjectId, page_num: u32) -> V
                     let uri = extract_link_uri(doc, annot_dict);
 
                     if let (Some((x, y, width, height)), Some(url)) = (rect, uri) {
-                        links.push(TextItem { hull: None,
+                        links.push(TextItem {
+                            hull: Some(rect_hull(x, y, width, height)),
                             text: url.clone(),
                             x,
                             y,
@@ -441,7 +454,8 @@ pub(crate) fn walk_form_fields(
         format!("{}: {}", full_name, value_str)
     };
 
-    items.push(TextItem { hull: None,
+    items.push(TextItem {
+        hull: Some(rect_hull(x, y, width, height)),
         text,
         x,
         y,

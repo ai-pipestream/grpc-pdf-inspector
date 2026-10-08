@@ -475,6 +475,14 @@ pub(crate) fn parse_type0_widths(
             250
         });
 
+    // Vertical writing: the predefined Identity-V CMap, or a CMap stream
+    // that declares WMode 1 (read from the font dictionary when a producer
+    // copies it there, as some do).
+    let vertical_encoding = font_dict
+        .get(b"Encoding")
+        .ok()
+        .and_then(|o| o.as_name().ok())
+        .is_some_and(|name| name.ends_with(b"-V"));
     let wmode = font_dict
         .get(b"WMode")
         .ok()
@@ -482,7 +490,7 @@ pub(crate) fn parse_type0_widths(
             Object::Integer(n) => Some(*n as u8),
             _ => None,
         })
-        .unwrap_or(0);
+        .unwrap_or(u8::from(vertical_encoding));
 
     Some(FontWidthInfo {
         widths,

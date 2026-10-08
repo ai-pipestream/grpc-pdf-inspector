@@ -78,8 +78,11 @@ The private APIs, and what each unblocks:
     crate's own. The combined matrix the walker had at the show operator
     was thrown away. `TextItem.hull` is the axis-aligned box of the glyph
     frame in user space, from that matrix, kept out of the correction's
-    way; image placements carry theirs the same way and merged runs the
-    union of their parts.
+    way; image placements carry theirs the same way, merged runs the
+    union of their parts, and link annotations and form fields their
+    rectangle. A TJ segment's hull covers the furthest the pen went either
+    way inside it. No hull is measured where the model is not followed in
+    full: a font with no widths, a vertical font (Identity-V, WMode 1).
 11. **Each page's boxes and rotation** (`src/types.rs`,
     `src/extractor/mod.rs`). The walk had the page dictionary open and
     read neither its boxes nor its `/Rotate`.
@@ -117,9 +120,18 @@ reasons in `docs/capture-deferrals.md`.
   The neighbouring-page clip kept short fragments outside the crop box
   because their coordinates could not be trusted. With the hull measured
   from the full matrix they can be: a run, image or form placement whose
-  hull lies entirely outside the crop box (media box when there is none),
+  hull lies entirely outside the visible box (the crop box cut to the
+  media box, the media box when they do not meet or there is no crop box),
   past the clip's six points of grace, is dropped before the markdown is
-  rendered. A page whose runs are an adopted OCR layer is left alone.
+  rendered. A run with no hull is never dropped, nor is one continuing an
+  on-page line pen to pen on the same baseline. A page whose runs are an
+  adopted OCR layer is left alone.
+- **Horizontal scaling is applied** (`src/extractor/content_stream.rs`,
+  `src/extractor/xobjects.rs`). `Tz` was never read, so a run set at 50 Tz
+  advanced twice as far as drawn and every TJ offset after it landed twice
+  as far off. The factor now scales every glyph advance, the Tc and Tw
+  spacing and every TJ offset, in both walkers, and is saved and restored
+  with q and Q.
 - **Decoding is bounded** (`src/guard.rs`, and every decoding call site).
   Every stream the crate decodes goes through the guard module, which holds
   it to a per-stream ceiling and a per-run budget, loads documents with the

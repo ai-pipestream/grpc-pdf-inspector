@@ -321,6 +321,7 @@ pub(crate) fn extract_page_text_items_with_forms(
         word_spacing: f32,
         text_rise: f32,
         text_leading: f32,
+        horizontal_scale: f32,
         current_font: String,
         current_font_size: f32,
     }
@@ -333,6 +334,7 @@ pub(crate) fn extract_page_text_items_with_forms(
     let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
     let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
     let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift for super/subscripts, unscaled)
+    let mut horizontal_scale: f32 = 1.0; // Tz parameter as a factor: every advance and TJ offset scales by it
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
@@ -376,6 +378,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                     word_spacing,
                     text_rise,
                     text_leading,
+                    horizontal_scale,
                     current_font: current_font.clone(),
                     current_font_size,
                 });
@@ -390,6 +393,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                     word_spacing = saved.word_spacing;
                     text_rise = saved.text_rise;
                     text_leading = saved.text_leading;
+                    horizontal_scale = saved.horizontal_scale;
                     current_font = saved.current_font;
                     current_font_size = saved.current_font_size;
                 }
@@ -470,6 +474,15 @@ pub(crate) fn extract_page_text_items_with_forms(
                     text_rise = ts;
                 }
             }
+            "Tz" => {
+                // Horizontal scaling, a percentage: it scales every glyph
+                // advance, the Tc and Tw spacing and every TJ offset.
+                if let Some(tz) = op.operands.first().and_then(get_number) {
+                    if tz > 0.0 {
+                        horizontal_scale = tz / 100.0;
+                    }
+                }
+            }
             "Td" | "TD" => {
                 // Move text position: TLM = T(tx,ty) × TLM; Tm = TLM
                 // tx,ty are in text space — must be scaled by the text line matrix
@@ -511,7 +524,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
                         get_operand_bytes(&op.operands[0]).map(|raw| {
-                            compute_string_width_ts(
+                            horizontal_scale * compute_string_width_ts(
                                 raw,
                                 fi,
                                 current_font_size,
@@ -610,7 +623,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     }
                                 }
                             }
-                            items.push(TextItem { hull: Some(super::run_hull(&combined, w_ts_opt.unwrap_or(0.0), current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
+                            items.push(TextItem { hull: super::run_hull_if_known(font_widths.get(&current_font), w_ts_opt, &combined, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0)),
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -652,11 +665,6 @@ pub(crate) fn extract_page_text_items_with_forms(
                         }
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
-                        // Capture first-glyph position for ActualText
-                        if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
-                            actual_text_glyph_tm = Some(text_matrix);
-                            actual_text_glyph_rise = Some(text_rise);
-                        }
 
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
@@ -669,11 +677,16 @@ pub(crate) fn extract_page_text_items_with_forms(
                         let column_gap_threshold = space_threshold * 4.0;
 
                         // Track sub-items for column-gap splitting:
-                        // (text, start_width_ts, end_width_ts)
-                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
+                        // (text, start_width_ts, end_width_ts, min_width_ts, max_width_ts),
+                        // the last two the furthest the pen went either way
+                        // while the segment was open, which is what the
+                        // segment's glyphs cover when an offset backtracks.
+                        let mut sub_items: Vec<(String, f32, f32, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        let mut sub_min_width_ts: f32 = 0.0;
+                        let mut sub_max_width_ts: f32 = 0.0;
                         // Positive TJ offsets beyond a space width move the pen
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
@@ -682,7 +695,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
-                                    let displacement = -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0 * current_font_size * horizontal_scale;
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -701,11 +714,17 @@ pub(crate) fn extract_page_text_items_with_forms(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            sub_min_width_ts,
+                                            sub_max_width_ts,
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_min_width_ts = total_width_ts;
+                                        sub_max_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                        sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
                                         // A displacement before the segment's
                                         // first glyph moves the pen, and so the
                                         // segment's origin, before anything is
@@ -713,6 +732,8 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         // dozen ems to the left of the pen.
                                         if current_text.is_empty() {
                                             sub_start_width_ts = total_width_ts;
+                                            sub_min_width_ts = total_width_ts;
+                                            sub_max_width_ts = total_width_ts;
                                         }
                                         if !is_invisible
                                             && n_val < -space_threshold
@@ -726,7 +747,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                 }
                                 Object::Real(n) => {
                                     let n_val = *n;
-                                    let displacement = -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0 * current_font_size * horizontal_scale;
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -744,11 +765,17 @@ pub(crate) fn extract_page_text_items_with_forms(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            sub_min_width_ts,
+                                            sub_max_width_ts,
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_min_width_ts = total_width_ts;
+                                        sub_max_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                        sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
                                         // A displacement before the segment's
                                         // first glyph moves the pen, and so the
                                         // segment's origin, before anything is
@@ -756,6 +783,8 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         // dozen ems to the left of the pen.
                                         if current_text.is_empty() {
                                             sub_start_width_ts = total_width_ts;
+                                            sub_min_width_ts = total_width_ts;
+                                            sub_max_width_ts = total_width_ts;
                                         }
                                         if !is_invisible
                                             && n_val < -space_threshold
@@ -769,15 +798,31 @@ pub(crate) fn extract_page_text_items_with_forms(
                                 }
                                 _ => {}
                             }
+                            // The first glyph of an ActualText span is where
+                            // the pen is when the string is shown, after any
+                            // offset at the head of the array.
+                            if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
+                                actual_text_glyph_tm = Some([
+                                    text_matrix[0],
+                                    text_matrix[1],
+                                    text_matrix[2],
+                                    text_matrix[3],
+                                    text_matrix[4] + total_width_ts * text_matrix[0],
+                                    text_matrix[5] + total_width_ts * text_matrix[1],
+                                ]);
+                                actual_text_glyph_rise = Some(text_rise);
+                            }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
-                                    total_width_ts += compute_string_width_ts(
+                                    total_width_ts += horizontal_scale * compute_string_width_ts(
                                         raw_bytes,
                                         fi,
                                         current_font_size,
                                         char_spacing,
                                         word_spacing,
                                     );
+                                    sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                    sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
                                 }
                             }
                             if !is_invisible {
@@ -799,7 +844,13 @@ pub(crate) fn extract_page_text_items_with_forms(
                         }
                         // Flush remaining text
                         if !is_invisible && !current_text.trim().is_empty() {
-                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                            sub_items.push((
+                                current_text,
+                                sub_start_width_ts,
+                                total_width_ts,
+                                sub_min_width_ts,
+                                sub_max_width_ts,
+                            ));
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
@@ -828,7 +879,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w) in &sub_items {
+                            for (text, start_w, end_w, min_w, max_w) in &sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -839,6 +890,16 @@ pub(crate) fn extract_page_text_items_with_forms(
                                 ];
                                 let combined =
                                     multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
+                                let hull_tm = [
+                                    text_matrix[0],
+                                    text_matrix[1],
+                                    text_matrix[2],
+                                    text_matrix[3],
+                                    text_matrix[4] + min_w * text_matrix[0],
+                                    text_matrix[5] + min_w * text_matrix[1],
+                                ];
+                                let hull_m =
+                                    multiply_matrices(&rise_adjusted(&hull_tm, text_rise), &ctm);
                                 let (x, y) = (combined[4], combined[5]);
                                 let width = if font_info.is_some() {
                                     ((end_w - start_w) * scale_x).abs()
@@ -859,7 +920,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         rtl_visual_candidates.push(items.len());
                                     }
                                 }
-                                items.push(TextItem { hull: Some(super::run_hull(&combined, if font_info.is_some() { end_w - start_w } else { 0.0 }, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
+                                items.push(TextItem { hull: super::run_hull_if_known(font_info, font_info.map(|_| max_w - min_w), &hull_m, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0)),
                                     text: expand_ligatures(text),
                                     x,
                                     y,
@@ -911,7 +972,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                 // rejects it (`is_underline_candidate` needs width > 0).
                 let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
                     op.operands.first().and_then(get_operand_bytes).map(|raw| {
-                        compute_string_width_ts(
+                        horizontal_scale * compute_string_width_ts(
                             raw,
                             fi,
                             current_font_size,
@@ -980,7 +1041,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     rtl_logical_ops += 1;
                                 }
                             }
-                            items.push(TextItem { hull: Some(super::run_hull(&combined, w_ts_opt.unwrap_or(0.0), current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
+                            items.push(TextItem { hull: super::run_hull_if_known(font_widths.get(&current_font), w_ts_opt, &combined, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0)),
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -2344,6 +2405,27 @@ end"#;
         let items = extract_simple_items(b"BT /F1 10 Tf 1 0 0 1 100 700 Tm (AB) Tj ET");
         let run = find_item(&items, "AB");
         assert_eq!(run.hull, Some([100.0, 700.0, 112.0, 710.0]));
+    }
+
+    #[test]
+    fn rise_spacing_and_scaling_shape_the_hull() {
+        // Ts lifts the glyph frame; Tc adds after every glyph and Tw after
+        // every space; Tz scales the advance.
+        let items = extract_simple_items(b"BT /F1 10 Tf 1 0 0 1 100 700 Tm 5 Ts (AB) Tj ET");
+        assert_eq!(find_item(&items, "AB").hull, Some([100.0, 705.0, 112.0, 715.0]));
+        let items = extract_simple_items(b"BT /F1 10 Tf 1 0 0 1 100 700 Tm 2 Tc 5 Tw (A B) Tj ET");
+        // 3 glyphs of 6, 3 times Tc, one Tw: 29.
+        let hull = find_item(&items, "A B").hull.unwrap();
+        assert!((hull[2] - 129.0).abs() < 0.05, "{hull:?}");
+        let items = extract_simple_items(b"BT /F1 10 Tf 50 Tz 1 0 0 1 100 700 Tm (AB) Tj ET");
+        let run = find_item(&items, "AB");
+        assert_eq!(run.hull, Some([100.0, 700.0, 106.0, 710.0]));
+        assert!((run.width - 6.0).abs() < 0.05, "{run:?}");
+        // q/Q scopes it like the rest of the text state.
+        let items = extract_simple_items(
+            b"q 50 Tz Q BT /F1 10 Tf 1 0 0 1 100 700 Tm (AB) Tj ET",
+        );
+        assert_eq!(find_item(&items, "AB").hull, Some([100.0, 700.0, 112.0, 710.0]));
     }
 
     #[test]

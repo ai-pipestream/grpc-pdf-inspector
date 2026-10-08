@@ -418,6 +418,7 @@ fn extract_form_xobject_text_inner(
     let mut text_leading: f32 = 0.0; // TL parameter (text-space units)
     let mut char_spacing: f32 = 0.0; // Tc parameter
     let mut word_spacing: f32 = 0.0; // Tw parameter
+    let mut horizontal_scale: f32 = 1.0; // Tz parameter as a factor
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
@@ -430,6 +431,7 @@ fn extract_form_xobject_text_inner(
         char_spacing: f32,
         word_spacing: f32,
         text_leading: f32,
+        horizontal_scale: f32,
         current_font: String,
         current_font_size: f32,
         fill_is_white: bool,
@@ -447,6 +449,7 @@ fn extract_form_xobject_text_inner(
                     char_spacing,
                     word_spacing,
                     text_leading,
+                    horizontal_scale,
                     current_font: current_font.clone(),
                     current_font_size,
                     fill_is_white,
@@ -458,6 +461,7 @@ fn extract_form_xobject_text_inner(
                     char_spacing = saved.char_spacing;
                     word_spacing = saved.word_spacing;
                     text_leading = saved.text_leading;
+                    horizontal_scale = saved.horizontal_scale;
                     current_font = saved.current_font;
                     current_font_size = saved.current_font_size;
                     fill_is_white = saved.fill_is_white;
@@ -548,6 +552,13 @@ fn extract_form_xobject_text_inner(
                 // Set text leading (used by T*, ', and ")
                 if let Some(tl) = op.operands.first().and_then(get_number) {
                     text_leading = tl;
+                }
+            }
+            "Tz" => {
+                if let Some(tz) = op.operands.first().and_then(get_number) {
+                    if tz > 0.0 {
+                        horizontal_scale = tz / 100.0;
+                    }
                 }
             }
             "Tc" => {
@@ -649,7 +660,7 @@ fn extract_form_xobject_text_inner(
                     if fill_is_white {
                         if let Some(font_info) = font_widths.get(&current_font) {
                             if let Some(raw_bytes) = get_operand_bytes(show_operand) {
-                                let w_ts = compute_string_width_ts(
+                                let w_ts = horizontal_scale * compute_string_width_ts(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
@@ -680,7 +691,7 @@ fn extract_form_xobject_text_inner(
                         let (x, y) = (combined[4], combined[5]);
                         let w_ts_opt = font_widths.get(&current_font).and_then(|font_info| {
                             get_operand_bytes(show_operand).map(|raw_bytes| {
-                                compute_string_width_ts(
+                                horizontal_scale * compute_string_width_ts(
                                     raw_bytes,
                                     font_info,
                                     current_font_size,
@@ -721,7 +732,7 @@ fn extract_form_xobject_text_inner(
                                     *rtl_logical_ops += 1;
                                 }
                             }
-                            items.push(TextItem { hull: Some(super::run_hull(&combined, w_ts_opt.unwrap_or(0.0), current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
+                            items.push(TextItem { hull: super::run_hull_if_known(font_widths.get(&current_font), w_ts_opt, &combined, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0)),
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -761,10 +772,12 @@ fn extract_form_xobject_text_inner(
                         };
                         let column_gap_threshold = space_threshold * 4.0;
 
-                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
+                        let mut sub_items: Vec<(String, f32, f32, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        let mut sub_min_width_ts: f32 = 0.0;
+                        let mut sub_max_width_ts: f32 = 0.0;
                         // Positive TJ offsets beyond a space width move the pen
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
@@ -773,7 +786,7 @@ fn extract_form_xobject_text_inner(
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
-                                    let displacement = -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0 * current_font_size * horizontal_scale;
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -791,11 +804,17 @@ fn extract_form_xobject_text_inner(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            sub_min_width_ts,
+                                            sub_max_width_ts,
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_min_width_ts = total_width_ts;
+                                        sub_max_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                        sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
                                         // A displacement before the segment's
                                         // first glyph moves the pen, and so the
                                         // segment's origin, before anything is
@@ -803,6 +822,8 @@ fn extract_form_xobject_text_inner(
                                         // dozen ems to the left of the pen.
                                         if current_text.is_empty() {
                                             sub_start_width_ts = total_width_ts;
+                                            sub_min_width_ts = total_width_ts;
+                                            sub_max_width_ts = total_width_ts;
                                         }
                                         if !fill_is_white
                                             && n_val < -space_threshold
@@ -816,7 +837,7 @@ fn extract_form_xobject_text_inner(
                                 }
                                 Object::Real(n) => {
                                     let n_val = *n;
-                                    let displacement = -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0 * current_font_size * horizontal_scale;
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -834,11 +855,17 @@ fn extract_form_xobject_text_inner(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            sub_min_width_ts,
+                                            sub_max_width_ts,
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_min_width_ts = total_width_ts;
+                                        sub_max_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                        sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
                                         // A displacement before the segment's
                                         // first glyph moves the pen, and so the
                                         // segment's origin, before anything is
@@ -846,6 +873,8 @@ fn extract_form_xobject_text_inner(
                                         // dozen ems to the left of the pen.
                                         if current_text.is_empty() {
                                             sub_start_width_ts = total_width_ts;
+                                            sub_min_width_ts = total_width_ts;
+                                            sub_max_width_ts = total_width_ts;
                                         }
                                         if !fill_is_white
                                             && n_val < -space_threshold
@@ -861,13 +890,15 @@ fn extract_form_xobject_text_inner(
                             }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
-                                    total_width_ts += compute_string_width_ts(
+                                    total_width_ts += horizontal_scale * compute_string_width_ts(
                                         raw_bytes,
                                         fi,
                                         current_font_size,
                                         char_spacing,
                                         word_spacing,
                                     );
+                                    sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                    sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
                                 }
                             }
                             if !fill_is_white {
@@ -888,7 +919,13 @@ fn extract_form_xobject_text_inner(
                             }
                         }
                         if !fill_is_white && !current_text.trim().is_empty() {
-                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                            sub_items.push((
+                                current_text,
+                                sub_start_width_ts,
+                                total_width_ts,
+                                sub_min_width_ts,
+                                sub_max_width_ts,
+                            ));
                         }
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
@@ -911,7 +948,7 @@ fn extract_form_xobject_text_inner(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w) in &sub_items {
+                            for (text, start_w, end_w, min_w, max_w) in &sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -921,6 +958,15 @@ fn extract_form_xobject_text_inner(
                                     text_matrix[5] + start_w * text_matrix[1],
                                 ];
                                 let combined_mat = multiply_matrices(&offset_tm, &ctm);
+                                let hull_tm = [
+                                    text_matrix[0],
+                                    text_matrix[1],
+                                    text_matrix[2],
+                                    text_matrix[3],
+                                    text_matrix[4] + min_w * text_matrix[0],
+                                    text_matrix[5] + min_w * text_matrix[1],
+                                ];
+                                let hull_m = multiply_matrices(&hull_tm, &ctm);
                                 let (x, y) = (combined_mat[4], combined_mat[5]);
                                 let width = if font_info.is_some() {
                                     ((end_w - start_w) * scale_x).abs()
@@ -941,7 +987,7 @@ fn extract_form_xobject_text_inner(
                                         rtl_visual_candidates.push(items.len());
                                     }
                                 }
-                                items.push(TextItem { hull: Some(super::run_hull(&combined_mat, if font_info.is_some() { end_w - start_w } else { 0.0 }, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
+                                items.push(TextItem { hull: super::run_hull_if_known(font_info, font_info.map(|_| max_w - min_w), &hull_m, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0)),
                                     text: expand_ligatures(text),
                                     x,
                                     y,
