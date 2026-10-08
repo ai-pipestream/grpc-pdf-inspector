@@ -286,7 +286,7 @@ fn page_box(doc: &Document, page_id: ObjectId) -> PageBox {
     let normalized = |v: Vec<f32>| [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])];
     let rotation = inherited_page_attribute(doc, page_id, b"Rotate").and_then(|obj| match obj {
         Object::Integer(i) => Some(*i),
-        Object::Real(r) => Some(*r as i64),
+        Object::Real(r) => Some(r.round() as i64),
         _ => None,
     });
     PageBox {
@@ -3895,6 +3895,11 @@ mod tests {
         /// A Type3 font to add as `T3`, given its glyph procedure stream
         /// as `CharProcs /square` by the builder.
         type3: Option<lopdf::Dictionary>,
+        /// A font built against the document (for one that needs objects
+        /// of its own, such as a CMap stream): (name, builder).
+        font_builder: Option<(String, Box<dyn FnOnce(&mut Document) -> lopdf::Dictionary>)>,
+        /// `/Rotate` as any object, overriding `rotate`.
+        rotate_object: Option<lopdf::Object>,
     }
 
     impl Fixture {
@@ -3909,6 +3914,8 @@ mod tests {
                 xobjects: Vec::new(),
                 widths: true,
                 type3: None,
+                font_builder: None,
+                rotate_object: None,
             }
         }
 
@@ -3930,6 +3937,11 @@ mod tests {
             let font_id = doc.add_object(f1);
             let mut font_resources = dictionary! { "F1" => font_id };
             for (name, font) in self.fonts {
+                let id = doc.add_object(font);
+                font_resources.set(name.as_bytes().to_vec(), id);
+            }
+            if let Some((name, build)) = self.font_builder {
+                let font = build(&mut doc);
                 let id = doc.add_object(font);
                 font_resources.set(name.as_bytes().to_vec(), id);
             }
@@ -3970,6 +3982,9 @@ mod tests {
                 page.set("CropBox", crop.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>());
             }
             if let Some(rotate) = self.rotate {
+                page.set("Rotate", rotate);
+            }
+            if let Some(rotate) = self.rotate_object {
                 page.set("Rotate", rotate);
             }
             let page_id = doc.add_object(page);
@@ -4073,6 +4088,88 @@ mod tests {
             "the run past the model's edge stays: {:?}",
             texts_of(&items)
         );
+    }
+
+    /// A Type0 font over an embedded CMap stream; `wmode_in_dict` puts
+    /// `/WMode 1` in the stream dictionary, else only the body says it.
+    fn vertical_cmap_font(doc: &mut Document, wmode_in_dict: bool) -> lopdf::Dictionary {
+        use lopdf::{dictionary, Object, Stream};
+        let body = b"%!PS-Adobe-3.0 Resource-CMap\n/CIDInit /ProcSet findresource begin\n\
+12 dict begin\nbegincmap\n/CMapName /TestV def\n/WMode 1 def\n\
+1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+1 begincidrange\n<0000> <FFFF> 0\nendcidrange\nendcmap\n\
+CMapName currentdict /CMap defineresource pop\nend end\n"
+            .to_vec();
+        let mut dict = dictionary! { "Type" => "CMap", "CMapName" => "TestV" };
+        if wmode_in_dict {
+            dict.set("WMode", 1);
+        }
+        let cmap = doc.add_object(Stream::new(dict, body));
+        let cid_font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "Vertical",
+            "CIDSystemInfo" => dictionary! { "Registry" => "Adobe", "Ordering" => "Identity", "Supplement" => 0 },
+            "DW" => 1000,
+        };
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "Vertical",
+            "Encoding" => cmap,
+            "DescendantFonts" => vec![Object::Dictionary(cid_font)],
+        }
+    }
+
+    #[test]
+    fn an_embedded_vertical_cmap_keeps_its_runs_and_measures_no_hull() {
+        for wmode_in_dict in [true, false] {
+            let mut fixture = Fixture::new(
+                "BT /FV 20 Tf 1 0 0 1 560 760 Tm [<00410042004300440045004600470048> -3000 <00490049>] TJ ET",
+            );
+            fixture.font_builder = Some((String::from("FV"), Box::new(move |doc| vertical_cmap_font(doc, wmode_in_dict))));
+            let items = runs_of(&fixture.bytes());
+            assert!(!items.is_empty(), "the vertical runs are read (WMode in dict: {wmode_in_dict})");
+            assert!(items.iter().all(|item| item.hull.is_none()), "{items:?}");
+            assert!(
+                items.iter().any(|item| item.text.contains("II")),
+                "the run past the model's edge stays (WMode in dict: {wmode_in_dict}): {:?}",
+                texts_of(&items)
+            );
+        }
+    }
+
+    #[test]
+    fn a_form_inherits_the_horizontal_scaling_of_its_caller() {
+        use lopdf::{dictionary, Stream};
+        // 50 Tz set on the page is graphics state the form runs in: the
+        // form's ten glyphs and 200-point offset put "tail" at
+        // 300 + (60 + 200) / 2 = 430, on the page.
+        let form = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            },
+            b"BT /F1 10 Tf 1 0 0 1 300 700 Tm [(ABCDEFGHIJ) -20000 (tail)] TJ ET".to_vec(),
+        );
+        let mut fixture = Fixture::new("BT 50 Tz ET q /Fx Do Q");
+        fixture.xobjects.push(("Fx".to_owned(), form));
+        let items = runs_of(&fixture.bytes());
+        let tail = run(&items, "tail");
+        assert!((tail.x - 430.0).abs() < 0.05, "{tail:?}");
+        assert!(close(tail.hull.unwrap(), [430.0, 700.0, 442.0, 710.0]), "{:?}", tail.hull);
+    }
+
+    #[test]
+    fn a_real_rotation_is_rounded_as_the_metadata_reader_rounds_it() {
+        use lopdf::Object;
+        let mut fixture = Fixture::new("BT /F1 10 Tf 1 0 0 1 100 300 Tm (turned) Tj ET");
+        fixture.rotate_object = Some(Object::Real(269.5));
+        let bytes = fixture.bytes();
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        assert_eq!(extraction.page_boxes[&1].rotation, 270);
     }
 
     #[test]

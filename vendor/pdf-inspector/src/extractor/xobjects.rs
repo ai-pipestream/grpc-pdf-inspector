@@ -229,6 +229,7 @@ pub(crate) fn extract_form_xobject_text(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    inherited: InheritedTextState,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     budget: &mut FormWalkBudget,
@@ -240,11 +241,33 @@ pub(crate) fn extract_form_xobject_text(
         page_num,
         font_cmaps,
         parent_ctm,
+        inherited,
         cmap_decisions,
         style_cache,
         0,
         budget,
     )
+}
+
+/// The text state a form inherits from the stream that invokes it: the
+/// spacing and scaling parameters are graphics state, and a form runs in
+/// its caller's. The font is not carried over, because its tag names a
+/// resource in the caller's dictionary, not the form's.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct InheritedTextState {
+    pub char_spacing: f32,
+    pub word_spacing: f32,
+    pub horizontal_scale: f32,
+}
+
+impl Default for InheritedTextState {
+    fn default() -> Self {
+        Self {
+            char_spacing: 0.0,
+            word_spacing: 0.0,
+            horizontal_scale: 1.0,
+        }
+    }
 }
 
 /// The `/BBox` of a form dictionary as four numbers, when it carries one.
@@ -283,6 +306,7 @@ fn extract_form_xobject_text_inner(
     page_num: u32,
     font_cmaps: &FontCMaps,
     parent_ctm: &[f32; 6],
+    inherited: InheritedTextState,
     cmap_decisions: &mut CMapDecisionCache,
     style_cache: &mut FontStyleCache,
     depth: u8,
@@ -416,9 +440,9 @@ fn extract_form_xobject_text_inner(
     // current line, not to the position left by the last show operator.
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut text_leading: f32 = 0.0; // TL parameter (text-space units)
-    let mut char_spacing: f32 = 0.0; // Tc parameter
-    let mut word_spacing: f32 = 0.0; // Tw parameter
-    let mut horizontal_scale: f32 = 1.0; // Tz parameter as a factor
+    let mut char_spacing: f32 = inherited.char_spacing; // Tc parameter
+    let mut word_spacing: f32 = inherited.word_spacing; // Tw parameter
+    let mut horizontal_scale: f32 = inherited.horizontal_scale; // Tz parameter as a factor
     let mut in_text_block = false;
     let mut fill_is_white = false;
     let mut ctm = base_ctm;
@@ -490,6 +514,11 @@ fn extract_form_xobject_text_inner(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        InheritedTextState {
+                                            char_spacing,
+                                            word_spacing,
+                                            horizontal_scale,
+                                        },
                                         cmap_decisions,
                                         style_cache,
                                         depth + 1,
@@ -1167,6 +1196,7 @@ mod tests {
             1,
             &FontCMaps::from_doc(doc),
             &[1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+            InheritedTextState::default(),
             &mut CMapDecisionCache::new(),
             &mut FontStyleCache::new(),
             budget,

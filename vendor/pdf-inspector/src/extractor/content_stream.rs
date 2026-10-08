@@ -19,7 +19,9 @@ use super::fonts::{
     CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
-use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
+use super::xobjects::{
+    extract_form_xobject_text, get_page_xobjects, FormWalkBudget, InheritedTextState, XObjectType,
+};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
@@ -1117,6 +1119,11 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        InheritedTextState {
+                                            char_spacing,
+                                            word_spacing,
+                                            horizontal_scale,
+                                        },
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,

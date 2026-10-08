@@ -82,7 +82,8 @@ The private APIs, and what each unblocks:
     union of their parts, and link annotations and form fields their
     rectangle. A TJ segment's hull covers the furthest the pen went either
     way inside it. No hull is measured where the model is not followed in
-    full: a font with no widths, a vertical font (Identity-V, WMode 1).
+    full: a font with no widths, a vertical font (a `-V` CMap name, an
+    embedded CMap stream saying `/WMode 1` in its dictionary or its body).
 11. **Each page's boxes and rotation** (`src/types.rs`,
     `src/extractor/mod.rs`). The walk had the page dictionary open and
     read neither its boxes nor its `/Rotate`.
@@ -131,7 +132,8 @@ reasons in `docs/capture-deferrals.md`.
   advanced twice as far as drawn and every TJ offset after it landed twice
   as far off. The factor now scales every glyph advance, the Tc and Tw
   spacing and every TJ offset, in both walkers, and is saved and restored
-  with q and Q.
+  with q and Q. A Form XObject starts in its caller's Tz, Tc and Tw, as
+  the graphics state it runs in says.
 - **Decoding is bounded** (`src/guard.rs`, and every decoding call site).
   Every stream the crate decodes goes through the guard module, which holds
   it to a per-stream ceiling and a per-run budget, loads documents with the

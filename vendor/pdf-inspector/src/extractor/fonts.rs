@@ -428,6 +428,23 @@ pub(crate) fn parse_simple_font_widths(
     })
 }
 
+/// Whether an embedded CMap stream writes vertically: its dictionary's
+/// `/WMode`, or failing that the `/WMode 1 def` in its body.
+fn cmap_stream_is_vertical(stream: &lopdf::Stream) -> bool {
+    match stream.dict.get(b"WMode") {
+        Ok(Object::Integer(mode)) => return *mode == 1,
+        Ok(Object::Real(mode)) => return *mode == 1.0,
+        _ => {}
+    }
+    let Ok(body) = crate::guard::inflate(stream) else {
+        return false;
+    };
+    let body = String::from_utf8_lossy(&body);
+    body.split("/WMode")
+        .skip(1)
+        .any(|rest| rest.trim_start().starts_with('1'))
+}
+
 /// Parse widths for Type0 (composite/CID) fonts
 /// Reads DescendantFonts → CIDFont → W array and DW value
 pub(crate) fn parse_type0_widths(
@@ -475,14 +492,20 @@ pub(crate) fn parse_type0_widths(
             250
         });
 
-    // Vertical writing: the predefined Identity-V CMap, or a CMap stream
-    // that declares WMode 1 (read from the font dictionary when a producer
-    // copies it there, as some do).
-    let vertical_encoding = font_dict
-        .get(b"Encoding")
-        .ok()
-        .and_then(|o| o.as_name().ok())
-        .is_some_and(|name| name.ends_with(b"-V"));
+    // Vertical writing: a predefined CMap named `-V`, an embedded CMap
+    // stream whose dictionary says `/WMode 1`, or one whose body says
+    // `/WMode 1 def`; the font dictionary's own `/WMode`, where a producer
+    // copied it, counts too.
+    let vertical_encoding = match font_dict.get(b"Encoding").ok() {
+        Some(Object::Name(name)) => name.ends_with(b"-V"),
+        Some(Object::Reference(id)) => match doc.get_object(*id) {
+            Ok(Object::Stream(stream)) => cmap_stream_is_vertical(stream),
+            Ok(Object::Name(name)) => name.ends_with(b"-V"),
+            _ => false,
+        },
+        Some(Object::Stream(stream)) => cmap_stream_is_vertical(stream),
+        _ => false,
+    };
     let wmode = font_dict
         .get(b"WMode")
         .ok()
