@@ -630,6 +630,52 @@ fn extract_positioned_text_impl_reporting_invisible(
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
+        // A run or image drawn wholly outside the visible box is one no
+        // reader sees: the overflowing right of a display equation, a
+        // producer's hidden tag below the sheet, the facing page of an
+        // imposed spread drawn off the sheet. The heuristic above keeps
+        // short off-box fragments because their coordinates used to be
+        // untrustworthy; the hull is measured from the full matrix, so it
+        // can be trusted, and it is in user space whatever frame the page's
+        // runs were turned into. The same six points of grace, so a glyph
+        // touching the edge stays and is clipped by the caller. A scan's
+        // adopted OCR layer is left alone: its positions are the
+        // recogniser's guess and the words are the point.
+        if !include_invisible && !ocr_layer_pages.contains(page_num) {
+            if let Some((bx0, by0, bx1, by1)) = get_page_box(doc, page_id) {
+                if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 {
+                    const TOL: f32 = 6.0;
+                    let visible = |hull: &[f32; 4]| {
+                        hull[2] >= bx0 - TOL
+                            && hull[0] <= bx1 + TOL
+                            && hull[3] >= by0 - TOL
+                            && hull[1] <= by1 + TOL
+                    };
+                    let before = items.len();
+                    items.retain(|it| {
+                        !matches!(it.item_type, ItemType::Text | ItemType::Image)
+                            || it.hull.as_ref().is_none_or(visible)
+                    });
+                    // A form placement on a turned page is in the walk's
+                    // landscape frame (x = Y, y = -(X + W), sides exchanged).
+                    forms.retain(|f| {
+                        let hull = if coords_rotated {
+                            [-(f.y + f.height), f.x, -f.y, f.x + f.width]
+                        } else {
+                            [f.x, f.y, f.x + f.width, f.y + f.height]
+                        };
+                        visible(&hull)
+                    });
+                    if items.len() < before {
+                        debug!(
+                            "page {}: dropped {} runs drawn wholly outside the page box",
+                            page_num,
+                            before - items.len()
+                        );
+                    }
+                }
+            }
+        }
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -3716,4 +3762,95 @@ mod tests {
         assert_eq!(merged.len(), 2);
     }
 
+    /// A one-page document with `content`, a crop box and a rotation.
+    fn page_bytes(content: &str, crop: Option<[i64; 4]>, rotate: Option<i64>) -> Vec<u8> {
+        use lopdf::{dictionary, Object, Stream};
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+            "FirstChar" => 0,
+            "LastChar" => 255,
+            "Widths" => Object::Array(widths),
+        });
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+        let mut page = dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! { "Font" => dictionary! { "F1" => font_id } },
+            "Contents" => content_id,
+        };
+        if let Some(crop) = crop {
+            page.set("CropBox", crop.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>());
+        }
+        if let Some(rotate) = rotate {
+            page.set("Rotate", rotate);
+        }
+        let page_id = doc.add_object(page);
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).unwrap();
+        bytes
+    }
+
+    #[test]
+    fn runs_drawn_wholly_off_the_visible_box_are_dropped_and_straddlers_kept() {
+        // Crop box 36..432 by 0..396 on a letter sheet: a hidden tag below
+        // the sheet, a heading off the left edge and a matrix row off the
+        // right are seen by nobody; a run across the right edge is seen in
+        // part and stays for the caller to clip.
+        let bytes = page_bytes(
+            "BT /F1 6 Tf 1 0 0 1 218 -14 Tm (<UN>) Tj ET\n\
+             BT /F1 29 Tf 1 0 0 1 -506 747 Tm (Introduction) Tj ET\n\
+             BT /F1 10 Tf 1 0 0 1 440 300 Tm (overflow) Tj ET\n\
+             BT /F1 10 Tf 1 0 0 1 420 200 Tm (straddle) Tj ET\n\
+             BT /F1 10 Tf 1 0 0 1 100 300 Tm (visible) Tj ET",
+            Some([36, 0, 432, 396]),
+            None,
+        );
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        let texts: Vec<&str> = extraction.extraction.0.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["visible", "straddle"], "{texts:?}");
+    }
+
+    #[test]
+    fn a_turned_page_is_still_clipped_by_its_hulls() {
+        // /Rotate 270 with text drawn reading down the sheet, as such a
+        // page is written: one line on the sheet and one 200 points below
+        // it. The walk turns the page's runs into its own frame; the hulls
+        // stay in user space and the off-sheet line is dropped by them.
+        let bytes = page_bytes(
+            "BT /F1 1 Tf 0 -11 11 0 500 762 Tm (on the sheet) Tj ET\n\
+             BT /F1 1 Tf 0 -11 11 0 -200 762 Tm (off the sheet) Tj ET\n\
+             BT /F1 1 Tf 0 -11 11 0 480 762 Tm (second line) Tj ET\n\
+             BT /F1 1 Tf 0 -11 11 0 460 762 Tm (third line) Tj ET",
+            None,
+            Some(270),
+        );
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        assert!(extraction.rotated_pages.contains(&1), "the walk turned the page");
+        let texts: Vec<&str> = extraction.extraction.0.iter().map(|item| item.text.as_str()).collect();
+        assert!(texts.contains(&"on the sheet") && !texts.contains(&"off the sheet"), "{texts:?}");
+        let run = extraction.extraction.0.iter().find(|item| item.text == "on the sheet").unwrap();
+        let hull = run.hull.expect("measured");
+        // Twelve glyphs of 6.6 points run down from y = 762; the glyph
+        // height runs right from x = 500.
+        assert!((hull[0] - 500.0).abs() < 0.05 && (hull[2] - 511.0).abs() < 0.05, "{hull:?}");
+        assert!((hull[3] - 762.0).abs() < 0.05 && (hull[1] - (762.0 - 79.2)).abs() < 0.05, "{hull:?}");
+    }
 }
