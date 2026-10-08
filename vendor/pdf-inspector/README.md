@@ -70,6 +70,22 @@ The private APIs, and what each unblocks:
    values are negative. The walk knew which pages it swapped and kept it to
    itself. `OcrLayerExtraction.rotated_pages` names them, so the service can
    move what it emits onto the page a reader sees.
+10. **Each run's hull** (`src/types.rs`, `src/extractor/content_stream.rs`,
+    `src/extractor/xobjects.rs`, `src/extractor/mod.rs`). A run's `x`, `y`,
+    `width` and `height` are its origin and its extents along the device
+    axes, which for text drawn turned, mirrored or skewed is a zero-width
+    line, and which the rotated-page correction moves into a frame of the
+    crate's own. The combined matrix the walker had at the show operator
+    was thrown away. `TextItem.hull` is the axis-aligned box of the glyph
+    frame in user space, from that matrix, kept out of the correction's
+    way; image placements carry theirs the same way and merged runs the
+    union of their parts.
+11. **Each page's boxes and rotation** (`src/types.rs`,
+    `src/extractor/mod.rs`). The walk had the page dictionary open and
+    read neither its boxes nor its `/Rotate`.
+    `OcrLayerExtraction.page_boxes` is a `PageBox` per walked page, so a
+    caller placing the runs on the displayed page needs no second read of
+    the file.
 
 ## Patches that change what the crate does
 
@@ -90,6 +106,20 @@ reasons in `docs/capture-deferrals.md`.
   OCR list is built for text-based documents too, not only mixed ones.
   Detection and extraction both keep the mode as graphics state: `BT` no
   longer resets it, only `Tr` and `Q` change it.
+- **A leading TJ displacement moves the run** (`src/extractor/content_stream.rs`,
+  `src/extractor/xobjects.rs`). A number at the head of a TJ array, or
+  right after a segment flush, moves the pen before the next segment's
+  first glyph. The walker added it to the running width but left the
+  segment's origin at the old pen position, so `[12719(31)]TJ` reported
+  "31" twelve ems right of where it is drawn, with a width that included
+  the jump. The origin now follows the pen while the segment is empty.
+- **Runs drawn wholly off the page are dropped** (`src/extractor/mod.rs`).
+  The neighbouring-page clip kept short fragments outside the crop box
+  because their coordinates could not be trusted. With the hull measured
+  from the full matrix they can be: a run, image or form placement whose
+  hull lies entirely outside the crop box (media box when there is none),
+  past the clip's six points of grace, is dropped before the markdown is
+  rendered. A page whose runs are an adopted OCR layer is left alone.
 - **Decoding is bounded** (`src/guard.rs`, and every decoding call site).
   Every stream the crate decodes goes through the guard module, which holds
   it to a per-stream ceiling and a per-run budget, loads documents with the

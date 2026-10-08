@@ -344,27 +344,6 @@ impl DocumentFold {
         }
     }
 
-    /// Measure `pages` as they are displayed, turned a quarter: their boxes
-    /// were moved onto the landscape page (see [`crate::frame`]), so the
-    /// page they are measured against is the crop box with its sides
-    /// exchanged. Pages the metadata did not size are left unsized.
-    pub fn turn_pages(&mut self, pages: impl IntoIterator<Item = u32>) {
-        for page_no in pages {
-            let Some(item) = i32::try_from(page_no)
-                .ok()
-                .and_then(|page_no| self.document.pages.get_mut(&page_no))
-            else {
-                continue;
-            };
-            for size in [item.size.as_mut(), item.media_size.as_mut()]
-                .into_iter()
-                .flatten()
-            {
-                std::mem::swap(&mut size.width, &mut size.height);
-            }
-        }
-    }
-
     /// `info` names the document, counts its pages, and carries the
     /// detection confidence every item inherits.
     fn on_info(&mut self, info: &pb::PdfInfo) {
@@ -495,18 +474,29 @@ impl DocumentFold {
                 ..doc::PageItem::default()
             });
             // The visible box is the page as a reader sees it, which is the
-            // frame every box on this wire is measured against. The media
-            // box is the sheet it was imposed on, and is only worth saying
-            // when the two differ.
-            if let Some(size) = page.crop_box.as_ref() {
-                item.size = Some(size_of(size));
+            // frame every box on this wire is measured against: the crop
+            // box, turned by the page's rotation (`crate::frame`). The
+            // media box is the sheet it was imposed on, turned the same
+            // way, and is only worth saying when the two differ.
+            if let Some(frame) = crate::frame::PageFrame::new(page, false) {
+                let (width, height) = frame.size();
+                item.size = Some(doc::Size { width, height });
             }
             if let Some(media) = page.media_box.as_ref().filter(|media| {
                 page.crop_box
                     .as_ref()
                     .is_none_or(|crop| size_of(media) != size_of(crop))
             }) {
-                item.media_size = Some(size_of(media));
+                let media = size_of(media);
+                item.media_size =
+                    Some(if page.rotation % 360 == 90 || page.rotation % 360 == 270 {
+                        doc::Size {
+                            width: media.height,
+                            height: media.width,
+                        }
+                    } else {
+                        media
+                    });
             }
             // The page's own printed number, which is what a citation or a
             // "go to page 12" actually means when the document numbers its

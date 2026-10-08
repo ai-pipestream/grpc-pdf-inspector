@@ -211,13 +211,19 @@ pub struct PageTables {
     #[prost(message, repeated, tag="2")]
     pub tables: ::prost::alloc::vec::Vec<TableRegion>,
 }
-/// Rect is an axis-aligned rectangle in PDF user space.
+/// Rect is an axis-aligned rectangle on the page as it is displayed.
 ///
-/// The unit is the PDF point (1/72 inch) and the origin is the page's
-/// bottom-left corner, with y increasing upwards — the space the file
-/// itself is written in, unrotated and unscaled. A consumer that wants
-/// top-left coordinates subtracts from the page box, which arrives on
-/// `PageGeometry`.
+/// The unit is the PDF point (1/72 inch), unscaled by `user_unit`. The
+/// frame is the page a reader sees: the crop box (the media box when the
+/// page declares none), turned by the page's `/Rotate`, with the origin at
+/// the displayed page's bottom-left corner and y increasing upwards. That
+/// is user space when the crop box starts at the origin and the page is
+/// not rotated, which is the common case; otherwise every box has been
+/// moved by the crop box's corner and turned with the page, so it lands
+/// where the page shows it. A box is clipped to the page: what hangs off
+/// the sheet is seen by no one. The boxes on `PageGeometry` are the
+/// exception, being the page's own declaration in user space. A consumer
+/// that wants top-left coordinates subtracts from the displayed height.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Rect {
     /// Distance from the page's left edge to the rectangle's left edge.
@@ -1541,7 +1547,6 @@ pub struct PageDocument {
     #[prost(message, optional, tag="2")]
     pub document: ::core::option::Option<super::super::document::v1::Document>,
 }
-/// GetServiceInfoRequest asks for the server's build and limits. It carries
 /// GetServiceInfoRequest asks for the server's build and limits. It carries
 /// no arguments; the message exists so the RPC can gain them additively.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

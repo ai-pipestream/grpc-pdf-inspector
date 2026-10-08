@@ -1370,6 +1370,58 @@ pub fn landscape_pdf() -> Vec<u8> {
     bytes
 }
 
+/// A one-page document drawing `content` on a letter sheet, with the font
+/// `F1` (Helvetica) available, an optional crop box and an optional
+/// `/Rotate`: the fixture for everything about where a box lands on the
+/// page a reader sees.
+#[must_use]
+pub fn framed_pdf(content: &str, crop_box: Option<[i64; 4]>, rotate: Option<i64>) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    };
+    if let Some(crop) = crop_box {
+        page.set(
+            "CropBox",
+            crop.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>(),
+        );
+    }
+    if let Some(rotate) = rotate {
+        page.set("Rotate", rotate);
+    }
+    let page_id = doc.add_object(page);
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Prose long enough for letter statistics to mean anything, one line per
 /// entry.
 const PROSE: [&str; 8] = [

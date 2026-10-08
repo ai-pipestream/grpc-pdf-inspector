@@ -280,6 +280,7 @@ mod tests {
 
     fn item(text: &str, font_size: f32) -> TextItem {
         TextItem {
+            hull: None,
             text: text.to_owned(),
             x: 0.0,
             y: 0.0,

@@ -492,6 +492,7 @@ mod tests {
 
     fn item(page: u32, text: &str, x: f32, y: f32) -> TextItem {
         TextItem {
+            hull: None,
             text: text.to_owned(),
             x,
             y,
