@@ -317,6 +317,83 @@ text-based with their body text in symbols.
 - *Tests*: the crate's `symbol_soup_tests` module and
   `tests/quality.rs` (`symbol_soup_pdf`).
 
+**Real-corpus run (2026-10-08): boxes outside the page.** The S3 battery's
+`boxes_in_page` check failed on 18 PDF-family files whose provenance boxes
+came from this service. Four causes, found by comparing each file's runs
+against an independent interpretation of its content stream:
+
+- The crop box's corner was never subtracted. The fold reported the page
+  as its crop box but every box stayed in user space, so a page cropped to
+  `[36 0 432 396]` had runs 36 points right of where it shows them, and a
+  map cropped out of a 1685-point sheet (NapierOne 0032) had every run off
+  the 343-point page.
+- Runs not aligned with the page's dominant direction had no usable box:
+  a vertical word on an upright page was a zero-width line as tall as its
+  type size (DocLayNet 432da), an upright running head on a turned page
+  had its width laid along the wrong axis (NapierOne 0050, page 218), and
+  a `/Rotate 270` page was left in the library's frame, off the page
+  altogether (NapierOne 0060, page 22).
+- A leading TJ displacement was dropped from the run's origin, so a table
+  that positions its cells with `[12719(31)]TJ` had its right columns 127
+  points off (NapierOne 0079, page 25).
+- Text really drawn off the page: a matrix overflowing the right margin
+  (DocLayNet 1633), a hidden `<UN>` tag below the sheet (four DP-Bench
+  files), a heading of an imposed spread's facing page at x = -506
+  (DP-Bench 020d), rules placed a page-width off the sheet (NapierOne
+  0050). The library kept them deliberately, because their coordinates
+  could not be trusted; with hulls from the full matrix they can be.
+
+- *Patch* `d612bc4`: `TextItem.hull`, the run's axis-aligned box in user
+  space from the combined matrix at the show operator; images and merged
+  runs carry one too.
+- *Patch* `89b256a`: a TJ displacement before a segment's first glyph
+  moves the segment's origin with the pen.
+- *Patch* `c0da05e`: runs, images and form placements whose hull lies
+  wholly outside the crop box are dropped before rendering; adopted OCR
+  layers are exempt.
+- *Patch* `958197e`: `OcrLayerExtraction.page_boxes`, each walked page's
+  media box, crop box and `/Rotate`, so the service needs no second read.
+- *Wired*: `crate::frame::PageFrame`, one per page, built from the walk's
+  boxes. Every box on the wire (runs, forms, grids, invisible and dropped
+  runs) and every Document box is placed on the page a reader sees: moved
+  by the crop box's corner, turned by `/Rotate` (0, 90, 180 and 270), and
+  turned back out of the library's frame on a page whose text it read
+  sideways. A run across the page's edge is clipped to the page; a
+  placement entirely off it collapses to a zero-area box at the edge.
+  `PageItem.size` is the displayed size for every rotation, not only the
+  pages the library turned. `Rect`'s contract comment says so.
+- *Tests*: `tests/geometry.rs` (crop box offset, `/Rotate 270`, turned
+  glyphs on an upright page, off-page text), `src/frame.rs`, and the
+  crate's `content_stream` and `extractor` test modules.
+- *Review follow-up* (same branch): the drop trusts the hull only where
+  the text model holds. `Tz` is now applied to advances and offsets; a
+  TJ segment's hull covers the pen's furthest reach either way; a font
+  with no widths or a vertical font measures no hull and is never
+  dropped; a run continuing an on-page line pen to pen stays; the visible
+  box is the crop box cut to the media box, as `frame.rs` measures it.
+  Link annotations and form fields carry their rectangle as a hull, so a
+  turned page places them. Grid edges are rebuilt from the bands between
+  them, so `column_boundaries` stays ascending starts and
+  `row_boundaries` descending bottoms under every turn. A real `/Rotate`
+  (`90.0`, `269.5`) rounds the same in the metadata reader and the walk.
+  The ActualText first-glyph position is taken after a leading TJ offset.
+  Second round: an embedded CMap stream's `/WMode 1` (dictionary or body)
+  marks a vertical font; a form inherits its caller's Tz, Tc and Tw;
+  `TableCells.boxes` carries each cell's box, cut in the frame the grid
+  was read in and placed with the page, so a mirrored or quarter-turned
+  page keeps every cell with its text (the fold prefers it to cutting
+  cells from the placed lists); a ruled table keeps its outer fence when
+  mirrored; a page the library read sideways has its bands cut the other
+  way when its text reads down the sheet, since its frame is then a half
+  turn from the way the text reads. That is the text's direction, carried
+  out of the walk's rotation vote as `downward_pages`, not the page's
+  `/Rotate`: a table turned clockwise on a portrait page reads down with
+  no `/Rotate`, and text reading up stays in step with the frame under
+  any turn.
+- *Not done*: a run's exact quadrilateral is not reported on
+  `ProvenanceItem.polygon`; the hull is the axis-aligned box only, and it
+  runs from the baseline (the `Rect` contract's `y`), not the descender.
+
 Two rows the audit listed here were never asks and belong below with the
 rest of the deliberate deferrals: **D20**, the detector's per-page
 statistics, which are collapsed into one of four reason strings and several

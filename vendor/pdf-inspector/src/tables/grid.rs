@@ -510,7 +510,7 @@ mod tests {
     use crate::types::ItemType;
 
     fn make_item(text: &str, x: f32, y: f32, font_size: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,
@@ -903,7 +903,7 @@ mod tests {
                 let y = 700.0 - row as f32 * 12.0;
                 items.push((
                     0,
-                    TextItem {
+                    TextItem { hull: None,
                         text: format!("{}", row),
                         x,
                         y,
@@ -942,7 +942,7 @@ mod tests {
             for row in 0..10 {
                 items.push((
                     0,
-                    TextItem {
+                    TextItem { hull: None,
                         text: format!("cell_{}_{}", col, row),
                         x: base_x + (row as f32 * 0.3),
                         y: 700.0 - row as f32 * 15.0,

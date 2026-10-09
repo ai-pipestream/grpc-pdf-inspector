@@ -344,27 +344,6 @@ impl DocumentFold {
         }
     }
 
-    /// Measure `pages` as they are displayed, turned a quarter: their boxes
-    /// were moved onto the landscape page (see [`crate::frame`]), so the
-    /// page they are measured against is the crop box with its sides
-    /// exchanged. Pages the metadata did not size are left unsized.
-    pub fn turn_pages(&mut self, pages: impl IntoIterator<Item = u32>) {
-        for page_no in pages {
-            let Some(item) = i32::try_from(page_no)
-                .ok()
-                .and_then(|page_no| self.document.pages.get_mut(&page_no))
-            else {
-                continue;
-            };
-            for size in [item.size.as_mut(), item.media_size.as_mut()]
-                .into_iter()
-                .flatten()
-            {
-                std::mem::swap(&mut size.width, &mut size.height);
-            }
-        }
-    }
-
     /// `info` names the document, counts its pages, and carries the
     /// detection confidence every item inherits.
     fn on_info(&mut self, info: &pb::PdfInfo) {
@@ -495,18 +474,29 @@ impl DocumentFold {
                 ..doc::PageItem::default()
             });
             // The visible box is the page as a reader sees it, which is the
-            // frame every box on this wire is measured against. The media
-            // box is the sheet it was imposed on, and is only worth saying
-            // when the two differ.
-            if let Some(size) = page.crop_box.as_ref() {
-                item.size = Some(size_of(size));
+            // frame every box on this wire is measured against: the crop
+            // box, turned by the page's rotation (`crate::frame`). The
+            // media box is the sheet it was imposed on, turned the same
+            // way, and is only worth saying when the two differ.
+            if let Some(frame) = crate::frame::PageFrame::new(page, false) {
+                let (width, height) = frame.size();
+                item.size = Some(doc::Size { width, height });
             }
             if let Some(media) = page.media_box.as_ref().filter(|media| {
                 page.crop_box
                     .as_ref()
                     .is_none_or(|crop| size_of(media) != size_of(crop))
             }) {
-                item.media_size = Some(size_of(media));
+                let media = size_of(media);
+                item.media_size =
+                    Some(if page.rotation % 360 == 90 || page.rotation % 360 == 270 {
+                        doc::Size {
+                            width: media.height,
+                            height: media.width,
+                        }
+                    } else {
+                        media
+                    });
             }
             // The page's own printed number, which is what a citation or a
             // "go to page 12" actually means when the document numbers its
@@ -1215,8 +1205,16 @@ fn table_data(region: &pb::TableRegion) -> doc::TableData {
     for (row_index, row) in region.rows.iter().enumerate() {
         let mut row_cells = Vec::new();
         for (column_index, text) in row.cells.iter().enumerate() {
+            // The box the detector cut and the page placed; a region
+            // that carries none (an older producer, or a table with no
+            // extent) is cut here from its boundaries, which is right
+            // only on a page shown as it was read.
             let cell = doc::TableCell {
-                bbox: cell_bbox(region, row_index, column_index),
+                bbox: row
+                    .boxes
+                    .get(column_index)
+                    .map(bounding_box)
+                    .or_else(|| cell_bbox(region, row_index, column_index)),
                 row_span: 1,
                 col_span: 1,
                 start_row_offset_idx: i32::try_from(row_index).unwrap_or(i32::MAX),
@@ -2540,9 +2538,11 @@ mod tests {
                 rows: vec![
                     pb::TableCells {
                         cells: vec!["Year".to_owned(), "Count".to_owned()],
+                        boxes: Vec::new(),
                     },
                     pb::TableCells {
                         cells: vec!["1843".to_owned(), "7".to_owned()],
+                        boxes: Vec::new(),
                     },
                 ],
                 kind: pb::TableKind::Data.into(),
@@ -2586,6 +2586,7 @@ mod tests {
             tables: vec![pb::TableRegion {
                 rows: vec![pb::TableCells {
                     cells: vec!["Chapter One".to_owned(), "3".to_owned()],
+                    boxes: Vec::new(),
                 }],
                 kind: pb::TableKind::Contents.into(),
                 ..pb::TableRegion::default()
@@ -2620,6 +2621,7 @@ mod tests {
                 .iter()
                 .map(|cells| pb::TableCells {
                     cells: cells.iter().map(|cell| (*cell).to_owned()).collect(),
+                    boxes: Vec::new(),
                 })
                 .collect(),
             kind: pb::TableKind::Data.into(),

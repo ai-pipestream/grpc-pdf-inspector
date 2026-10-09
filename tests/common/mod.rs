@@ -562,6 +562,59 @@ pub fn table_pdf() -> Vec<u8> {
     bytes
 }
 
+/// The [`table_pdf`] grid on a page with `rotate`, drawn upright in user
+/// space, or drawn turned (`turned`) so that it reads upright on a
+/// `/Rotate 270` page: the text runs down the sheet, the rows advance
+/// along user-space x. The grid is laid out on the displayed page at
+/// columns 72, 240 and 400 and rows from 500 downwards, so the same cells
+/// land in the same displayed places whichever way the page is written.
+#[must_use]
+pub fn grid_pdf(rotate: Option<i64>, turned: bool) -> Vec<u8> {
+    grid_page(rotate, |shown_x, shown_y, text| {
+        if turned {
+            // Shown under /Rotate 270 on a letter sheet: a displayed
+            // point (x', y') is user space (y', 792 - x'), and the
+            // reading direction is down the sheet.
+            let (x, y) = (shown_y, 792 - shown_x);
+            format!("BT /F1 1 Tf 0 -11 11 0 {x} {y} Tm ({text}) Tj ET\n")
+        } else {
+            format!("BT /F1 11 Tf {shown_x} {shown_y} Td ({text}) Tj ET\n")
+        }
+    })
+}
+
+/// The [`table_pdf`] grid drawn turned the other way, so that it reads
+/// upright on a `/Rotate 90` page (Distiller's landscape output): the text
+/// runs up the sheet, the rows advance along user-space x the other way.
+/// A displayed point (x', y') is user space (612 - y', x').
+#[must_use]
+pub fn upward_grid_pdf(rotate: Option<i64>) -> Vec<u8> {
+    grid_page(rotate, |shown_x, shown_y, text| {
+        let (x, y) = (612 - shown_y, shown_x);
+        format!("BT /F1 1 Tf 0 11 -11 0 {x} {y} Tm ({text}) Tj ET\n")
+    })
+}
+
+/// The [`table_pdf`] grid, each cell drawn by `cell` at its displayed
+/// column and row.
+fn grid_page(rotate: Option<i64>, cell: impl Fn(i32, i32, &str) -> String) -> Vec<u8> {
+    const COLUMNS: [i32; 3] = [72, 240, 400];
+    const ROWS: [(&str, &str, &str); 4] = [
+        ("Year", "Engine", "Cards"),
+        ("1837", "Analytical", "Punched"),
+        ("1843", "Notes", "Woven"),
+        ("1854", "Difference", "None"),
+    ];
+    let mut content = String::new();
+    for (index, (first, second, third)) in ROWS.iter().enumerate() {
+        let shown_y = 500 - 24 * i32::try_from(index).expect("four rows fit in an i32");
+        for (shown_x, text) in COLUMNS.iter().zip([first, second, third]) {
+            content.push_str(&cell(*shown_x, shown_y, text));
+        }
+    }
+    framed_pdf(&content, None, rotate)
+}
+
 /// Build a one-page PDF whose table is drawn with real rules and whose
 /// cells hold prose rather than short aligned tokens.
 ///
@@ -1351,6 +1404,100 @@ pub fn landscape_pdf() -> Vec<u8> {
         },
         "Contents" => content_id,
     });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// A one-page document drawing `content` on a letter sheet, with the font
+/// `F1` (Helvetica) available, an optional crop box and an optional
+/// `/Rotate`: the fixture for everything about where a box lands on the
+/// page a reader sees.
+#[must_use]
+pub fn framed_pdf(content: &str, crop_box: Option<[i64; 4]>, rotate: Option<i64>) -> Vec<u8> {
+    framed_pdf_with(FramedPage {
+        content: content.to_owned(),
+        crop_box,
+        rotate: rotate.map(Object::Integer),
+        ..FramedPage::default()
+    })
+}
+
+/// What [`framed_pdf_with`] builds.
+#[derive(Debug, Clone)]
+pub struct FramedPage {
+    /// The page's content stream.
+    pub content: String,
+    /// The media box, letter when not said.
+    pub media_box: [i64; 4],
+    /// The crop box, when the page declares one.
+    pub crop_box: Option<[i64; 4]>,
+    /// `/Rotate`, as whatever object the fixture wants to write.
+    pub rotate: Option<Object>,
+}
+
+impl Default for FramedPage {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            media_box: [0, 0, 612, 792],
+            crop_box: None,
+            rotate: None,
+        }
+    }
+}
+
+/// A one-page document drawing `page.content` with the font `F1`
+/// (Helvetica) available, under the boxes and rotation the page says.
+#[must_use]
+pub fn framed_pdf_with(page: FramedPage) -> Vec<u8> {
+    let FramedPage {
+        content,
+        media_box,
+        crop_box,
+        rotate,
+    } = page;
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => media_box.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>(),
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    };
+    if let Some(crop) = crop_box {
+        page.set(
+            "CropBox",
+            crop.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>(),
+        );
+    }
+    if let Some(rotate) = rotate {
+        page.set("Rotate", rotate);
+    }
+    let page_id = doc.add_object(page);
     doc.objects.insert(
         pages_id,
         Object::Dictionary(dictionary! {

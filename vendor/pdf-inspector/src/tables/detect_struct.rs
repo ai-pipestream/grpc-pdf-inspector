@@ -587,7 +587,7 @@ mod tests {
     use crate::types::ItemType;
 
     fn make_item(text: &str, x: f32, y: f32, page: u32, mcid: Option<i64>) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,

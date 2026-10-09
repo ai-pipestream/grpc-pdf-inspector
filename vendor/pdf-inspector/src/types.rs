@@ -134,6 +134,32 @@ pub struct OcrLayerExtraction {
     /// user-space x. That frame keeps the reading order and has no
     /// translation, so its y values are negative.
     pub rotated_pages: std::collections::BTreeSet<u32>,
+    /// The pages of `rotated_pages` whose text mostly reads down the sheet
+    /// (a text matrix `[0, -b, b, 0]`) rather than up it (`[0, b, -b, 0]`).
+    /// In the landscape frame such text runs towards smaller x, so the
+    /// frame is a half turn from the way the text reads; on every other
+    /// rotated page it runs towards larger x.
+    pub downward_pages: std::collections::BTreeSet<u32>,
+    /// Every walked page's boxes and rotation, read from the page
+    /// dictionary and its ancestors by the same reader that walked the
+    /// content, so a caller can place the runs on the page a reader sees
+    /// without opening the file again.
+    pub page_boxes: std::collections::BTreeMap<u32, PageBox>,
+}
+
+/// A page's media box, crop box and rotation, as `[x0, y0, x1, y1]` in
+/// user space with the corners normalized, and `/Rotate` folded into
+/// `[0, 360)`.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PageBox {
+    /// `/MediaBox`, inherited down the page tree; `None` when the page
+    /// declares none anywhere.
+    pub media_box: Option<[f32; 4]>,
+    /// `/CropBox`, inherited the same way; `None` when the page declares
+    /// none, which means the media box is the visible extent.
+    pub crop_box: Option<[f32; 4]>,
+    /// Clockwise degrees the page is turned for display.
+    pub rotation: u32,
 }
 
 /// A text item with position information
@@ -185,6 +211,19 @@ pub struct TextItem {
     /// Marked Content ID from the content stream's BDC/BMC operator.
     /// Used to link this item to the PDF structure tree for tagged PDFs.
     pub mcid: Option<i64>,
+    /// The axis-aligned hull of the glyph frame in PDF user space, as
+    /// `[x0, y0, x1, y1]`, computed from the full text rendering matrix
+    /// (text matrix times CTM) at the show operator: the origin, the
+    /// advance along the text-space x axis and the font size along its y
+    /// axis, with every corner transformed. For an upright run it is
+    /// `x..x+width` by `y..y+height`; for a run drawn turned, mirrored or
+    /// skewed it is the box the glyphs really cover, where `x`, `y`,
+    /// `width` and `height` name only the origin and the extents along the
+    /// device axes. Never moved by the rotated-page correction, which keeps
+    /// `x` and `y` in a frame of its own; `None` for items that did not
+    /// come from a show operator or an image placement (link annotations,
+    /// form fields, split table tokens).
+    pub hull: Option<[f32; 4]>,
 }
 
 /// A line of text (grouped text items)
@@ -389,7 +428,7 @@ mod formatting_tests {
     use super::{ItemType, TextItem, TextLine};
 
     fn item(text: &str, x: f32, width: f32, strikeout: bool) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y: 100.0,

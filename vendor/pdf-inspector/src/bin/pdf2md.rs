@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn items_json_includes_position_and_underline_metadata() {
-        let items = vec![TextItem {
+        let items = vec![TextItem { hull: None,
             text: "A \"quoted\" item".to_string(),
             x: 12.345,
             y: 67.891,

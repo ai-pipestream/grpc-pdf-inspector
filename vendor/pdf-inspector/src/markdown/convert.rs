@@ -1562,7 +1562,7 @@ mod tests {
     use std::collections::HashMap;
 
     fn make_item(text: &str, page: u32, mcid: Option<i64>) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x: 72.0,
             y: 700.0,

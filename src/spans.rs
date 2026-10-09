@@ -18,6 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use pdf_inspector::types::ItemType;
 use pdf_inspector::{PdfForm, TextItem};
 
+use crate::frame::{PageFrame, raw_rect};
 use crate::proto::v1 as pb;
 
 /// Group the document's items by their 1-indexed page.
@@ -44,7 +45,8 @@ pub fn forms_by_page(forms: Vec<PdfForm>) -> BTreeMap<u32, Vec<PdfForm>> {
     pages
 }
 
-/// A Form XObject placement as the wire message.
+/// A Form XObject placement as the wire message, placed on the displayed
+/// page when its page has a frame.
 ///
 /// The text is a placeholder naming the resource, as an image run's is;
 /// the box is the form's own bounding box under the transformation the
@@ -52,17 +54,13 @@ pub fn forms_by_page(forms: Vec<PdfForm>) -> BTreeMap<u32, Vec<PdfForm>> {
 /// nothing else is said about it: its text, when it has any, arrives as
 /// runs in its own right.
 #[must_use]
-pub fn form_span(form: &PdfForm) -> pb::TextSpan {
-    let (x, width) = normalize(form.x, form.width);
-    let (y, height) = normalize(form.y, form.height);
+pub fn form_span(form: &PdfForm, frame: Option<&PageFrame>) -> pb::TextSpan {
     pb::TextSpan {
         text: format!("[Form: {}]", form.name),
-        bbox: Some(pb::Rect {
-            x: f64::from(x),
-            y: f64::from(y),
-            width: f64::from(width),
-            height: f64::from(height),
-        }),
+        bbox: Some(frame.map_or_else(
+            || raw_rect(form.x, form.y, form.width, form.height),
+            |frame| frame.place_form(form),
+        )),
         kind: pb::SpanKind::Form.into(),
         ..pb::TextSpan::default()
     }
@@ -123,8 +121,8 @@ fn key(item: &TextItem) -> Key {
 
 /// One page's runs as the wire message.
 #[must_use]
-pub fn page_spans(page_no: u32, items: &[TextItem]) -> pb::PageSpans {
-    page_spans_marking(page_no, items, |_| false)
+pub fn page_spans(page_no: u32, items: &[TextItem], frame: Option<&PageFrame>) -> pb::PageSpans {
+    page_spans_marking(page_no, items, frame, |_| false)
 }
 
 /// One page's runs as the wire message, the ones `is_chrome` names flagged
@@ -134,6 +132,7 @@ pub fn page_spans(page_no: u32, items: &[TextItem]) -> pb::PageSpans {
 pub fn page_spans_marking(
     page_no: u32,
     items: &[TextItem],
+    frame: Option<&PageFrame>,
     is_chrome: impl Fn(&TextItem) -> bool,
 ) -> pb::PageSpans {
     pb::PageSpans {
@@ -142,28 +141,25 @@ pub fn page_spans_marking(
             .iter()
             .map(|item| pb::TextSpan {
                 chrome: is_chrome(item),
-                ..span(item)
+                ..span(item, frame)
             })
             .collect(),
     }
 }
 
-/// One run as the wire message.
+/// One run as the wire message, placed on the displayed page when its
+/// page has a frame (`crate::frame`), else boxed as the library measured
+/// it: a right-to-left or upward run can hand back a negative extent, and
+/// the box is normalized so a consumer never has to wonder which corner
+/// `x`/`y` names.
 #[must_use]
-pub fn span(item: &TextItem) -> pb::TextSpan {
-    // Width and height are extents, and a right-to-left or upward run can
-    // hand back a negative one. The box is normalized here so a consumer
-    // never has to wonder which corner `x`/`y` names.
-    let (x, width) = normalize(item.x, item.width);
-    let (y, height) = normalize(item.y, item.height);
+pub fn span(item: &TextItem, frame: Option<&PageFrame>) -> pb::TextSpan {
     pb::TextSpan {
         text: item.text.clone(),
-        bbox: Some(pb::Rect {
-            x: f64::from(x),
-            y: f64::from(y),
-            width: f64::from(width),
-            height: f64::from(height),
-        }),
+        bbox: Some(frame.map_or_else(
+            || raw_rect(item.x, item.y, item.width, item.height),
+            |frame| frame.place_item(item),
+        )),
         font_family: item.font.clone(),
         font_tag: item.font_tag.clone(),
         font_size: item.font_size,
@@ -193,22 +189,13 @@ fn kind(item_type: &ItemType) -> pb::SpanKind {
     }
 }
 
-/// Turn an origin and a possibly-negative extent into an origin and a
-/// non-negative extent.
-fn normalize(origin: f32, extent: f32) -> (f32, f32) {
-    if extent < 0.0 {
-        (origin + extent, -extent)
-    } else {
-        (origin, extent)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn item(page: u32, text: &str) -> TextItem {
         TextItem {
+            hull: None,
             text: text.to_owned(),
             x: 10.0,
             y: 700.0,
@@ -238,7 +225,7 @@ mod tests {
 
     #[test]
     fn a_run_carries_its_box_font_and_join_key() {
-        let spans = page_spans(1, &[item(1, "hello")]);
+        let spans = page_spans(1, &[item(1, "hello")], None);
         assert_eq!(spans.page_no, 1);
         let span = &spans.spans[0];
         assert_eq!(span.text, "hello");
@@ -256,21 +243,24 @@ mod tests {
     fn a_link_run_carries_its_target_and_kind() {
         let mut link = item(1, "https://example.invalid/x");
         link.item_type = ItemType::Link("https://example.invalid/x".to_owned());
-        let span = span(&link);
+        let span = span(&link, None);
         assert_eq!(span.kind, pb::SpanKind::Link as i32);
         assert_eq!(span.link_uri, "https://example.invalid/x");
     }
 
     #[test]
     fn a_form_placement_is_a_placed_run_with_no_face() {
-        let span = form_span(&PdfForm {
-            name: "Im3".to_owned(),
-            x: 345.6,
-            y: 447.9,
-            width: 158.4,
-            height: 116.1,
-            page: 4,
-        });
+        let span = form_span(
+            &PdfForm {
+                name: "Im3".to_owned(),
+                x: 345.6,
+                y: 447.9,
+                width: 158.4,
+                height: 116.1,
+                page: 4,
+            },
+            None,
+        );
         assert_eq!(span.kind, pb::SpanKind::Form as i32);
         assert_eq!(span.text, "[Form: Im3]");
         let bbox = span.bbox.as_ref().expect("a box");
@@ -303,7 +293,7 @@ mod tests {
     fn a_negative_extent_becomes_an_origin_and_a_positive_extent() {
         let mut backwards = item(1, "x");
         backwards.width = -20.0;
-        let span = span(&backwards);
+        let span = span(&backwards, None);
         let bbox = span.bbox.as_ref().expect("a box");
         assert!((bbox.x - -10.0).abs() < f64::EPSILON);
         assert!((bbox.width - 20.0).abs() < f64::EPSILON);

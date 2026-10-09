@@ -14,14 +14,14 @@ mod xobjects;
 
 use crate::text_utils::{is_cjk_char, is_rtl_text};
 use crate::tounicode::FontCMaps;
-use crate::types::{OcrLayerExtraction, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
+use crate::types::{OcrLayerExtraction, PageBox, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items_with_forms;
+use content_stream::{extract_page_text_items_with_forms, PageTurn};
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -235,7 +235,7 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, ocr_layer_pages, rotated_pages) =
+    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, ocr_layer_pages, turned_pages) =
         extract_positioned_text_impl_reporting_invisible(
             &doc,
             &font_cmaps,
@@ -244,13 +244,91 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
             None,
             true,
         )?;
+    let page_boxes = doc
+        .get_pages()
+        .iter()
+        .filter(|(page_num, _)| page_filter.is_none_or(|filter| filter.contains(page_num)))
+        .map(|(page_num, &page_id)| (*page_num, page_box(&doc, page_id)))
+        .collect();
     Ok(OcrLayerExtraction {
         extraction,
         forms,
         skipped_invisible,
         ocr_layer_pages,
-        rotated_pages,
+        rotated_pages: turned_pages.keys().copied().collect(),
+        downward_pages: turned_pages
+            .iter()
+            .filter(|(_, turn)| **turn == PageTurn::ReadsDown)
+            .map(|(page, _)| *page)
+            .collect(),
+        page_boxes,
     })
+}
+
+/// The box a reader sees, normalized: the crop box cut down to the media
+/// box when both are declared (a crop box reaching past the sheet is
+/// legal and viewers show the overlap), the media box when the two do
+/// not meet or the page declares no crop box, the crop box alone when
+/// there is no media box anywhere.
+fn visible_page_box(doc: &Document, page_id: ObjectId) -> Option<(f32, f32, f32, f32)> {
+    let page = page_box(doc, page_id);
+    let valid = |b: [f32; 4]| (b[2] > b[0] && b[3] > b[1]).then_some(b);
+    let media = page.media_box.and_then(valid);
+    let crop = page.crop_box.and_then(valid);
+    let b = match (crop, media) {
+        (Some(c), Some(m)) => {
+            let cut = [c[0].max(m[0]), c[1].max(m[1]), c[2].min(m[2]), c[3].min(m[3])];
+            valid(cut).unwrap_or(m)
+        }
+        (Some(only), None) | (None, Some(only)) => only,
+        (None, None) => return None,
+    };
+    Some((b[0], b[1], b[2], b[3]))
+}
+
+/// A page's boxes and rotation, each inherited down the page tree.
+fn page_box(doc: &Document, page_id: ObjectId) -> PageBox {
+    let normalized = |v: Vec<f32>| [v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])];
+    let rotation = inherited_page_attribute(doc, page_id, b"Rotate").and_then(|obj| match obj {
+        Object::Integer(i) => Some(*i),
+        Object::Real(r) => Some(r.round() as i64),
+        _ => None,
+    });
+    PageBox {
+        media_box: inherited_rect(doc, page_id, b"MediaBox").map(normalized),
+        crop_box: inherited_rect(doc, page_id, b"CropBox").map(normalized),
+        rotation: rotation.map_or(0, |degrees| degrees.rem_euclid(360) as u32),
+    }
+}
+
+/// A page attribute, looked up on the page and then up the page tree.
+fn inherited_page_attribute<'a>(doc: &'a Document, page_id: ObjectId, key: &[u8]) -> Option<&'a Object> {
+    let mut id = page_id;
+    for _ in 0..32 {
+        let dict = doc.get_dictionary(id).ok()?;
+        if let Ok(obj) = dict.get(key) {
+            return match obj {
+                Object::Reference(r) => doc.get_object(*r).ok(),
+                other => Some(other),
+            };
+        }
+        match dict.get(b"Parent") {
+            Ok(Object::Reference(p)) => id = *p,
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// An inheritable rectangle attribute with at least four numbers.
+fn inherited_rect(doc: &Document, page_id: ObjectId, key: &[u8]) -> Option<Vec<f32>> {
+    match inherited_page_attribute(doc, page_id, key)? {
+        Object::Array(a) => {
+            let vals: Vec<f32> = a.iter().filter_map(get_number).collect();
+            (vals.len() >= 4).then_some(vals)
+        }
+        _ => None,
+    }
 }
 
 /// [`extract_text_with_positions_mem_pages`] with the invisible layer under
@@ -441,7 +519,7 @@ fn extract_positioned_text_impl(
 /// [`crate::is_adoptable_ocr_layer`] says it is real text; the sixth element
 /// of the result names the pages that did. The last names the pages whose
 /// runs the walk turned from rotated text into a landscape frame (see
-/// `correct_rotated_page`).
+/// `correct_rotated_page`), each with the way its text reads.
 #[allow(clippy::type_complexity)]
 fn extract_positioned_text_impl_reporting_invisible(
     doc: &Document,
@@ -458,7 +536,7 @@ fn extract_positioned_text_impl_reporting_invisible(
         HashSet<u32>,
         bool,
         BTreeSet<u32>,
-        BTreeSet<u32>,
+        BTreeMap<u32, PageTurn>,
     ),
     PdfError,
 > {
@@ -471,7 +549,7 @@ fn extract_positioned_text_impl_reporting_invisible(
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
     let mut skipped_invisible_anywhere = false;
     let mut ocr_layer_pages: BTreeSet<u32> = BTreeSet::new();
-    let mut rotated_pages: BTreeSet<u32> = BTreeSet::new();
+    let mut turned_pages: BTreeMap<u32, PageTurn> = BTreeMap::new();
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -503,7 +581,7 @@ fn extract_positioned_text_impl_reporting_invisible(
             (mut items, mut rects, mut lines),
             mut forms,
             mut has_gid_fonts,
-            mut coords_rotated,
+            mut turn,
             mut skipped_invisible,
         ) = match page_result {
                 Ok(extraction) => extraction,
@@ -528,7 +606,7 @@ fn extract_positioned_text_impl_reporting_invisible(
             && skipped_invisible
             && !crate::has_visible_text(&items)
         {
-            if let Ok(((layer, _, _), _, layer_gid, layer_rotated, _)) =
+            if let Ok(((layer, _, _), _, layer_gid, layer_turn, _)) =
                 extract_page_text_items_with_forms(
                     doc,
                     page_id,
@@ -542,15 +620,16 @@ fn extract_positioned_text_impl_reporting_invisible(
                 if crate::is_adoptable_ocr_layer(&layer) {
                     items = layer;
                     has_gid_fonts = layer_gid;
-                    coords_rotated = layer_rotated;
+                    turn = layer_turn;
                     skipped_invisible = false;
                     ocr_layer_pages.insert(*page_num);
                 }
             }
         }
         skipped_invisible_anywhere |= skipped_invisible;
+        let coords_rotated = turn.is_turned();
         if coords_rotated {
-            rotated_pages.insert(*page_num);
+            turned_pages.insert(*page_num, turn);
         }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
@@ -630,6 +709,73 @@ fn extract_positioned_text_impl_reporting_invisible(
         if has_gid_fonts {
             gid_encoded_pages.insert(*page_num);
         }
+        // A run or image drawn wholly outside the visible box is one no
+        // reader sees: the overflowing right of a display equation, a
+        // producer's hidden tag below the sheet, the facing page of an
+        // imposed spread drawn off the sheet. The heuristic above keeps
+        // short off-box fragments because their coordinates used to be
+        // untrustworthy; the hull is measured from the full matrix, so it
+        // can be trusted, and it is in user space whatever frame the page's
+        // runs were turned into. The same six points of grace, so a glyph
+        // touching the edge stays and is clipped by the caller. A scan's
+        // adopted OCR layer is left alone: its positions are the
+        // recogniser's guess and the words are the point.
+        if !include_invisible && !ocr_layer_pages.contains(page_num) {
+            if let Some((bx0, by0, bx1, by1)) = visible_page_box(doc, page_id) {
+                if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 {
+                    const TOL: f32 = 6.0;
+                    let visible = |hull: &[f32; 4]| {
+                        hull[2] >= bx0 - TOL
+                            && hull[0] <= bx1 + TOL
+                            && hull[3] >= by0 - TOL
+                            && hull[1] <= by1 + TOL
+                    };
+                    // A run whose hull is off the box but which continues an
+                    // on-box line (same baseline, pen to pen) is placed by a
+                    // model this walker does not fully follow; it stays, as
+                    // the clip above keeps it.
+                    let on_box: Vec<bool> = items
+                        .iter()
+                        .map(|it| it.hull.as_ref().is_none_or(visible))
+                        .collect();
+                    let continues_a_line = |off: &TextItem| {
+                        items.iter().zip(&on_box).any(|(it, &kept)| {
+                            kept && (it.y - off.y).abs() <= 2.0
+                                && ((off.x - (it.x + it.width)).abs() <= 10.0
+                                    || (it.x - (off.x + off.width)).abs() <= 10.0)
+                        })
+                    };
+                    let keep: Vec<bool> = items
+                        .iter()
+                        .zip(&on_box)
+                        .map(|(it, &kept)| {
+                            kept || !matches!(it.item_type, ItemType::Text | ItemType::Image)
+                                || continues_a_line(it)
+                        })
+                        .collect();
+                    let before = items.len();
+                    let mut keep = keep.into_iter();
+                    items.retain(|_| keep.next().unwrap_or(true));
+                    // A form placement on a turned page is in the walk's
+                    // landscape frame (x = Y, y = -(X + W), sides exchanged).
+                    forms.retain(|f| {
+                        let hull = if coords_rotated {
+                            [-(f.y + f.height), f.x, -f.y, f.x + f.width]
+                        } else {
+                            [f.x, f.y, f.x + f.width, f.y + f.height]
+                        };
+                        visible(&hull)
+                    });
+                    if items.len() < before {
+                        debug!(
+                            "page {}: dropped {} runs drawn wholly outside the page box",
+                            page_num,
+                            before - items.len()
+                        );
+                    }
+                }
+            }
+        }
         let threshold = crate::text_utils::fix_letterspaced_items(&mut items);
         if threshold > 0.10 {
             page_thresholds.insert(*page_num, threshold);
@@ -695,7 +841,7 @@ fn extract_positioned_text_impl_reporting_invisible(
         gid_encoded_pages,
         skipped_invisible_anywhere,
         ocr_layer_pages,
-        rotated_pages,
+        turned_pages,
     ))
 }
 
@@ -830,6 +976,75 @@ pub(crate) fn image_bbox_from_ctm(ctm: &[f32; 6]) -> (f32, f32, f32, f32) {
         }
     }
     (x_min, y_min, x_max - x_min, y_max - y_min)
+}
+
+/// The axis-aligned hull, in user space, of a run shown with the combined
+/// matrix `m` (text matrix times CTM): its origin, `advance_ts` text-space
+/// units along the text x axis and `size_ts` along the text y axis, with
+/// every corner transformed. For an upright matrix this is the run's
+/// `(x, y, x + width, y + height)`; for a turned, mirrored or skewed one it
+/// is the box the glyphs cover, which the device-axis extents cannot say.
+pub(crate) fn run_hull(m: &[f32; 6], advance_ts: f32, size_ts: f32) -> [f32; 4] {
+    let corners = [
+        apply_ctm_point(m, 0.0, 0.0),
+        apply_ctm_point(m, advance_ts, 0.0),
+        apply_ctm_point(m, 0.0, size_ts),
+        apply_ctm_point(m, advance_ts, size_ts),
+    ];
+    hull_of(&corners)
+}
+
+/// The hull of a run whose origin and end are known as two combined
+/// matrices (the matrix before and after the glyphs were shown), `size_ts`
+/// text-space units tall along the start matrix's y axis.
+pub(crate) fn run_hull_between(start: &[f32; 6], end: &[f32; 6], size_ts: f32) -> [f32; 4] {
+    let corners = [
+        apply_ctm_point(start, 0.0, 0.0),
+        apply_ctm_point(end, 0.0, 0.0),
+        apply_ctm_point(start, 0.0, size_ts),
+        apply_ctm_point(end, 0.0, size_ts),
+    ];
+    hull_of(&corners)
+}
+
+fn hull_of(corners: &[(f32, f32)]) -> [f32; 4] {
+    let mut hull = [corners[0].0, corners[0].1, corners[0].0, corners[0].1];
+    for &(x, y) in &corners[1..] {
+        hull[0] = hull[0].min(x);
+        hull[1] = hull[1].min(y);
+        hull[2] = hull[2].max(x);
+        hull[3] = hull[3].max(y);
+    }
+    hull
+}
+
+/// The hull of a run shown with `m`, when the advance model is one to
+/// trust: a font with widths, an advance measured from them, and a
+/// horizontal writing mode. A run with no widths has no measured
+/// advance, and a vertical font (Identity-V, or a CMap with WMode 1)
+/// advances down the page where this walker advances along x; both
+/// get no hull, which keeps them as the walker measured them and out
+/// of the off-page drop.
+pub(crate) fn run_hull_if_known(
+    font: Option<&crate::types::FontWidthInfo>,
+    advance_ts: Option<f32>,
+    m: &[f32; 6],
+    size_ts: f32,
+) -> Option<[f32; 4]> {
+    let font = font?;
+    let advance_ts = advance_ts?;
+    if font.wmode != 0 {
+        return None;
+    }
+    Some(run_hull(m, advance_ts, size_ts))
+}
+
+/// The hull around two runs' hulls: known only when both are.
+pub(crate) fn union_hulls(a: Option<[f32; 4]>, b: Option<[f32; 4]>) -> Option<[f32; 4]> {
+    match (a, b) {
+        (Some(a), Some(b)) => Some([a[0].min(b[0]), a[1].min(b[1]), a[2].max(b[2]), a[3].max(b[3])]),
+        _ => None,
+    }
 }
 
 /// Multiply two 2D transformation matrices
@@ -1284,6 +1499,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             let first = group[i];
             let mut text = first.text.clone();
             let mut end_x = first.x + effective_merge_width(first);
+            let mut hull = first.hull;
 
             // Tracked display text: run-local space floor overrides the
             // fixed thresholds for this run's junctions (see helper).
@@ -1363,6 +1579,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
                     text.push(' ');
                 }
                 text.push_str(&next.text);
+                hull = union_hulls(hull, next.hull);
                 let next_end = next.x + effective_merge_width(next);
                 end_x = if *preserve_stream_order {
                     end_x.max(next_end)
@@ -1373,6 +1590,7 @@ pub(crate) fn merge_text_items(items: Vec<TextItem>) -> Vec<TextItem> {
             }
 
             merged.push(TextItem {
+                hull,
                 text,
                 x: first.x,
                 y: first.y,
@@ -1490,6 +1708,7 @@ pub(crate) fn merge_subscript_items(items: Vec<TextItem>) -> Vec<TextItem> {
                             let raised = item.y > parent.y + parent.font_size * 0.1;
                             parent.text.push_str(&map_script_digits(&item.text, raised));
                             parent.width = (item.x + item.width) - parent.x;
+                            parent.hull = union_hulls(parent.hull, item.hull);
                             continue;
                         }
                     }
@@ -1676,7 +1895,7 @@ mod tests {
     }
 
     fn make_merge_item(text: &str, x: f32, width: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.into(),
             x,
             y: 700.0,
@@ -1935,7 +2154,7 @@ mod tests {
     #[test]
     fn test_group_into_lines() {
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "Hello".into(),
                 x: 100.0,
                 y: 700.0,
@@ -1952,7 +2171,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "World".into(),
                 x: 160.0,
                 y: 700.0,
@@ -1969,7 +2188,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "Next line".into(),
                 x: 100.0,
                 y: 680.0,
@@ -2756,7 +2975,7 @@ mod tests {
     fn test_word_level_items_get_spaces() {
         // Simulate CID font per-word items touching with gap=0
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "the".into(),
                 x: 100.0,
                 y: 500.0,
@@ -2773,7 +2992,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "Prague".into(),
                 x: 119.5,
                 y: 500.0,
@@ -2790,7 +3009,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "Rules".into(),
                 x: 161.5,
                 y: 500.0,
@@ -2818,7 +3037,7 @@ mod tests {
     fn test_single_char_items_still_join() {
         // Per-glyph positioning: single chars should join into words
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "N".into(),
                 x: 100.0,
                 y: 500.0,
@@ -2835,7 +3054,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "A".into(),
                 x: 108.0,
                 y: 500.0,
@@ -2852,7 +3071,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "V".into(),
                 x: 116.0,
                 y: 500.0,
@@ -2882,7 +3101,7 @@ mod tests {
         // separate TextItem. Intra-word gaps are ≈ 0, word gaps ≈ 2.0 at
         // font_size 13.3 (ratio 0.15). Must detect word boundaries correctly.
         fn char_item(ch: &str, x: f32, width: f32) -> TextItem {
-            TextItem {
+            TextItem { hull: None,
                 text: ch.into(),
                 x,
                 y: 719.3,
@@ -2919,7 +3138,7 @@ mod tests {
     fn test_per_glyph_words_not_merged() {
         // Verify multiple words from per-character rendering get spaces between them
         fn char_item(ch: &str, x: f32, width: f32) -> TextItem {
-            TextItem {
+            TextItem { hull: None,
                 text: ch.into(),
                 x,
                 y: 705.5,
@@ -2957,7 +3176,7 @@ mod tests {
     fn test_cjk_items_join_without_spaces() {
         // Japanese text items touching at gap=0 should join without spaces
         let items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "である".into(),
                 x: 100.0,
                 y: 500.0,
@@ -2974,7 +3193,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "履行義務".into(),
                 x: 124.0,
                 y: 500.0,
@@ -2991,7 +3210,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "を識別す".into(),
                 x: 156.0,
                 y: 500.0,
@@ -3016,7 +3235,7 @@ mod tests {
     }
 
     fn make_item(text: &str, x: f32, y: f32, width: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.into(),
             x,
             y,
@@ -3156,7 +3375,7 @@ mod tests {
     #[test]
     fn test_rtl_line_sorting() {
         let mut items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "\u{05D0}".into(), // alef at x=100
                 x: 100.0,
                 y: 700.0,
@@ -3173,7 +3392,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "\u{05D1}".into(), // bet at x=200 (rightmost)
                 x: 200.0,
                 y: 700.0,
@@ -3200,7 +3419,7 @@ mod tests {
     #[test]
     fn test_ltr_unaffected() {
         let mut items = vec![
-            TextItem {
+            TextItem { hull: None,
                 text: "Hello".into(),
                 x: 100.0,
                 y: 700.0,
@@ -3217,7 +3436,7 @@ mod tests {
                 item_type: ItemType::Text,
                 mcid: None,
             },
-            TextItem {
+            TextItem { hull: None,
                 text: "World".into(),
                 x: 200.0,
                 y: 700.0,
@@ -3260,7 +3479,7 @@ mod tests {
             y,
             page,
             adaptive_threshold: 0.10,
-            items: vec![TextItem {
+            items: vec![TextItem { hull: None,
                 text: "text".into(),
                 x,
                 y,
@@ -3307,7 +3526,7 @@ mod tests {
             y,
             page,
             adaptive_threshold: 0.10,
-            items: vec![TextItem {
+            items: vec![TextItem { hull: None,
                 text: "text".into(),
                 x,
                 y,
@@ -3354,7 +3573,7 @@ mod tests {
             y,
             page,
             adaptive_threshold: 0.10,
-            items: vec![TextItem {
+            items: vec![TextItem { hull: None,
                 text: "text".into(),
                 x,
                 y,
@@ -3394,7 +3613,7 @@ mod tests {
     }
 
     fn make_item_fs(text: &str, x: f32, y: f32, width: f32, font_size: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.into(),
             x,
             y,
@@ -3662,5 +3881,512 @@ mod tests {
         ];
         let merged = merge_subscript_items(items);
         assert_eq!(merged.len(), 2);
+    }
+
+    /// A one-page document to build: `F1` is Helvetica with 600-unit
+    /// widths unless `fonts` says otherwise, the media box sits on the
+    /// page unless `media_on_pages` puts it on the page tree node.
+    struct Fixture {
+        content: String,
+        media: [i64; 4],
+        media_on_pages: bool,
+        crop: Option<[i64; 4]>,
+        rotate: Option<i64>,
+        /// Extra font resources: (name, font dictionary).
+        fonts: Vec<(String, lopdf::Dictionary)>,
+        /// Form XObjects: (name, stream).
+        xobjects: Vec<(String, lopdf::Stream)>,
+        /// Whether `F1` carries a Widths array at all.
+        widths: bool,
+        /// A Type3 font to add as `T3`, given its glyph procedure stream
+        /// as `CharProcs /square` by the builder.
+        type3: Option<lopdf::Dictionary>,
+        /// A font built against the document (for one that needs objects
+        /// of its own, such as a CMap stream): (name, builder).
+        font_builder: Option<(String, Box<dyn FnOnce(&mut Document) -> lopdf::Dictionary>)>,
+        /// `/Rotate` as any object, overriding `rotate`.
+        rotate_object: Option<lopdf::Object>,
+    }
+
+    impl Fixture {
+        fn new(content: &str) -> Self {
+            Self {
+                content: content.to_owned(),
+                media: [0, 0, 612, 792],
+                media_on_pages: false,
+                crop: None,
+                rotate: None,
+                fonts: Vec::new(),
+                xobjects: Vec::new(),
+                widths: true,
+                type3: None,
+                font_builder: None,
+                rotate_object: None,
+            }
+        }
+
+        fn bytes(self) -> Vec<u8> {
+            use lopdf::{dictionary, Object, Stream};
+            let mut doc = Document::with_version("1.5");
+            let pages_id = doc.new_object_id();
+            let mut f1 = dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type1",
+                "BaseFont" => if self.widths { "Helvetica" } else { "NoSuchFace" },
+            };
+            if self.widths {
+                let widths: Vec<Object> = (0..=255).map(|_| 600.into()).collect();
+                f1.set("FirstChar", 0);
+                f1.set("LastChar", 255);
+                f1.set("Widths", Object::Array(widths));
+            }
+            let font_id = doc.add_object(f1);
+            let mut font_resources = dictionary! { "F1" => font_id };
+            for (name, font) in self.fonts {
+                let id = doc.add_object(font);
+                font_resources.set(name.as_bytes().to_vec(), id);
+            }
+            if let Some((name, build)) = self.font_builder {
+                let font = build(&mut doc);
+                let id = doc.add_object(font);
+                font_resources.set(name.as_bytes().to_vec(), id);
+            }
+            if let Some(mut type3) = self.type3 {
+                let glyph = doc.add_object(Stream::new(
+                    dictionary! {},
+                    b"50 0 d0 0 0 50 50 re f".to_vec(),
+                ));
+                type3.set("CharProcs", dictionary! { "square" => glyph });
+                let id = doc.add_object(type3);
+                font_resources.set(b"T3".to_vec(), id);
+            }
+            let mut resources = dictionary! { "Font" => font_resources.clone() };
+            if !self.xobjects.is_empty() {
+                let mut xobjects = lopdf::Dictionary::new();
+                for (name, mut stream) in self.xobjects {
+                    stream
+                        .dict
+                        .set("Resources", dictionary! { "Font" => font_resources.clone() });
+                    let id = doc.add_object(stream);
+                    xobjects.set(name.as_bytes().to_vec(), id);
+                }
+                resources.set("XObject", xobjects);
+            }
+            let content_id =
+                doc.add_object(Stream::new(dictionary! {}, self.content.as_bytes().to_vec()));
+            let media: Vec<Object> = self.media.iter().map(|v| Object::Integer(*v)).collect();
+            let mut page = dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "Resources" => resources,
+                "Contents" => content_id,
+            };
+            if !self.media_on_pages {
+                page.set("MediaBox", media.clone());
+            }
+            if let Some(crop) = self.crop {
+                page.set("CropBox", crop.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>());
+            }
+            if let Some(rotate) = self.rotate {
+                page.set("Rotate", rotate);
+            }
+            if let Some(rotate) = self.rotate_object {
+                page.set("Rotate", rotate);
+            }
+            let page_id = doc.add_object(page);
+            let mut pages = dictionary! {
+                "Type" => "Pages",
+                "Kids" => vec![Object::Reference(page_id)],
+                "Count" => 1,
+            };
+            if self.media_on_pages {
+                pages.set("MediaBox", media);
+            }
+            doc.objects.insert(pages_id, Object::Dictionary(pages));
+            let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+            doc.trailer.set("Root", catalog_id);
+            let mut bytes = Vec::new();
+            doc.save_to(&mut bytes).unwrap();
+            bytes
+        }
+    }
+
+    /// A one-page document with `content`, a crop box and a rotation.
+    fn page_bytes(content: &str, crop: Option<[i64; 4]>, rotate: Option<i64>) -> Vec<u8> {
+        let mut fixture = Fixture::new(content);
+        fixture.crop = crop;
+        fixture.rotate = rotate;
+        fixture.bytes()
+    }
+
+    fn runs_of(bytes: &[u8]) -> Vec<TextItem> {
+        extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(bytes, None)
+            .unwrap()
+            .extraction
+            .0
+    }
+
+    fn texts_of(items: &[TextItem]) -> Vec<&str> {
+        items.iter().map(|item| item.text.as_str()).collect()
+    }
+
+    fn run<'a>(items: &'a [TextItem], text: &str) -> &'a TextItem {
+        items
+            .iter()
+            .find(|item| item.text == text)
+            .unwrap_or_else(|| panic!("no run {text:?} among {:?}", texts_of(items)))
+    }
+
+    fn close(hull: [f32; 4], want: [f32; 4]) -> bool {
+        hull.iter().zip(want).all(|(a, b)| (a - b).abs() < 0.05)
+    }
+
+    // --- Visible text survives the off-page drop whatever the text model
+    // --- does not follow: these are the cases a run can be placed wrongly.
+
+    #[test]
+    fn horizontal_scaling_moves_the_run_where_the_page_draws_it() {
+        // At 50 Tz the glyph advance and the TJ offset are halved: ten
+        // glyphs of 6 points and a 200-point offset put "tail" at
+        // 300 + (60 + 200) / 2 = 430, well on the page. Without Tz the
+        // model put it at 560 and its hull past the edge.
+        let items = runs_of(
+            &Fixture::new("BT /F1 10 Tf 50 Tz 1 0 0 1 300 700 Tm [(ABCDEFGHIJ) -20000 (tail)] TJ ET")
+                .bytes(),
+        );
+        let tail = run(&items, "tail");
+        assert!((tail.x - 430.0).abs() < 0.05, "{tail:?}");
+        assert!((tail.width - 12.0).abs() < 0.05, "{tail:?}");
+        assert!(close(tail.hull.unwrap(), [430.0, 700.0, 442.0, 710.0]), "{:?}", tail.hull);
+    }
+
+    #[test]
+    fn a_vertical_font_keeps_its_runs_and_measures_no_hull() {
+        // Identity-V advances down the page where this walker advances
+        // along x; its runs get no hull, so nothing about them is trusted
+        // enough to drop. "IJ" sits at (560, 540) on the sheet.
+        use lopdf::dictionary;
+        let cid_font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "Vertical",
+            "CIDSystemInfo" => dictionary! { "Registry" => "Adobe", "Ordering" => "Identity", "Supplement" => 0 },
+            "DW" => 1000,
+        };
+        let mut fixture = Fixture::new(
+            "BT /FV 20 Tf 1 0 0 1 560 760 Tm [<00410042004300440045004600470048> -3000 <00490049>] TJ ET",
+        );
+        fixture.fonts.push((
+            "FV".to_owned(),
+            dictionary! {
+                "Type" => "Font",
+                "Subtype" => "Type0",
+                "BaseFont" => "Vertical",
+                "Encoding" => "Identity-V",
+                "DescendantFonts" => vec![lopdf::Object::Dictionary(cid_font)],
+            },
+        ));
+        let items = runs_of(&fixture.bytes());
+        assert!(!items.is_empty(), "the vertical runs are read");
+        assert!(items.iter().all(|item| item.hull.is_none()), "{items:?}");
+        assert!(
+            items.iter().any(|item| item.text.contains("II")),
+            "the run past the model's edge stays: {:?}",
+            texts_of(&items)
+        );
+    }
+
+    /// A Type0 font over an embedded CMap stream; `wmode_in_dict` puts
+    /// `/WMode 1` in the stream dictionary, else only the body says it.
+    fn vertical_cmap_font(doc: &mut Document, wmode_in_dict: bool) -> lopdf::Dictionary {
+        use lopdf::{dictionary, Object, Stream};
+        let body = b"%!PS-Adobe-3.0 Resource-CMap\n/CIDInit /ProcSet findresource begin\n\
+12 dict begin\nbegincmap\n/CMapName /TestV def\n/WMode 1 def\n\
+1 begincodespacerange\n<0000> <FFFF>\nendcodespacerange\n\
+1 begincidrange\n<0000> <FFFF> 0\nendcidrange\nendcmap\n\
+CMapName currentdict /CMap defineresource pop\nend end\n"
+            .to_vec();
+        let mut dict = dictionary! { "Type" => "CMap", "CMapName" => "TestV" };
+        if wmode_in_dict {
+            dict.set("WMode", 1);
+        }
+        let cmap = doc.add_object(Stream::new(dict, body));
+        let cid_font = dictionary! {
+            "Type" => "Font",
+            "Subtype" => "CIDFontType2",
+            "BaseFont" => "Vertical",
+            "CIDSystemInfo" => dictionary! { "Registry" => "Adobe", "Ordering" => "Identity", "Supplement" => 0 },
+            "DW" => 1000,
+        };
+        dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => "Vertical",
+            "Encoding" => cmap,
+            "DescendantFonts" => vec![Object::Dictionary(cid_font)],
+        }
+    }
+
+    #[test]
+    fn an_embedded_vertical_cmap_keeps_its_runs_and_measures_no_hull() {
+        for wmode_in_dict in [true, false] {
+            let mut fixture = Fixture::new(
+                "BT /FV 20 Tf 1 0 0 1 560 760 Tm [<00410042004300440045004600470048> -3000 <00490049>] TJ ET",
+            );
+            fixture.font_builder = Some((String::from("FV"), Box::new(move |doc| vertical_cmap_font(doc, wmode_in_dict))));
+            let items = runs_of(&fixture.bytes());
+            assert!(!items.is_empty(), "the vertical runs are read (WMode in dict: {wmode_in_dict})");
+            assert!(items.iter().all(|item| item.hull.is_none()), "{items:?}");
+            assert!(
+                items.iter().any(|item| item.text.contains("II")),
+                "the run past the model's edge stays (WMode in dict: {wmode_in_dict}): {:?}",
+                texts_of(&items)
+            );
+        }
+    }
+
+    #[test]
+    fn a_form_inherits_the_horizontal_scaling_of_its_caller() {
+        use lopdf::{dictionary, Stream};
+        // 50 Tz set on the page is graphics state the form runs in: the
+        // form's ten glyphs and 200-point offset put "tail" at
+        // 300 + (60 + 200) / 2 = 430, on the page.
+        let form = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            },
+            b"BT /F1 10 Tf 1 0 0 1 300 700 Tm [(ABCDEFGHIJ) -20000 (tail)] TJ ET".to_vec(),
+        );
+        let mut fixture = Fixture::new("BT 50 Tz ET q /Fx Do Q");
+        fixture.xobjects.push(("Fx".to_owned(), form));
+        let items = runs_of(&fixture.bytes());
+        let tail = run(&items, "tail");
+        assert!((tail.x - 430.0).abs() < 0.05, "{tail:?}");
+        assert!(close(tail.hull.unwrap(), [430.0, 700.0, 442.0, 710.0]), "{:?}", tail.hull);
+    }
+
+    #[test]
+    fn a_real_rotation_is_rounded_as_the_metadata_reader_rounds_it() {
+        use lopdf::Object;
+        let mut fixture = Fixture::new("BT /F1 10 Tf 1 0 0 1 100 300 Tm (turned) Tj ET");
+        fixture.rotate_object = Some(Object::Real(269.5));
+        let bytes = fixture.bytes();
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        assert_eq!(extraction.page_boxes[&1].rotation, 270);
+    }
+
+    #[test]
+    fn a_crop_box_off_the_sheet_does_not_empty_the_page() {
+        // A crop box that misses the media box shows the media box in
+        // viewers; the drop measures against the same box.
+        let mut fixture = Fixture::new("BT /F1 10 Tf 1 0 0 1 100 300 Tm (still here) Tj ET");
+        fixture.crop = Some([0, 800, 612, 1592]);
+        let items = runs_of(&fixture.bytes());
+        assert_eq!(texts_of(&items), ["still here"]);
+    }
+
+    #[test]
+    fn a_backtracking_tj_hull_covers_the_pen_both_ways() {
+        // Ten glyphs from -40 reach 20; the 9000 offset sends the pen back
+        // to -70 for "K". The segment's glyphs cover -70..20, which is
+        // partly on the page, so the run stays.
+        let items = runs_of(
+            &Fixture::new("BT /F1 10 Tf 1 0 0 1 -40 700 Tm [(ABCDEFGHIJ) 9000 (K)] TJ ET").bytes(),
+        );
+        assert_eq!(items.len(), 1, "{:?}", texts_of(&items));
+        let hull = items[0].hull.unwrap();
+        assert!(close(hull, [-70.0, 700.0, 20.0, 710.0]), "{hull:?}");
+    }
+
+    #[test]
+    fn a_font_with_no_widths_keeps_its_runs_and_measures_no_hull() {
+        // No advance can be measured, so the hull is unknown and the run
+        // is left where the walker put it rather than dropped for
+        // starting left of the sheet.
+        let mut fixture = Fixture::new("BT /F1 12 Tf 1 0 0 1 -30 700 Tm (mostly on the page) Tj ET");
+        fixture.widths = false;
+        let items = runs_of(&fixture.bytes());
+        assert_eq!(texts_of(&items), ["mostly on the page"]);
+        assert!(items[0].hull.is_none(), "{items:?}");
+    }
+
+    #[test]
+    fn a_run_continuing_an_on_page_line_stays() {
+        // The first run ends 50 points left of the sheet by its hull, but
+        // the next run on the same baseline starts where its pen stopped:
+        // the pair is one line placed by a model the walker does not
+        // follow in full, and the clip keeps such lines whole.
+        let items = runs_of(
+            &Fixture::new(
+                "BT /F1 10 Tf 1 0 0 1 -200 700 Tm (twentyfive letters here!!) Tj ET\n\
+                 BT /F1 10 Tf 1 0 0 1 -40 700 Tm (and on the page) Tj ET",
+            )
+            .bytes(),
+        );
+        let texts = texts_of(&items);
+        assert!(
+            texts.iter().any(|text| text.contains("twentyfive")),
+            "{texts:?}"
+        );
+    }
+
+    // --- Hulls under the rest of the text model.
+
+    #[test]
+    fn a_form_matrix_moves_the_hull_with_the_glyphs() {
+        use lopdf::{dictionary, Stream};
+        let form = Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 200.into(), 100.into()],
+                "Matrix" => vec![1.into(), 0.into(), 0.into(), 1.into(), 50.into(), 100.into()],
+            },
+            b"BT /F1 10 Tf 1 0 0 1 10 20 Tm (in the form) Tj ET".to_vec(),
+        );
+        let mut fixture = Fixture::new("q 1 0 0 1 200 300 cm /Fx Do Q");
+        fixture.xobjects.push(("Fx".to_owned(), form));
+        let items = runs_of(&fixture.bytes());
+        let item = run(&items, "in the form");
+        // 11 glyphs of 6 points from (200 + 50 + 10, 300 + 100 + 20).
+        assert!(close(item.hull.unwrap(), [260.0, 420.0, 326.0, 430.0]), "{:?}", item.hull);
+    }
+
+    #[test]
+    fn a_type3_font_scales_the_hull_by_its_matrix() {
+        use lopdf::{dictionary, Object};
+        // The glyph procedure is a stream, and a stream is an indirect
+        // object; the fixture writes the font over the page's document so
+        // the reference resolves.
+        let mut fixture = Fixture::new("BT /T3 10 Tf 1 0 0 1 100 700 Tm (aaa) Tj ET");
+        fixture.type3 = Some(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type3",
+            "FontBBox" => vec![0.into(), 0.into(), 50.into(), 50.into()],
+            "FontMatrix" => vec![Object::Real(0.01), 0.into(), 0.into(), Object::Real(0.01), 0.into(), 0.into()],
+            "Encoding" => dictionary! { "Type" => "Encoding", "Differences" => vec![97.into(), Object::Name(b"square".to_vec())] },
+            "FirstChar" => 97,
+            "LastChar" => 97,
+            "Widths" => vec![50.into()],
+        });
+        let items = runs_of(&fixture.bytes());
+        let item = run(&items, "aaa");
+        let hull = item.hull.unwrap();
+        // Three glyphs of 50 glyph-space units under a 0.01 matrix at 10
+        // points: 5 points each, 15 in all.
+        assert!((hull[0] - 100.0).abs() < 0.05 && (hull[2] - 115.0).abs() < 0.05, "{hull:?}");
+        assert!((hull[1] - 700.0).abs() < 0.05 && hull[3] > 700.0, "{hull:?}");
+    }
+
+    #[test]
+    fn an_inherited_media_box_with_a_negative_origin_frames_the_drop() {
+        // The page tree node carries MediaBox [-100 -100 512 692]: a run at
+        // the user-space origin is on the sheet, one 150 points left of it
+        // is off.
+        let mut fixture = Fixture::new(
+            "BT /F1 10 Tf 1 0 0 1 0 0 Tm (at the origin) Tj ET\n\
+             BT /F1 10 Tf 1 0 0 1 -250 300 Tm (off the sheet) Tj ET",
+        );
+        fixture.media = [-100, -100, 512, 692];
+        fixture.media_on_pages = true;
+        let bytes = fixture.bytes();
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        assert_eq!(extraction.page_boxes[&1].media_box, Some([-100.0, -100.0, 512.0, 692.0]));
+        assert_eq!(texts_of(&extraction.extraction.0), ["at the origin"]);
+    }
+
+    #[test]
+    fn runs_drawn_wholly_off_the_visible_box_are_dropped_and_straddlers_kept() {
+        // Crop box 36..432 by 0..396 on a letter sheet: a hidden tag below
+        // the sheet, a heading off the left edge and a matrix row off the
+        // right are seen by nobody; a run across the right edge is seen in
+        // part and stays for the caller to clip.
+        let bytes = page_bytes(
+            "BT /F1 6 Tf 1 0 0 1 218 -14 Tm (<UN>) Tj ET\n\
+             BT /F1 29 Tf 1 0 0 1 -506 747 Tm (Introduction) Tj ET\n\
+             BT /F1 10 Tf 1 0 0 1 440 300 Tm (overflow) Tj ET\n\
+             BT /F1 10 Tf 1 0 0 1 420 200 Tm (straddle) Tj ET\n\
+             BT /F1 10 Tf 1 0 0 1 100 300 Tm (visible) Tj ET",
+            Some([36, 0, 432, 396]),
+            None,
+        );
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        let texts: Vec<&str> = extraction.extraction.0.iter().map(|item| item.text.as_str()).collect();
+        assert_eq!(texts, ["visible", "straddle"], "{texts:?}");
+    }
+
+    #[test]
+    fn the_walk_reports_each_pages_boxes_and_rotation() {
+        let bytes = page_bytes("BT /F1 10 Tf 1 0 0 1 100 300 Tm (visible) Tj ET", Some([36, 0, 432, 396]), None);
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        let page = extraction.page_boxes[&1];
+        assert_eq!(page.crop_box, Some([36.0, 0.0, 432.0, 396.0]));
+        assert_eq!(page.media_box, Some([0.0, 0.0, 612.0, 792.0]));
+        assert_eq!(page.rotation, 0);
+        let bytes = page_bytes("BT /F1 10 Tf 1 0 0 1 100 300 Tm (visible) Tj ET", None, Some(-90));
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        let page = extraction.page_boxes[&1];
+        assert_eq!(page.crop_box, None, "a page declaring no crop box says so");
+        assert_eq!(page.rotation, 270, "a negative /Rotate is folded into [0, 360)");
+    }
+
+    #[test]
+    fn a_turned_page_is_still_clipped_by_its_hulls() {
+        // /Rotate 270 with text drawn reading down the sheet, as such a
+        // page is written: one line on the sheet and one 200 points below
+        // it. The walk turns the page's runs into its own frame; the hulls
+        // stay in user space and the off-sheet line is dropped by them.
+        let bytes = page_bytes(
+            "BT /F1 1 Tf 0 -11 11 0 500 762 Tm (on the sheet) Tj ET\n\
+             BT /F1 1 Tf 0 -11 11 0 -200 762 Tm (off the sheet) Tj ET\n\
+             BT /F1 1 Tf 0 -11 11 0 480 762 Tm (second line) Tj ET\n\
+             BT /F1 1 Tf 0 -11 11 0 460 762 Tm (third line) Tj ET",
+            None,
+            Some(270),
+        );
+        let extraction =
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(&bytes, None).unwrap();
+        assert!(extraction.rotated_pages.contains(&1), "the walk turned the page");
+        let texts: Vec<&str> = extraction.extraction.0.iter().map(|item| item.text.as_str()).collect();
+        assert!(texts.contains(&"on the sheet") && !texts.contains(&"off the sheet"), "{texts:?}");
+        let run = extraction.extraction.0.iter().find(|item| item.text == "on the sheet").unwrap();
+        let hull = run.hull.expect("measured");
+        // Twelve glyphs of 6.6 points run down from y = 762; the glyph
+        // height runs right from x = 500.
+        assert!((hull[0] - 500.0).abs() < 0.05 && (hull[2] - 511.0).abs() < 0.05, "{hull:?}");
+        assert!((hull[3] - 762.0).abs() < 0.05 && (hull[1] - (762.0 - 79.2)).abs() < 0.05, "{hull:?}");
+    }
+
+    #[test]
+    fn a_turned_page_says_which_way_its_text_reads() {
+        // The direction is the text's, not the page's /Rotate: the same
+        // three lines read down the sheet or up it, on a sheet shown
+        // without a turn.
+        let lines = |matrix: &str| {
+            [500, 480, 460]
+                .iter()
+                .map(|x| format!("BT /F1 1 Tf {matrix} {x} 400 Tm (a line) Tj ET\n"))
+                .collect::<String>()
+        };
+        let read = |content: String| {
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
+                &page_bytes(&content, None, None),
+                None,
+            )
+            .unwrap()
+        };
+        let down = read(lines("0 -11 11 0"));
+        assert!(down.rotated_pages.contains(&1) && down.downward_pages.contains(&1));
+        let up = read(lines("0 11 -11 0"));
+        assert!(up.rotated_pages.contains(&1) && up.downward_pages.is_empty());
+        let upright = read(lines("11 0 0 11"));
+        assert!(upright.rotated_pages.is_empty() && upright.downward_pages.is_empty());
     }
 }

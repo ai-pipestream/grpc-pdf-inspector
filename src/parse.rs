@@ -462,37 +462,27 @@ fn parse(
             // library's own region and whole-document pipelines read it.
             let pdf_inspector::OcrLayerExtraction {
                 extraction: (items, rects, lines),
-                mut forms,
+                forms,
                 skipped_invisible,
                 ocr_layer_pages,
                 rotated_pages,
+                downward_pages,
+                page_boxes,
             } = guarded(guard, || {
                 pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
                     bytes,
                     filter.as_ref(),
                 )
             })?;
-            // A landscape page drawn turned comes back in a frame of the
-            // library's own, off the page. The page boxes are read only when
-            // there is such a page, and what goes on the wire is moved onto
-            // the page a reader sees as it is emitted (`crate::frame`).
-            let moved = if rotated_pages.is_empty() {
-                BTreeMap::new()
-            } else {
-                let password = (!options.password.is_empty()).then_some(options.password.as_str());
-                let geometry = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    crate::metadata::read(bytes, password, guard.max_stream_bytes)
-                }))
-                .ok()
-                .flatten()
-                .map(|metadata| metadata.pages)
-                .unwrap_or_default();
-                crate::frame::movable_pages(&rotated_pages, &geometry)
-            };
-            crate::frame::place_forms(&moved, &mut forms);
-            if let Some(fold) = events.fold.as_mut() {
-                fold.turn_pages(moved.keys().copied());
-            }
+            // Every box goes on the wire placed on the page a reader sees:
+            // moved by the crop box's corner, turned by the page's
+            // rotation, and turned back out of the library's own frame on
+            // a page whose text it read sideways (`crate::frame`). The
+            // boxes come from the walk itself, so this costs no second
+            // read; a page with no box anywhere keeps the library's
+            // coordinates.
+            let frames =
+                crate::frame::PageFrame::of_pages(&page_boxes, &rotated_pages, &downward_pages);
             // Where the page invoked Form XObjects. A vector figure is one,
             // and it draws no image run, so this is the only record of
             // where it sits. They ride the spans event, after the runs.
@@ -577,6 +567,7 @@ fn parse(
                 // the parser, so the call's time is checked here too.
                 check(guard)?;
                 let page_items = by_page.remove(&page_no).unwrap_or_default();
+                let frame = frames.get(&page_no);
 
                 // A page that drew a picture and no text at all is a scan,
                 // or a page whose words are in a figure, and it needs OCR
@@ -605,7 +596,13 @@ fn parse(
                 // runs, one whole read of the file later. They go out
                 // before the markdown that flattens them into pipe
                 // characters.
-                let page_tables = tables::page_tables(page_no, &page_items, &rects, &lines);
+                let page_tables = tables::page_tables(
+                    page_no,
+                    &page_items,
+                    &rects,
+                    &lines,
+                    rotated_pages.contains(&page_no),
+                );
                 if page_tables.as_ref().is_some_and(tables::has_data_table) {
                     pages_with_tables.push(page_no);
                 }
@@ -621,8 +618,8 @@ fn parse(
                     pages_with_columns.push(page_no);
                 }
                 if let Some(mut tables) = page_tables {
-                    if let Some(crop) = moved.get(&page_no) {
-                        crate::frame::place_tables(*crop, &mut tables);
+                    if let Some(frame) = frame {
+                        frame.place_tables(&mut tables);
                     }
                     events.route(
                         pb::parse_pdf_response::Event::Tables(tables),
@@ -639,18 +636,16 @@ fn parse(
                 // sit in the middle of that line's letters, where no block
                 // of the rendering can match across it.
                 if events.wanted(options.emit_spans) {
-                    let mut spans = spans::page_spans_marking(page_no, &page_items, |item| {
-                        chrome.convicts(item)
-                    });
-                    if let Some(crop) = moved.get(&page_no) {
-                        crate::frame::place_spans(*crop, &mut spans.spans);
-                    }
+                    let mut spans =
+                        spans::page_spans_marking(page_no, &page_items, frame, |item| {
+                            chrome.convicts(item)
+                        });
                     spans.spans.extend(
                         forms
                             .remove(&page_no)
                             .unwrap_or_default()
                             .iter()
-                            .map(spans::form_span),
+                            .map(|form| spans::form_span(form, frame)),
                     );
                     events.route(
                         pb::parse_pdf_response::Event::Spans(spans),
@@ -688,7 +683,7 @@ fn parse(
                                     | pdf_inspector::types::ItemType::FormField
                             )
                         })
-                        .map(spans::span)
+                        .map(|item| spans::span(item, frame))
                         .collect()
                 } else {
                     Vec::new()
@@ -701,7 +696,7 @@ fn parse(
                     detected.page_count,
                 );
                 let markdown = markdown.trim().to_owned();
-                let mut dropped = absent_from(content, &markdown);
+                let dropped = absent_from(content, &markdown);
                 let markdown_bytes = markdown.len() as u64;
                 let reasons = verdicts.get(&page_no);
                 let needs_ocr = reasons.is_some();
@@ -716,16 +711,12 @@ fn parse(
                 let encoding_issues = !ocr_layer_pages.contains(&page_no)
                     && pdf_inspector::detect_encoding_issues(&markdown);
                 has_encoding_issues |= encoding_issues;
-                let mut page_invisible: Vec<pb::TextSpan> = invisible
+                let page_invisible: Vec<pb::TextSpan> = invisible
                     .remove(&page_no)
                     .unwrap_or_default()
                     .iter()
-                    .map(spans::span)
+                    .map(|item| spans::span(item, frame))
                     .collect();
-                if let Some(crop) = moved.get(&page_no) {
-                    crate::frame::place_spans(*crop, &mut dropped);
-                    crate::frame::place_spans(*crop, &mut page_invisible);
-                }
                 events.send_page(pb::PageMarkdown {
                     page_no,
                     markdown,
@@ -1294,6 +1285,7 @@ mod tests {
     /// One extracted item of the given kind on page 1.
     fn item(text: &str, item_type: pdf_inspector::types::ItemType) -> pdf_inspector::TextItem {
         pdf_inspector::TextItem {
+            hull: None,
             text: text.to_owned(),
             x: 72.0,
             y: 700.0,

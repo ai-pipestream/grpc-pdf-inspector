@@ -162,12 +162,20 @@ pub struct PdfOptions {
     pub emit_page_documents: bool,
 }
 /// TableCells is one row of a detected table.
-#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TableCells {
     /// The row's cells, left to right. A row shorter than the table's column
     /// count ends where the detector found it ending.
     #[prost(string, repeated, tag="1")]
     pub cells: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The box of each cell in `cells`, in the same order, on the page as
+    /// displayed. Each is cut from the grid in the frame the detector read
+    /// it in (this column's start to the next, this row's bottom to the
+    /// previous row's, the outermost from the extent) and then placed with
+    /// the page, so a turned or mirrored page keeps every cell with its
+    /// text. Empty when the table has no extent.
+    #[prost(message, repeated, tag="2")]
+    pub boxes: ::prost::alloc::vec::Vec<Rect>,
 }
 /// TableRegion is one detected table: its grid, its contents, and where its
 /// lines fall on the page.
@@ -211,13 +219,19 @@ pub struct PageTables {
     #[prost(message, repeated, tag="2")]
     pub tables: ::prost::alloc::vec::Vec<TableRegion>,
 }
-/// Rect is an axis-aligned rectangle in PDF user space.
+/// Rect is an axis-aligned rectangle on the page as it is displayed.
 ///
-/// The unit is the PDF point (1/72 inch) and the origin is the page's
-/// bottom-left corner, with y increasing upwards — the space the file
-/// itself is written in, unrotated and unscaled. A consumer that wants
-/// top-left coordinates subtracts from the page box, which arrives on
-/// `PageGeometry`.
+/// The unit is the PDF point (1/72 inch), unscaled by `user_unit`. The
+/// frame is the page a reader sees: the crop box (the media box when the
+/// page declares none), turned by the page's `/Rotate`, with the origin at
+/// the displayed page's bottom-left corner and y increasing upwards. That
+/// is user space when the crop box starts at the origin and the page is
+/// not rotated, which is the common case; otherwise every box has been
+/// moved by the crop box's corner and turned with the page, so it lands
+/// where the page shows it. A box is clipped to the page: what hangs off
+/// the sheet is seen by no one. The boxes on `PageGeometry` are the
+/// exception, being the page's own declaration in user space. A consumer
+/// that wants top-left coordinates subtracts from the displayed height.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct Rect {
     /// Distance from the page's left edge to the rectangle's left edge.
