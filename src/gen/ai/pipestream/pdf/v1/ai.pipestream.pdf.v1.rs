@@ -1542,7 +1542,6 @@ pub struct PageDocument {
     pub document: ::core::option::Option<super::super::document::v1::Document>,
 }
 /// GetServiceInfoRequest asks for the server's build and limits. It carries
-/// GetServiceInfoRequest asks for the server's build and limits. It carries
 /// no arguments; the message exists so the RPC can gain them additively.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct GetServiceInfoRequest {
