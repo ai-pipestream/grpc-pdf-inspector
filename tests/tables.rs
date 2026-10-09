@@ -317,3 +317,31 @@ async fn the_cells_of_a_turned_grid_shown_anticlockwise_hold_their_text() {
 async fn the_cells_of_an_unturned_grid_hold_their_text() {
     assert_cells_hold_their_text(&common::grid_pdf(None, false), "no rotation").await;
 }
+
+#[tokio::test]
+async fn the_cells_of_a_grid_read_down_an_unturned_sheet_hold_their_text() {
+    // A portrait document with a table turned clockwise: no /Rotate, the
+    // text running down the sheet.
+    assert_cells_hold_their_text(&common::grid_pdf(None, true), "down, no rotation").await;
+}
+
+#[tokio::test]
+async fn the_cells_of_a_grid_read_down_a_clockwise_sheet_hold_their_text() {
+    assert_cells_hold_their_text(&common::grid_pdf(Some(90), true), "down on /Rotate 90").await;
+}
+
+#[tokio::test]
+async fn the_cells_of_a_grid_read_up_an_anticlockwise_sheet_hold_their_text() {
+    assert_cells_hold_their_text(&common::upward_grid_pdf(Some(270)), "up on /Rotate 270").await;
+}
+
+#[tokio::test]
+async fn the_cells_of_a_grid_read_up_a_clockwise_sheet_hold_their_text() {
+    // Distiller's landscape page: the common case.
+    assert_cells_hold_their_text(&common::upward_grid_pdf(Some(90)), "up on /Rotate 90").await;
+}
+
+#[tokio::test]
+async fn the_cells_of_a_grid_read_up_an_unturned_sheet_hold_their_text() {
+    assert_cells_hold_their_text(&common::upward_grid_pdf(None), "up, no rotation").await;
+}

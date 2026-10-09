@@ -466,6 +466,7 @@ fn parse(
                 skipped_invisible,
                 ocr_layer_pages,
                 rotated_pages,
+                downward_pages,
                 page_boxes,
             } = guarded(guard, || {
                 pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
@@ -480,7 +481,8 @@ fn parse(
             // boxes come from the walk itself, so this costs no second
             // read; a page with no box anywhere keeps the library's
             // coordinates.
-            let frames = crate::frame::PageFrame::of_pages(&page_boxes, &rotated_pages);
+            let frames =
+                crate::frame::PageFrame::of_pages(&page_boxes, &rotated_pages, &downward_pages);
             // Where the page invoked Form XObjects. A vector figure is one,
             // and it draws no image run, so this is the only record of
             // where it sits. They ride the spans event, after the runs.

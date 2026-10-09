@@ -54,6 +54,9 @@ pub struct PageFrame {
     /// Whether the library swapped this page's geometry into its landscape
     /// frame.
     turned: bool,
+    /// Whether the text of a turned page reads down the sheet, so that it
+    /// runs towards smaller x in the library's frame.
+    reads_down: bool,
 }
 
 /// A page's crop box corners, in user space.
@@ -153,20 +156,34 @@ impl PageFrame {
                 _ => 0,
             },
             turned,
+            reads_down: false,
         })
     }
 
+    /// This frame with the way a turned page's text reads: `down` when it
+    /// reads down the sheet (the library's `downward_pages`).
+    #[must_use]
+    pub fn reading_down(self, down: bool) -> Self {
+        Self {
+            reads_down: self.turned && down,
+            ..self
+        }
+    }
+
     /// The frames of every measured page, `turned` naming the pages the
-    /// library swapped.
+    /// library swapped and `downward` those of them whose text reads down
+    /// the sheet.
     #[must_use]
     pub fn of_pages(
         boxes: &BTreeMap<u32, PageBox>,
         turned: &BTreeSet<u32>,
+        downward: &BTreeSet<u32>,
     ) -> BTreeMap<u32, PageFrame> {
         boxes
             .iter()
             .filter_map(|(page_no, page)| {
-                Self::of_box(page, turned.contains(page_no)).map(|frame| (*page_no, frame))
+                let frame = Self::of_box(page, turned.contains(page_no))?;
+                Some((*page_no, frame.reading_down(downward.contains(page_no))))
             })
             .collect()
     }
@@ -254,13 +271,17 @@ impl PageFrame {
     /// is placed, and the lists and the cells are rebuilt from where the
     /// bands lie on the displayed page.
     ///
-    /// On a page the library read sideways and shown under `/Rotate 270`
-    /// its frame is a half turn from the page: the text runs towards
-    /// smaller x in that frame, so a column's start is the far end of its
-    /// glyphs and its band reaches back to the previous start, and a row's
-    /// bottom is its top. The bands are cut that way there.
+    /// On a page the library read sideways whose text reads down the
+    /// sheet, its frame is a half turn from the way the text reads: the
+    /// text runs towards smaller x in that frame, so a column's start is
+    /// the far end of its glyphs and its band reaches back to the previous
+    /// start, and a row's bottom is its top. The bands are cut that way
+    /// there. It is the text's direction that decides this, not the
+    /// page's `/Rotate`: a table turned clockwise on a portrait page reads
+    /// down with no `/Rotate` at all, and text reading up stays in step
+    /// with the frame whichever way the page is shown.
     pub fn place_tables(&self, tables: &mut pb::PageTables) {
-        let reversed = self.turned && self.rotation == 270;
+        let reversed = self.reads_down;
         for table in &mut tables.tables {
             let extent = table.bbox;
             let starts = table.column_boundaries.clone();
@@ -757,8 +778,9 @@ mod tests {
 
     #[test]
     fn a_turned_grid_shown_anticlockwise_keeps_its_columns_ascending() {
-        // The library's frame for a /Rotate 270 page is a half turn from
-        // the shown page, so a column's start edge becomes its end edge.
+        // The library's frame for text reading down a /Rotate 270 page is a
+        // half turn from the shown page, so a column's start edge becomes
+        // its end edge.
         // Columns starting at 100 and 200 in an extent reaching 300 are
         // shown as bands 592..692 and 492..592: starts 492 and 592, with
         // the extent's right edge (692) closing the last.
@@ -780,7 +802,9 @@ mod tests {
                 ..Default::default()
             }],
         };
-        frame(270, LETTER, true).place_tables(&mut tables);
+        frame(270, LETTER, true)
+            .reading_down(true)
+            .place_tables(&mut tables);
         let table = &tables.tables[0];
         let rect = table.bbox.as_ref().expect("a box");
         assert!(close(rect, 492.0, 200.0, 200.0, 100.0), "{rect:?}");
@@ -903,9 +927,10 @@ mod tests {
                 (2, PageBox::default()),
             ]),
             &BTreeSet::from([1]),
+            &BTreeSet::from([1]),
         );
         assert_eq!(frames.keys().copied().collect::<Vec<_>>(), [1]);
-        assert!(frames[&1].turned);
+        assert!(frames[&1].turned && frames[&1].reads_down);
         assert_eq!(frames[&1].size(), (792.0, 612.0));
     }
 }

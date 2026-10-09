@@ -383,8 +383,13 @@ against an independent interpretation of its content stream:
   was read in and placed with the page, so a mirrored or quarter-turned
   page keeps every cell with its text (the fold prefers it to cutting
   cells from the placed lists); a ruled table keeps its outer fence when
-  mirrored; a page the library read sideways under `/Rotate 270` has its
-  bands cut the other way, since its frame is a half turn from the page.
+  mirrored; a page the library read sideways has its bands cut the other
+  way when its text reads down the sheet, since its frame is then a half
+  turn from the way the text reads. That is the text's direction, carried
+  out of the walk's rotation vote as `downward_pages`, not the page's
+  `/Rotate`: a table turned clockwise on a portrait page reads down with
+  no `/Rotate`, and text reading up stays in step with the frame under
+  any turn.
 - *Not done*: a run's exact quadrilateral is not reported on
   `ProvenanceItem.polygon`; the hull is the axis-aligned box only, and it
   runs from the baseline (the `Rect` contract's `y`), not the descender.

@@ -153,7 +153,7 @@ pub(crate) fn extract_page_text_items(
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
-    let (extraction, _forms, has_gid_fonts, coords_rotated, skipped_invisible) =
+    let (extraction, _forms, has_gid_fonts, turn, skipped_invisible) =
         extract_page_text_items_with_forms(
             doc,
             page_id,
@@ -163,7 +163,7 @@ pub(crate) fn extract_page_text_items(
             style_cache,
             form_budget,
         )?;
-    Ok((extraction, has_gid_fonts, coords_rotated, skipped_invisible))
+    Ok((extraction, has_gid_fonts, turn.is_turned(), skipped_invisible))
 }
 
 /// [`extract_page_text_items`] with the Form XObject placements of the walk
@@ -177,7 +177,7 @@ pub(crate) fn extract_page_text_items_with_forms(
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
-) -> Result<(PageExtraction, Vec<PdfForm>, bool, bool, bool), PdfError> {
+) -> Result<(PageExtraction, Vec<PdfForm>, bool, PageTurn, bool), PdfError> {
     let mut items = Vec::new();
     let mut forms: Vec<PdfForm> = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
@@ -301,7 +301,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                 (Vec::new(), Vec::new(), Vec::new()),
                 Vec::new(),
                 false,
-                false,
+                PageTurn::Upright,
                 false,
             ));
         }
@@ -344,10 +344,7 @@ pub(crate) fn extract_page_text_items_with_forms(
     // Track text direction votes: (horizontal_count, rotated_count).
     // For each text item, if |combined[0]| > |combined[1]| the text runs
     // horizontally (normal); otherwise it's rotated ~90°.
-    let mut rotation_votes = RotationVotes {
-        horizontal: 0,
-        rotated: 0,
-    };
+    let mut rotation_votes = RotationVotes::default();
 
     // Marked content tracking: (ActualText, MCID) per nesting level
     struct MarkedContentEntry {
@@ -586,11 +583,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         let (x, y) = (combined[4], combined[5]);
-                        if combined[0].abs() >= combined[1].abs() {
-                            rotation_votes.horizontal += 1;
-                        } else {
-                            rotation_votes.rotated += 1;
-                        }
+                        rotation_votes.cast(&combined);
                         let width = if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -857,11 +850,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
-                            if combined[0].abs() >= combined[1].abs() {
-                                rotation_votes.horizontal += 1;
-                            } else {
-                                rotation_votes.rotated += 1;
-                            }
+                            rotation_votes.cast(&combined);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
@@ -1012,11 +1001,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                         if !text.trim().is_empty() {
                             let combined =
                                 multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
-                            if combined[0].abs() >= combined[1].abs() {
-                                rotation_votes.horizontal += 1;
-                            } else {
-                                rotation_votes.rotated += 1;
-                            }
+                            rotation_votes.cast(&combined);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
@@ -1192,11 +1177,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                         if let Some(start_tm) = glyph_tm.or(entry_tm) {
                             let rise = glyph_rise.unwrap_or(actual_text_start_rise);
                             let combined = multiply_matrices(&rise_adjusted(&start_tm, rise), &ctm);
-                            if combined[0].abs() >= combined[1].abs() {
-                                rotation_votes.horizontal += 1;
-                            } else {
-                                rotation_votes.rotated += 1;
-                            }
+                            rotation_votes.cast(&combined);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
@@ -1551,9 +1532,9 @@ pub(crate) fn extract_page_text_items_with_forms(
     // Some PDFs embed landscape content in portrait pages using a rotated text
     // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
     // assumes x=horizontal, y=vertical — so we swap coordinates to match.
-    let (mut items, rects, lines, coords_rotated) =
+    let (mut items, rects, lines, turn) =
         correct_rotated_page(items, rects, lines, &rotation_votes);
-    if coords_rotated {
+    if turn.is_turned() {
         rotate_underline_graphics(&mut underline_rects, &mut underline_lines);
         // Form placements follow the rectangles into the rotated frame.
         for form in &mut forms {
@@ -1577,15 +1558,63 @@ pub(crate) fn extract_page_text_items_with_forms(
         (items, rects, lines),
         forms,
         has_gid_fonts,
-        coords_rotated,
+        turn,
         skipped_invisible,
     ))
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
+#[derive(Default)]
 struct RotationVotes {
     horizontal: u32,
     rotated: u32,
+    /// The rotated operators whose text runs down the sheet (towards
+    /// smaller user-space y, `[0, -b, b, 0]`).
+    downward: u32,
+}
+
+impl RotationVotes {
+    /// Count one show operator by its combined matrix.
+    fn cast(&mut self, combined: &[f32; 6]) {
+        if combined[0].abs() >= combined[1].abs() {
+            self.horizontal += 1;
+        } else {
+            self.rotated += 1;
+            if combined[1] < 0.0 {
+                self.downward += 1;
+            }
+        }
+    }
+
+    /// Which way the rotated text mostly runs.
+    fn turn(&self) -> PageTurn {
+        if self.downward * 2 > self.rotated {
+            PageTurn::ReadsDown
+        } else {
+            PageTurn::ReadsUp
+        }
+    }
+}
+
+/// Whether the walk swapped a page into its landscape frame, and which way
+/// the text it found there runs. Text reading up the sheet
+/// (`[0, b, -b, 0]`) runs towards larger x in that frame; text reading
+/// down (`[0, -b, b, 0]`) towards smaller x.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageTurn {
+    /// Not swapped.
+    Upright,
+    /// Swapped, the text reading up the sheet.
+    ReadsUp,
+    /// Swapped, the text reading down the sheet.
+    ReadsDown,
+}
+
+impl PageTurn {
+    /// Whether the page was swapped into the landscape frame.
+    pub(crate) fn is_turned(self) -> bool {
+        self != Self::Upright
+    }
 }
 
 /// Detect if most text items on a page are rotated 90° or 270°, and if so,
@@ -1596,9 +1625,9 @@ fn correct_rotated_page(
     mut rects: Vec<PdfRect>,
     mut lines: Vec<PdfLine>,
     votes: &RotationVotes,
-) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>, bool) {
+) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>, PageTurn) {
     if items.len() < 2 {
-        return (items, rects, lines, false);
+        return (items, rects, lines, PageTurn::Upright);
     }
 
     // Use the combined-matrix direction votes collected during extraction.
@@ -1607,7 +1636,7 @@ fn correct_rotated_page(
     let total_votes = votes.horizontal + votes.rotated;
     if total_votes == 0 || votes.rotated * 3 < total_votes * 2 {
         // Less than ~67% of text operators are rotated → not a rotated page
-        return (items, rects, lines, false);
+        return (items, rects, lines, PageTurn::Upright);
     }
 
     log::debug!(
@@ -1658,7 +1687,7 @@ fn correct_rotated_page(
         line.y2 = new_y2;
     }
 
-    (items, rects, lines, true)
+    (items, rects, lines, votes.turn())
 }
 
 fn rotate_underline_graphics(rects: &mut [PdfRect], lines: &mut [UnderlineLine]) {

@@ -18,10 +18,10 @@ use crate::types::{OcrLayerExtraction, PageBox, PageExtraction, PdfForm, PdfLine
 use crate::PdfError;
 use log::debug;
 use lopdf::{Document, Object, ObjectId};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::path::Path;
 
-use content_stream::extract_page_text_items_with_forms;
+use content_stream::{extract_page_text_items_with_forms, PageTurn};
 use links::{extract_form_fields, extract_page_links};
 
 // Re-export public types so existing `crate::extractor::X` paths keep working.
@@ -235,7 +235,7 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, ocr_layer_pages, rotated_pages) =
+    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, ocr_layer_pages, turned_pages) =
         extract_positioned_text_impl_reporting_invisible(
             &doc,
             &font_cmaps,
@@ -255,7 +255,12 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
         forms,
         skipped_invisible,
         ocr_layer_pages,
-        rotated_pages,
+        rotated_pages: turned_pages.keys().copied().collect(),
+        downward_pages: turned_pages
+            .iter()
+            .filter(|(_, turn)| **turn == PageTurn::ReadsDown)
+            .map(|(page, _)| *page)
+            .collect(),
         page_boxes,
     })
 }
@@ -514,7 +519,7 @@ fn extract_positioned_text_impl(
 /// [`crate::is_adoptable_ocr_layer`] says it is real text; the sixth element
 /// of the result names the pages that did. The last names the pages whose
 /// runs the walk turned from rotated text into a landscape frame (see
-/// `correct_rotated_page`).
+/// `correct_rotated_page`), each with the way its text reads.
 #[allow(clippy::type_complexity)]
 fn extract_positioned_text_impl_reporting_invisible(
     doc: &Document,
@@ -531,7 +536,7 @@ fn extract_positioned_text_impl_reporting_invisible(
         HashSet<u32>,
         bool,
         BTreeSet<u32>,
-        BTreeSet<u32>,
+        BTreeMap<u32, PageTurn>,
     ),
     PdfError,
 > {
@@ -544,7 +549,7 @@ fn extract_positioned_text_impl_reporting_invisible(
     let mut gid_encoded_pages: HashSet<u32> = HashSet::new();
     let mut skipped_invisible_anywhere = false;
     let mut ocr_layer_pages: BTreeSet<u32> = BTreeSet::new();
-    let mut rotated_pages: BTreeSet<u32> = BTreeSet::new();
+    let mut turned_pages: BTreeMap<u32, PageTurn> = BTreeMap::new();
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -576,7 +581,7 @@ fn extract_positioned_text_impl_reporting_invisible(
             (mut items, mut rects, mut lines),
             mut forms,
             mut has_gid_fonts,
-            mut coords_rotated,
+            mut turn,
             mut skipped_invisible,
         ) = match page_result {
                 Ok(extraction) => extraction,
@@ -601,7 +606,7 @@ fn extract_positioned_text_impl_reporting_invisible(
             && skipped_invisible
             && !crate::has_visible_text(&items)
         {
-            if let Ok(((layer, _, _), _, layer_gid, layer_rotated, _)) =
+            if let Ok(((layer, _, _), _, layer_gid, layer_turn, _)) =
                 extract_page_text_items_with_forms(
                     doc,
                     page_id,
@@ -615,15 +620,16 @@ fn extract_positioned_text_impl_reporting_invisible(
                 if crate::is_adoptable_ocr_layer(&layer) {
                     items = layer;
                     has_gid_fonts = layer_gid;
-                    coords_rotated = layer_rotated;
+                    turn = layer_turn;
                     skipped_invisible = false;
                     ocr_layer_pages.insert(*page_num);
                 }
             }
         }
         skipped_invisible_anywhere |= skipped_invisible;
+        let coords_rotated = turn.is_turned();
         if coords_rotated {
-            rotated_pages.insert(*page_num);
+            turned_pages.insert(*page_num, turn);
         }
         // Clip to the visible page box: single-page extracts and imposed
         // spreads keep neighboring pages' content in the stream, positioned
@@ -835,7 +841,7 @@ fn extract_positioned_text_impl_reporting_invisible(
         gid_encoded_pages,
         skipped_invisible_anywhere,
         ocr_layer_pages,
-        rotated_pages,
+        turned_pages,
     ))
 }
 
@@ -4356,5 +4362,31 @@ CMapName currentdict /CMap defineresource pop\nend end\n"
         // height runs right from x = 500.
         assert!((hull[0] - 500.0).abs() < 0.05 && (hull[2] - 511.0).abs() < 0.05, "{hull:?}");
         assert!((hull[3] - 762.0).abs() < 0.05 && (hull[1] - (762.0 - 79.2)).abs() < 0.05, "{hull:?}");
+    }
+
+    #[test]
+    fn a_turned_page_says_which_way_its_text_reads() {
+        // The direction is the text's, not the page's /Rotate: the same
+        // three lines read down the sheet or up it, on a sheet shown
+        // without a turn.
+        let lines = |matrix: &str| {
+            [500, 480, 460]
+                .iter()
+                .map(|x| format!("BT /F1 1 Tf {matrix} {x} 400 Tm (a line) Tj ET\n"))
+                .collect::<String>()
+        };
+        let read = |content: String| {
+            extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
+                &page_bytes(&content, None, None),
+                None,
+            )
+            .unwrap()
+        };
+        let down = read(lines("0 -11 11 0"));
+        assert!(down.rotated_pages.contains(&1) && down.downward_pages.contains(&1));
+        let up = read(lines("0 11 -11 0"));
+        assert!(up.rotated_pages.contains(&1) && up.downward_pages.is_empty());
+        let upright = read(lines("11 0 0 11"));
+        assert!(upright.rotated_pages.is_empty() && upright.downward_pages.is_empty());
     }
 }

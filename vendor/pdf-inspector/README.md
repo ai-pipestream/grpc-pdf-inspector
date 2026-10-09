@@ -90,6 +90,15 @@ The private APIs, and what each unblocks:
     `OcrLayerExtraction.page_boxes` is a `PageBox` per walked page, so a
     caller placing the runs on the displayed page needs no second read of
     the file.
+12. **Which way a turned page's text reads** (`src/extractor/content_stream.rs`,
+    `src/extractor/mod.rs`, `src/types.rs`). The rotation vote saw every
+    show operator's combined matrix and counted only whether it was
+    sideways. Text reading down the sheet (`[0, -b, b, 0]`) runs towards
+    smaller x in the landscape frame and text reading up (`[0, b, -b, 0]`)
+    towards larger x, so a caller cutting a grid's bands in that frame
+    needs to know which. The vote now also counts the downward operators,
+    and `OcrLayerExtraction.downward_pages` names the rotated pages whose
+    text mostly reads down. The frame itself is unchanged.
 
 ## Patches that change what the crate does
 

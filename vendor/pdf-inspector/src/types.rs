@@ -134,6 +134,12 @@ pub struct OcrLayerExtraction {
     /// user-space x. That frame keeps the reading order and has no
     /// translation, so its y values are negative.
     pub rotated_pages: std::collections::BTreeSet<u32>,
+    /// The pages of `rotated_pages` whose text mostly reads down the sheet
+    /// (a text matrix `[0, -b, b, 0]`) rather than up it (`[0, b, -b, 0]`).
+    /// In the landscape frame such text runs towards smaller x, so the
+    /// frame is a half turn from the way the text reads; on every other
+    /// rotated page it runs towards larger x.
+    pub downward_pages: std::collections::BTreeSet<u32>,
     /// Every walked page's boxes and rotation, read from the page
     /// dictionary and its ancestors by the same reader that walked the
     /// content, so a caller can place the runs on the page a reader sees
