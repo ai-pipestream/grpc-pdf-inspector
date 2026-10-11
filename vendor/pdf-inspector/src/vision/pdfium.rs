@@ -247,7 +247,7 @@ fn text_chars_to_items(chars: &[PageChar], page: u32) -> Vec<TextItem> {
             text.clear();
             return;
         }
-        items.push(TextItem {
+        items.push(TextItem { hull: None,
             text: std::mem::take(text),
             x,
             y,

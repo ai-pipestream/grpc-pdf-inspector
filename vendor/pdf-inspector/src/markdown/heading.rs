@@ -510,7 +510,7 @@ mod tests {
 
     fn line(text: &str, y: f32, x: f32, size: f32, font: &str, bold: bool) -> TextLine {
         TextLine {
-            items: vec![TextItem {
+            items: vec![TextItem { hull: None,
                 text: text.into(),
                 x,
                 y,
@@ -669,7 +669,7 @@ mod tests {
     #[test]
     fn dominant_title_size_survives_smaller_number_prefix() {
         let mut parent = line("7.", 700.0, 72.0, 6.0, "Section", true);
-        parent.items.push(TextItem {
+        parent.items.push(TextItem { hull: None,
             text: "Theory".into(),
             x: 86.0,
             y: 700.0,

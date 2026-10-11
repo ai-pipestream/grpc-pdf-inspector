@@ -130,6 +130,9 @@ async fn info_arrives_before_extraction_runs() {
             pb::parse_pdf_response::Event::Tables(_) => {
                 panic!("a `tables` event without `emit_tables`")
             }
+            pb::parse_pdf_response::Event::PageDocument(_) => {
+                panic!("a `page_document` event without `emit_page_documents`")
+            }
         }
     }
     assert!(matches!(

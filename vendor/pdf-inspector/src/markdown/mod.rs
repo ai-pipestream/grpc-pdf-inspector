@@ -2678,7 +2678,7 @@ mod tests {
     }
 
     fn make_item(x: f32, y: f32, page: u32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: "A".into(),
             x,
             y,

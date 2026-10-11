@@ -1313,7 +1313,7 @@ mod tests {
     }
 
     fn make_rtl_item(text: &str, x: f32, y: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,
@@ -1513,7 +1513,7 @@ mod tests {
 
     /// Helper to create a single-char TextItem at a given x position with width.
     fn make_char_item(ch: char, x: f32, width: f32, font_size: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: ch.to_string(),
             x,
             y: 100.0,
@@ -1635,7 +1635,7 @@ mod tests {
         for (wi, word) in words.iter().enumerate() {
             let char_count = word.chars().filter(|c| !c.is_whitespace()).count();
             let w = char_count as f32 * char_w + (char_count - 1) as f32 * letter_gap;
-            items.push(TextItem {
+            items.push(TextItem { hull: None,
                 text: word.to_string(),
                 x,
                 y: 100.0,
@@ -1714,7 +1714,7 @@ mod tests {
 
     /// Helper to create a multi-char TextItem at a given position.
     fn make_text_item(text: &str, x: f32, width: f32, font_size: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y: 100.0,

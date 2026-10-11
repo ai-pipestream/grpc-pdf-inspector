@@ -428,6 +428,23 @@ pub(crate) fn parse_simple_font_widths(
     })
 }
 
+/// Whether an embedded CMap stream writes vertically: its dictionary's
+/// `/WMode`, or failing that the `/WMode 1 def` in its body.
+fn cmap_stream_is_vertical(stream: &lopdf::Stream) -> bool {
+    match stream.dict.get(b"WMode") {
+        Ok(Object::Integer(mode)) => return *mode == 1,
+        Ok(Object::Real(mode)) => return *mode == 1.0,
+        _ => {}
+    }
+    let Ok(body) = crate::guard::inflate(stream) else {
+        return false;
+    };
+    let body = String::from_utf8_lossy(&body);
+    body.split("/WMode")
+        .skip(1)
+        .any(|rest| rest.trim_start().starts_with('1'))
+}
+
 /// Parse widths for Type0 (composite/CID) fonts
 /// Reads DescendantFonts → CIDFont → W array and DW value
 pub(crate) fn parse_type0_widths(
@@ -475,6 +492,20 @@ pub(crate) fn parse_type0_widths(
             250
         });
 
+    // Vertical writing: a predefined CMap named `-V`, an embedded CMap
+    // stream whose dictionary says `/WMode 1`, or one whose body says
+    // `/WMode 1 def`; the font dictionary's own `/WMode`, where a producer
+    // copied it, counts too.
+    let vertical_encoding = match font_dict.get(b"Encoding").ok() {
+        Some(Object::Name(name)) => name.ends_with(b"-V"),
+        Some(Object::Reference(id)) => match doc.get_object(*id) {
+            Ok(Object::Stream(stream)) => cmap_stream_is_vertical(stream),
+            Ok(Object::Name(name)) => name.ends_with(b"-V"),
+            _ => false,
+        },
+        Some(Object::Stream(stream)) => cmap_stream_is_vertical(stream),
+        _ => false,
+    };
     let wmode = font_dict
         .get(b"WMode")
         .ok()
@@ -482,7 +513,7 @@ pub(crate) fn parse_type0_widths(
             Object::Integer(n) => Some(*n as u8),
             _ => None,
         })
-        .unwrap_or(0);
+        .unwrap_or(u8::from(vertical_encoding));
 
     Some(FontWidthInfo {
         widths,

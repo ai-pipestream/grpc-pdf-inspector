@@ -158,6 +158,24 @@ pub struct DocumentFold {
     open_list: Option<(bool, String)>,
 }
 
+/// The arena lengths at one point of a fold, taken before a page is folded
+/// so that page's share can be cut out after it.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PageMark {
+    /// `Document.texts` length.
+    texts: usize,
+    /// `Document.tables` length.
+    tables: usize,
+    /// `Document.pictures` length.
+    pictures: usize,
+    /// `Document.groups` length.
+    groups: usize,
+    /// `#/body` children.
+    body: usize,
+    /// `#/furniture` children.
+    furniture: usize,
+}
+
 impl Default for DocumentFold {
     fn default() -> Self {
         Self::new()
@@ -210,8 +228,8 @@ impl DocumentFold {
     /// refused: the fold is a projection, and an event it has no slot for
     /// is a gap in the projection, not a parse failure. `status` is counts
     /// and warnings, which describe the stream rather than the document; a
-    /// `document` event is a fold's own output, and folding one back in
-    /// would double the fragment.
+    /// `document` or `page_document` event is a fold's own output, and
+    /// folding one back in would double the fragment.
     pub fn consume(&mut self, event: &pb::parse_pdf_response::Event) {
         use pb::parse_pdf_response::Event;
         match event {
@@ -231,7 +249,7 @@ impl DocumentFold {
                 self.runs = Some(PageRuns::new(spans, internal, structure));
             }
             Event::Page(page) => self.on_page(page),
-            Event::Status(_) | Event::Document(_) => {}
+            Event::Status(_) | Event::Document(_) | Event::PageDocument(_) => {}
         }
     }
 
@@ -243,6 +261,87 @@ impl DocumentFold {
         self.open_list = None;
         self.internal_links.clear();
         std::mem::replace(&mut self.document, Self::new().document)
+    }
+
+    /// Where the fold stands now, so the items the next page adds can be
+    /// cut out afterwards by [`page_document`](Self::page_document).
+    #[must_use]
+    pub fn mark(&self) -> PageMark {
+        PageMark {
+            texts: self.document.texts.len(),
+            tables: self.document.tables.len(),
+            pictures: self.document.pictures.len(),
+            groups: self.document.groups.len(),
+            body: self
+                .document
+                .body
+                .as_ref()
+                .map_or(0, |body| body.children.len()),
+            furniture: self
+                .document
+                .furniture
+                .as_ref()
+                .map_or(0, |furniture| furniture.children.len()),
+        }
+    }
+
+    /// The share of the fold made since `mark`: the items folding page
+    /// `page_no` added, with the refs they carry in the whole Document, the
+    /// two root groups' children added since, and that page's `PageItem`.
+    ///
+    /// A page leaves nothing open behind it (it closes its list and drops
+    /// its grids), and nothing a later page folds reaches back into an
+    /// earlier page's items, so the slice is final the moment the page is
+    /// folded.
+    #[must_use]
+    pub fn page_document(&self, mark: &PageMark, page_no: u32) -> doc::Document {
+        let since = |children: Option<&doc::GroupItem>, from: usize| {
+            children.map_or_else(Vec::new, |group| {
+                group.children.get(from..).unwrap_or_default().to_vec()
+            })
+        };
+        let mut body = group(BODY_REF, doc::ContentLayer::Body);
+        body.children = since(self.document.body.as_ref(), mark.body);
+        let mut furniture = group(FURNITURE_REF, doc::ContentLayer::Furniture);
+        furniture.children = since(self.document.furniture.as_ref(), mark.furniture);
+        let page_no = i32::try_from(page_no).unwrap_or(i32::MAX);
+        doc::Document {
+            schema_name: Some(SCHEMA_NAME.to_owned()),
+            texts: self
+                .document
+                .texts
+                .get(mark.texts..)
+                .unwrap_or_default()
+                .to_vec(),
+            tables: self
+                .document
+                .tables
+                .get(mark.tables..)
+                .unwrap_or_default()
+                .to_vec(),
+            pictures: self
+                .document
+                .pictures
+                .get(mark.pictures..)
+                .unwrap_or_default()
+                .to_vec(),
+            groups: self
+                .document
+                .groups
+                .get(mark.groups..)
+                .unwrap_or_default()
+                .to_vec(),
+            body: Some(body),
+            furniture: Some(furniture),
+            pages: self
+                .document
+                .pages
+                .get(&page_no)
+                .map(|item| (page_no, item.clone()))
+                .into_iter()
+                .collect(),
+            ..doc::Document::default()
+        }
     }
 
     /// `info` names the document, counts its pages, and carries the
@@ -375,18 +474,29 @@ impl DocumentFold {
                 ..doc::PageItem::default()
             });
             // The visible box is the page as a reader sees it, which is the
-            // frame every box on this wire is measured against. The media
-            // box is the sheet it was imposed on, and is only worth saying
-            // when the two differ.
-            if let Some(size) = page.crop_box.as_ref() {
-                item.size = Some(size_of(size));
+            // frame every box on this wire is measured against: the crop
+            // box, turned by the page's rotation (`crate::frame`). The
+            // media box is the sheet it was imposed on, turned the same
+            // way, and is only worth saying when the two differ.
+            if let Some(frame) = crate::frame::PageFrame::new(page, false) {
+                let (width, height) = frame.size();
+                item.size = Some(doc::Size { width, height });
             }
             if let Some(media) = page.media_box.as_ref().filter(|media| {
                 page.crop_box
                     .as_ref()
                     .is_none_or(|crop| size_of(media) != size_of(crop))
             }) {
-                item.media_size = Some(size_of(media));
+                let media = size_of(media);
+                item.media_size =
+                    Some(if page.rotation % 360 == 90 || page.rotation % 360 == 270 {
+                        doc::Size {
+                            width: media.height,
+                            height: media.width,
+                        }
+                    } else {
+                        media
+                    });
             }
             // The page's own printed number, which is what a citation or a
             // "go to page 12" actually means when the document numbers its
@@ -1095,8 +1205,16 @@ fn table_data(region: &pb::TableRegion) -> doc::TableData {
     for (row_index, row) in region.rows.iter().enumerate() {
         let mut row_cells = Vec::new();
         for (column_index, text) in row.cells.iter().enumerate() {
+            // The box the detector cut and the page placed; a region
+            // that carries none (an older producer, or a table with no
+            // extent) is cut here from its boundaries, which is right
+            // only on a page shown as it was read.
             let cell = doc::TableCell {
-                bbox: cell_bbox(region, row_index, column_index),
+                bbox: row
+                    .boxes
+                    .get(column_index)
+                    .map(bounding_box)
+                    .or_else(|| cell_bbox(region, row_index, column_index)),
                 row_span: 1,
                 col_span: 1,
                 start_row_offset_idx: i32::try_from(row_index).unwrap_or(i32::MAX),
@@ -2420,9 +2538,11 @@ mod tests {
                 rows: vec![
                     pb::TableCells {
                         cells: vec!["Year".to_owned(), "Count".to_owned()],
+                        boxes: Vec::new(),
                     },
                     pb::TableCells {
                         cells: vec!["1843".to_owned(), "7".to_owned()],
+                        boxes: Vec::new(),
                     },
                 ],
                 kind: pb::TableKind::Data.into(),
@@ -2466,6 +2586,7 @@ mod tests {
             tables: vec![pb::TableRegion {
                 rows: vec![pb::TableCells {
                     cells: vec!["Chapter One".to_owned(), "3".to_owned()],
+                    boxes: Vec::new(),
                 }],
                 kind: pb::TableKind::Contents.into(),
                 ..pb::TableRegion::default()
@@ -2500,6 +2621,7 @@ mod tests {
                 .iter()
                 .map(|cells| pb::TableCells {
                     cells: cells.iter().map(|cell| (*cell).to_owned()).collect(),
+                    boxes: Vec::new(),
                 })
                 .collect(),
             kind: pb::TableKind::Data.into(),

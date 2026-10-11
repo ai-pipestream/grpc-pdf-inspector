@@ -117,7 +117,7 @@ fn merge_adjacent_items_preserving(
                 j += 1;
             }
 
-            merged_items.push(TextItem {
+            merged_items.push(TextItem { hull: None,
                 text,
                 x: first_item.x,
                 y: first_item.y,
@@ -2224,7 +2224,7 @@ fn try_add_label_column(
 mod tests {
 
     fn make_item(text: &str, x: f32, y: f32, font_size: f32, width: f32) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,
@@ -2367,7 +2367,7 @@ mod tests {
     use crate::types::ItemType;
 
     fn body_item(text: &str, x: f32, y: f32, strikeout: bool) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,

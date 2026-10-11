@@ -23,6 +23,8 @@
 //! - **Non-alphanumeric dominance**: symbol soup ([`is_garbage_text`]).
 //! - **Substitution-cipher letter statistics**: pure-ASCII output whose letter
 //!   distribution is a permutation of natural language ([`CipherGarbleStats`]).
+//! - **Symbol soup on the page's runs**: glyph codes passed through as low
+//!   ASCII, so a page of prose reads as `!"#$%&` ([`SymbolSoupStats`]).
 
 use crate::types::TextItem;
 use crate::{add_ocr_reason, OCR_REASON_SUSPECTED_GARBLED_TEXT};
@@ -307,6 +309,99 @@ struct PageTextQualityEvidence {
     replacement_spans: usize,
     longest_replacement_run: usize,
     cipher_garble: CipherGarbleStats,
+    symbol_soup: SymbolSoupStats,
+}
+
+/// Fewest counted characters a page must contribute before its symbol share
+/// is read as a verdict. Below this a short caption full of operators or a
+/// lone formula could carry a high share without the layer being broken.
+pub const MIN_CHARS_FOR_SYMBOL_SOUP: usize = 200;
+
+/// The share of a page's counted characters that must be rare ASCII symbols
+/// before the page is called symbol soup.
+///
+/// Measured on real documents (2026-10-04): 2,812 pages of born-digital PDFs
+/// (DP-Bench, DocLayNet, NapierOne) peak at 0.111 once numeric `%`, `$` and
+/// `#` are set aside, the one page above that being a genuinely broken layer
+/// at 0.24; 1,264 pages of Acrobat Distiller court opinions whose Type 3
+/// fonts carry no ToUnicode sit at a median of 0.36. 0.15 keeps a margin on
+/// both sides.
+const SYMBOL_SOUP_SHARE: f64 = 0.15;
+
+/// Symbol-soup statistics: how much of a page is ASCII punctuation that
+/// prose almost never uses.
+///
+/// A font with no ToUnicode CMap and a custom encoding hands its glyph codes
+/// straight through. When the codes are small integers (Type 3 fonts number
+/// their glyphs from 1; subset Type 1C fonts from 3) they land on `!"#$%&'`,
+/// so a page of prose extracts as `’!!"!9"5&%9 !" !!`: printable ASCII, no
+/// replacement character, and too few letters for [`CipherGarbleStats`] to
+/// measure. What gives it away is the symbols themselves. Prose uses `!`,
+/// `"`, `&`, `*`, `+`, `<`, `>`, `@`, brackets and braces sparingly; this
+/// output is a third symbols or more.
+///
+/// Two kinds of legitimate symbol runs are set aside before counting: dot
+/// and dash leaders (any character repeated three or more times, as a table
+/// of contents draws them), and the numeric uses of `%`, `$` and `#` (`49.8%`,
+/// `$12`, `#3`), which a statistics table repeats in every cell.
+#[derive(Debug, Default)]
+struct SymbolSoupStats {
+    counted: usize,
+    symbols: usize,
+}
+
+impl SymbolSoupStats {
+    fn add_text(&mut self, text: &str) {
+        let chars: Vec<char> = text.chars().collect();
+        let mut i = 0usize;
+        while i < chars.len() {
+            let ch = chars[i];
+            let mut run_end = i + 1;
+            while run_end < chars.len() && chars[run_end] == ch {
+                run_end += 1;
+            }
+            if ch.is_whitespace() || run_end - i >= 3 {
+                i = run_end;
+                continue;
+            }
+            for at in i..run_end {
+                self.counted += 1;
+                if is_rare_symbol(&chars, at) {
+                    self.symbols += 1;
+                }
+            }
+            i = run_end;
+        }
+    }
+
+    fn share(&self) -> Option<f64> {
+        (self.counted >= MIN_CHARS_FOR_SYMBOL_SOUP)
+            .then(|| self.symbols as f64 / self.counted as f64)
+    }
+
+    fn looks_garbled(&self) -> bool {
+        self.share().is_some_and(|share| share >= SYMBOL_SOUP_SHARE)
+    }
+}
+
+/// Whether the character at `at` is a symbol prose rarely uses, leaving out
+/// `%` after a digit and `$` or `#` before one.
+fn is_rare_symbol(chars: &[char], at: usize) -> bool {
+    let ch = chars[at];
+    if !matches!(
+        ch,
+        '!' | '"' | '#' | '$' | '%' | '&' | '*' | '+' | '<' | '=' | '>' | '@' | '[' | '\\'
+            | ']' | '^' | '{' | '|' | '}' | '~'
+    ) {
+        return false;
+    }
+    let before_digit = chars.get(at + 1).is_some_and(char::is_ascii_digit);
+    let after_digit = at > 0 && chars[at - 1].is_ascii_digit();
+    match ch {
+        '%' => !after_digit,
+        '$' | '#' => !before_digit,
+        _ => true,
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -327,6 +422,7 @@ pub fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         let evidence = evidence_by_page.entry(item.page).or_default();
         evidence.chars += item.text.chars().filter(|ch| !ch.is_whitespace()).count();
         evidence.cipher_garble.add_text(&item.text);
+        evidence.symbol_soup.add_text(&item.text);
 
         match text_span_decoding_issue_kind(&item.text) {
             Some(TextSpanIssueKind::Strong) => {
@@ -352,7 +448,9 @@ pub fn analyze_text_quality(items: &[TextItem]) -> TextQualityReport {
         if reasons_by_page.contains_key(&page) {
             continue;
         }
-        if page_replacement_evidence_needs_ocr(&evidence) || evidence.cipher_garble.looks_garbled()
+        if page_replacement_evidence_needs_ocr(&evidence)
+            || evidence.cipher_garble.looks_garbled()
+            || evidence.symbol_soup.looks_garbled()
         {
             add_ocr_reason(
                 &mut reasons_by_page,
@@ -588,4 +686,58 @@ pub(crate) fn is_cid_garbage(text: &str) -> bool {
     // page to OCR.
     let ascii_letters = text.chars().filter(|c| c.is_ascii_alphabetic()).count();
     total >= 20 && high_latin * 5 >= total * 2 && ascii_letters * 3 < total
+}
+
+#[cfg(test)]
+mod symbol_soup_tests {
+    use super::SymbolSoupStats;
+
+    fn stats(text: &str) -> SymbolSoupStats {
+        let mut stats = SymbolSoupStats::default();
+        stats.add_text(text);
+        stats
+    }
+
+    const PROSE: &str = "The court held that the district court did not abuse its discretion \
+        when it denied the motion to suppress, because the officers had probable cause to \
+        search the vehicle once the dog alerted. We therefore affirm the judgment of the \
+        district court in all respects and remand for resentencing consistent with this opinion.";
+
+    #[test]
+    fn prose_is_not_symbol_soup() {
+        let stats = stats(PROSE);
+        assert!(stats.share().expect("long enough to measure") < 0.01);
+        assert!(!stats.looks_garbled());
+    }
+
+    #[test]
+    fn glyph_codes_passed_through_as_low_ascii_are() {
+        // A Distiller court opinion's Type 3 body text, as extracted.
+        let soup = "::!&%0%/’ ’!!\"!9\"5&%9 !\" !! !\"%! !! &’, -!% &!!% 2\" #F-2G ! \"& H! \" !! \
+            H\"8!9’$% % 5& ’ ! !\"%!!\"!!’& &\" !! & #F!!7G () $% # # %#& # #, # 3%\" \
+            ())*+%H,%!’!\"\"’& !\"\"’ ! !. !! & !!&JFKL% ! KL !! !!&%& & \" KL G %012+- \
+            3 ! &’ &!!!’ &’!!\"!!% ! \" ! ’&!! &’!&’ !!28\"% !!!\"\" &1\"!!# E-5<<A):C::5<%!9";
+        let stats = stats(soup);
+        assert!(stats.share().expect("long enough to measure") > 0.30);
+        assert!(stats.looks_garbled());
+    }
+
+    #[test]
+    fn leaders_and_numeric_symbols_do_not_count() {
+        let toc = "1. Executive Summary ........................................ 4\n\
+            2. Methodology ############################################## 9\n";
+        let table = "Entry Level 49.8% 7.2% 2.6% 2.2% 6.4% 6.8% 8.0% 1.4% 1.5% 1.3% 4.0% \
+            SFL L1 52.0% 9.4% 1.6% 3.0% 5.3% 5.1% 9.6% 4.3% 2.0% 0.3% 3.6% 3.1% 0.8% \
+            Revenue $12,400 $9,100 $3,300 item #3 item #4 item #5 total $24,800 ";
+        let stats = stats(&format!("{toc}{table}{table}"));
+        assert_eq!(stats.symbols, 0, "{stats:?}");
+        assert!(!stats.looks_garbled());
+    }
+
+    #[test]
+    fn a_short_run_is_not_measured() {
+        let stats = stats("!\"#$%& <=> @[]^");
+        assert_eq!(stats.share(), None);
+        assert!(!stats.looks_garbled());
+    }
 }

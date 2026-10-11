@@ -531,7 +531,13 @@ impl<'a> Reader<'a> {
                     // and over-turned values are folded into [0, 360).
                     rotation: self
                         .inherited(*page_id, b"Rotate")
-                        .and_then(|object| object.as_i64().ok())
+                        .and_then(|object| match object {
+                            Object::Integer(degrees) => Some(*degrees),
+                            // A real where an integer belongs (`90.0`),
+                            // which producers write and viewers accept.
+                            Object::Real(degrees) => Some(degrees.round() as i64),
+                            _ => None,
+                        })
                         .map_or(0, |degrees| degrees.rem_euclid(360) as u32),
                     user_unit: self
                         .inherited(*page_id, b"UserUnit")

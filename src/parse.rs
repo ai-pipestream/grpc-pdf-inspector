@@ -165,17 +165,42 @@ impl Sink {
 struct Events<'a> {
     /// The outbound half of the response stream.
     sink: &'a Sink,
-    /// The fold, when `options.emit_document` was set.
+    /// The fold, when `options.emit_document` or
+    /// `options.emit_page_documents` was set.
     fold: Option<DocumentFold>,
+    /// Whether each page's share of the fold goes out after its `page`.
+    page_documents: bool,
 }
 
 impl<'a> Events<'a> {
     /// A router for one call.
-    fn new(sink: &'a Sink, emit_document: bool) -> Self {
+    fn new(sink: &'a Sink, emit_document: bool, emit_page_documents: bool) -> Self {
         Self {
             sink,
-            fold: emit_document.then(DocumentFold::new),
+            fold: (emit_document || emit_page_documents).then(DocumentFold::new),
+            page_documents: emit_page_documents,
         }
+    }
+
+    /// Put one page's `page` event on the wire, through the fold, and then
+    /// the share of the fold that page made, when the caller asked for it.
+    fn send_page(&mut self, page: pb::PageMarkdown) -> Result<(), Abort> {
+        let page_no = page.page_no;
+        let mark = self.fold.as_ref().map(DocumentFold::mark);
+        self.send(pb::parse_pdf_response::Event::Page(page))?;
+        if !self.page_documents {
+            return Ok(());
+        }
+        let (Some(fold), Some(mark)) = (self.fold.as_ref(), mark) else {
+            return Ok(());
+        };
+        let document = fold.page_document(&mark, page_no);
+        self.sink.send(pb::parse_pdf_response::Event::PageDocument(
+            pb::PageDocument {
+                page_no,
+                document: Some(document),
+            },
+        ))
     }
 
     /// Put an event on the wire, and through the fold on its way.
@@ -283,9 +308,11 @@ fn parse(
 
     // The optional second consumer of this stream: when the caller asked for
     // a Document, every event is folded on its way out and the folded
-    // Document goes out after the last `page`, before the `status` trailer.
-    // With the flag off no fold is built and the path is what it was.
-    let mut events = Events::new(sink, options.emit_document);
+    // Document goes out after the last `page`, before the `status` trailer;
+    // when it asked for page documents, each page's share of the fold
+    // follows that page's `page` event. With both flags off no fold is
+    // built and the path is what it was.
+    let mut events = Events::new(sink, options.emit_document, options.emit_page_documents);
 
     events.send(pb::parse_pdf_response::Event::Info(pb::PdfInfo {
         pdf_type: pdf_type(detected.pdf_type).into(),
@@ -403,6 +430,9 @@ fn parse(
                     // No per-page runs came back either, so there is
                     // nothing to say a rendering left out.
                     dropped: Vec::new(),
+                    // The whole-document verdict rides the trailer's
+                    // `has_encoding_issues`; this event is not a page.
+                    encoding_issues: false,
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -435,12 +465,24 @@ fn parse(
                 forms,
                 skipped_invisible,
                 ocr_layer_pages,
+                rotated_pages,
+                downward_pages,
+                page_boxes,
             } = guarded(guard, || {
                 pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
                     bytes,
                     filter.as_ref(),
                 )
             })?;
+            // Every box goes on the wire placed on the page a reader sees:
+            // moved by the crop box's corner, turned by the page's
+            // rotation, and turned back out of the library's own frame on
+            // a page whose text it read sideways (`crate::frame`). The
+            // boxes come from the walk itself, so this costs no second
+            // read; a page with no box anywhere keeps the library's
+            // coordinates.
+            let frames =
+                crate::frame::PageFrame::of_pages(&page_boxes, &rotated_pages, &downward_pages);
             // Where the page invoked Form XObjects. A vector figure is one,
             // and it draws no image run, so this is the only record of
             // where it sits. They ride the spans event, after the runs.
@@ -525,6 +567,7 @@ fn parse(
                 // the parser, so the call's time is checked here too.
                 check(guard)?;
                 let page_items = by_page.remove(&page_no).unwrap_or_default();
+                let frame = frames.get(&page_no);
 
                 // A page that drew a picture and no text at all is a scan,
                 // or a page whose words are in a figure, and it needs OCR
@@ -553,7 +596,13 @@ fn parse(
                 // runs, one whole read of the file later. They go out
                 // before the markdown that flattens them into pipe
                 // characters.
-                let page_tables = tables::page_tables(page_no, &page_items, &rects, &lines);
+                let page_tables = tables::page_tables(
+                    page_no,
+                    &page_items,
+                    &rects,
+                    &lines,
+                    rotated_pages.contains(&page_no),
+                );
                 if page_tables.as_ref().is_some_and(tables::has_data_table) {
                     pages_with_tables.push(page_no);
                 }
@@ -568,7 +617,10 @@ fn parse(
                 if columns.len() >= 2 {
                     pages_with_columns.push(page_no);
                 }
-                if let Some(tables) = page_tables {
+                if let Some(mut tables) = page_tables {
+                    if let Some(frame) = frame {
+                        frame.place_tables(&mut tables);
+                    }
                     events.route(
                         pb::parse_pdf_response::Event::Tables(tables),
                         options.emit_tables,
@@ -584,15 +636,16 @@ fn parse(
                 // sit in the middle of that line's letters, where no block
                 // of the rendering can match across it.
                 if events.wanted(options.emit_spans) {
-                    let mut spans = spans::page_spans_marking(page_no, &page_items, |item| {
-                        chrome.convicts(item)
-                    });
+                    let mut spans =
+                        spans::page_spans_marking(page_no, &page_items, frame, |item| {
+                            chrome.convicts(item)
+                        });
                     spans.spans.extend(
                         forms
                             .remove(&page_no)
                             .unwrap_or_default()
                             .iter()
-                            .map(spans::form_span),
+                            .map(|form| spans::form_span(form, frame)),
                     );
                     events.route(
                         pb::parse_pdf_response::Event::Spans(spans),
@@ -630,7 +683,7 @@ fn parse(
                                     | pdf_inspector::types::ItemType::FormField
                             )
                         })
-                        .map(spans::span)
+                        .map(|item| spans::span(item, frame))
                         .collect()
                 } else {
                     Vec::new()
@@ -655,25 +708,27 @@ fn parse(
                 // The rendering is the last thing the encoding backstop can
                 // look at, and it catches a page whose runs were each
                 // individually unremarkable.
-                if !ocr_layer_pages.contains(&page_no) {
-                    has_encoding_issues |= pdf_inspector::detect_encoding_issues(&markdown);
-                }
-                events.send(pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+                let encoding_issues = !ocr_layer_pages.contains(&page_no)
+                    && pdf_inspector::detect_encoding_issues(&markdown);
+                has_encoding_issues |= encoding_issues;
+                let page_invisible: Vec<pb::TextSpan> = invisible
+                    .remove(&page_no)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|item| spans::span(item, frame))
+                    .collect();
+                events.send_page(pb::PageMarkdown {
                     page_no,
                     markdown,
                     needs_ocr,
                     ocr_reason: reason.into(),
                     replacement_runs,
                     furniture,
-                    invisible: invisible
-                        .remove(&page_no)
-                        .unwrap_or_default()
-                        .iter()
-                        .map(spans::span)
-                        .collect(),
+                    invisible: page_invisible,
                     garble_score: garble_score(&quality, page_no),
                     dropped,
-                }))?;
+                    encoding_issues,
+                })?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
                 // hides from the streaming tests.
@@ -706,7 +761,9 @@ fn parse(
     // here — after the last `page`, before the `status` trailer that closes
     // the stream.
     check(guard)?;
-    if let Some(fold) = events.fold.as_mut() {
+    if options.emit_document
+        && let Some(fold) = events.fold.as_mut()
+    {
         sink.send(pb::parse_pdf_response::Event::Document(fold.take()))?;
     }
     sink.send(pb::parse_pdf_response::Event::Status(pb::ParseStatus {
@@ -1228,6 +1285,7 @@ mod tests {
     /// One extracted item of the given kind on page 1.
     fn item(text: &str, item_type: pdf_inspector::types::ItemType) -> pdf_inspector::TextItem {
         pdf_inspector::TextItem {
+            hull: None,
             text: text.to_owned(),
             x: 72.0,
             y: 700.0,

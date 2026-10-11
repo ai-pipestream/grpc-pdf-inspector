@@ -562,6 +562,59 @@ pub fn table_pdf() -> Vec<u8> {
     bytes
 }
 
+/// The [`table_pdf`] grid on a page with `rotate`, drawn upright in user
+/// space, or drawn turned (`turned`) so that it reads upright on a
+/// `/Rotate 270` page: the text runs down the sheet, the rows advance
+/// along user-space x. The grid is laid out on the displayed page at
+/// columns 72, 240 and 400 and rows from 500 downwards, so the same cells
+/// land in the same displayed places whichever way the page is written.
+#[must_use]
+pub fn grid_pdf(rotate: Option<i64>, turned: bool) -> Vec<u8> {
+    grid_page(rotate, |shown_x, shown_y, text| {
+        if turned {
+            // Shown under /Rotate 270 on a letter sheet: a displayed
+            // point (x', y') is user space (y', 792 - x'), and the
+            // reading direction is down the sheet.
+            let (x, y) = (shown_y, 792 - shown_x);
+            format!("BT /F1 1 Tf 0 -11 11 0 {x} {y} Tm ({text}) Tj ET\n")
+        } else {
+            format!("BT /F1 11 Tf {shown_x} {shown_y} Td ({text}) Tj ET\n")
+        }
+    })
+}
+
+/// The [`table_pdf`] grid drawn turned the other way, so that it reads
+/// upright on a `/Rotate 90` page (Distiller's landscape output): the text
+/// runs up the sheet, the rows advance along user-space x the other way.
+/// A displayed point (x', y') is user space (612 - y', x').
+#[must_use]
+pub fn upward_grid_pdf(rotate: Option<i64>) -> Vec<u8> {
+    grid_page(rotate, |shown_x, shown_y, text| {
+        let (x, y) = (612 - shown_y, shown_x);
+        format!("BT /F1 1 Tf 0 11 -11 0 {x} {y} Tm ({text}) Tj ET\n")
+    })
+}
+
+/// The [`table_pdf`] grid, each cell drawn by `cell` at its displayed
+/// column and row.
+fn grid_page(rotate: Option<i64>, cell: impl Fn(i32, i32, &str) -> String) -> Vec<u8> {
+    const COLUMNS: [i32; 3] = [72, 240, 400];
+    const ROWS: [(&str, &str, &str); 4] = [
+        ("Year", "Engine", "Cards"),
+        ("1837", "Analytical", "Punched"),
+        ("1843", "Notes", "Woven"),
+        ("1854", "Difference", "None"),
+    ];
+    let mut content = String::new();
+    for (index, (first, second, third)) in ROWS.iter().enumerate() {
+        let shown_y = 500 - 24 * i32::try_from(index).expect("four rows fit in an i32");
+        for (shown_x, text) in COLUMNS.iter().zip([first, second, third]) {
+            content.push_str(&cell(*shown_x, shown_y, text));
+        }
+    }
+    framed_pdf(&content, None, rotate)
+}
+
 /// Build a one-page PDF whose table is drawn with real rules and whose
 /// cells hold prose rather than short aligned tokens.
 ///
@@ -1302,6 +1355,168 @@ pub fn invisible_text_pdf(watermark: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page landscape PDF the way Acrobat Distiller writes one: a
+/// portrait 612 x 792 sheet with `/Rotate 90`, and every line of [`PROSE`]
+/// drawn with a text matrix turned a quarter, so the page reads as
+/// horizontal text on a 792 x 612 page.
+///
+/// Line `n` starts at user space `(60 + 16n, 54)`, which the page shows 54
+/// points from its left edge and `60 + 16n` points from its top.
+///
+/// The page also invokes one 50 x 30 Form XObject at user space (100, 200),
+/// a vector figure the way Distiller places one: the page shows it 200
+/// points from its left edge, 30 wide and 50 tall, with its bottom edge
+/// 612 - 150 = 462 points from the bottom.
+#[must_use]
+pub fn landscape_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let mut content = String::new();
+    for (index, line) in PROSE.iter().enumerate() {
+        let x = 60 + 16 * i32::try_from(index).expect("eight lines fit in an i32");
+        content.push_str(&format!(
+            "BT /F1 1 Tf 0 11 -11 0 {x} 54 Tm ({line}) Tj ET\n"
+        ));
+    }
+    let figure_id = doc.add_object(Stream::new(
+        dictionary! {
+            "Type" => "XObject",
+            "Subtype" => "Form",
+            "BBox" => vec![0.into(), 0.into(), 50.into(), 30.into()],
+        },
+        b"0.5 w 2 2 46 26 re S".to_vec(),
+    ));
+    content.push_str("q 1 0 0 1 100 200 cm /Fx1 Do Q\n");
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Rotate" => 90,
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+            "XObject" => dictionary! { "Fx1" => figure_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// A one-page document drawing `content` on a letter sheet, with the font
+/// `F1` (Helvetica) available, an optional crop box and an optional
+/// `/Rotate`: the fixture for everything about where a box lands on the
+/// page a reader sees.
+#[must_use]
+pub fn framed_pdf(content: &str, crop_box: Option<[i64; 4]>, rotate: Option<i64>) -> Vec<u8> {
+    framed_pdf_with(FramedPage {
+        content: content.to_owned(),
+        crop_box,
+        rotate: rotate.map(Object::Integer),
+        ..FramedPage::default()
+    })
+}
+
+/// What [`framed_pdf_with`] builds.
+#[derive(Debug, Clone)]
+pub struct FramedPage {
+    /// The page's content stream.
+    pub content: String,
+    /// The media box, letter when not said.
+    pub media_box: [i64; 4],
+    /// The crop box, when the page declares one.
+    pub crop_box: Option<[i64; 4]>,
+    /// `/Rotate`, as whatever object the fixture wants to write.
+    pub rotate: Option<Object>,
+}
+
+impl Default for FramedPage {
+    fn default() -> Self {
+        Self {
+            content: String::new(),
+            media_box: [0, 0, 612, 792],
+            crop_box: None,
+            rotate: None,
+        }
+    }
+}
+
+/// A one-page document drawing `page.content` with the font `F1`
+/// (Helvetica) available, under the boxes and rotation the page says.
+#[must_use]
+pub fn framed_pdf_with(page: FramedPage) -> Vec<u8> {
+    let FramedPage {
+        content,
+        media_box,
+        crop_box,
+        rotate,
+    } = page;
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.as_bytes().to_vec()));
+    let mut page = dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => media_box.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>(),
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    };
+    if let Some(crop) = crop_box {
+        page.set(
+            "CropBox",
+            crop.iter().map(|v| Object::Integer(*v)).collect::<Vec<_>>(),
+        );
+    }
+    if let Some(rotate) = rotate {
+        page.set("Rotate", rotate);
+    }
+    let page_id = doc.add_object(page);
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Prose long enough for letter statistics to mean anything, one line per
 /// entry.
 const PROSE: [&str; 8] = [
@@ -1351,6 +1566,40 @@ pub fn ciphered(source: &str) -> String {
 /// between them is where those letters fall.
 #[must_use]
 pub fn garbled_pdf() -> Vec<u8> {
+    prose_then(ciphered)
+}
+
+/// Map every letter of `source` to the low-ASCII symbol its glyph code would
+/// decode to under a font with no ToUnicode CMap and a custom encoding.
+///
+/// Type 3 fonts number their glyphs from 1 and subset fonts from a small
+/// offset, so with no CMap the codes land on `!"#$%&` and the digits. What
+/// comes out has almost no letters, which is why the letter statistics
+/// behind [`ciphered`] cannot measure it.
+#[must_use]
+pub fn symbol_soup(source: &str) -> String {
+    const GLYPHS: &[u8] = b"!\"#$%&'*+,-./0123456789:;<=>?";
+    source
+        .chars()
+        .map(|character| {
+            if !character.is_ascii_alphabetic() {
+                return character;
+            }
+            let letter = usize::from(character.to_ascii_lowercase() as u8 - b'a');
+            GLYPHS[letter % GLYPHS.len()] as char
+        })
+        .collect()
+}
+
+/// Build a two-page PDF whose first page is ordinary prose and whose second
+/// page is the same prose put through [`symbol_soup`].
+#[must_use]
+pub fn symbol_soup_pdf() -> Vec<u8> {
+    prose_then(symbol_soup)
+}
+
+/// Two pages of [`PROSE`], the second put through `second`.
+fn prose_then(second: fn(&str) -> String) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -1365,7 +1614,7 @@ pub fn garbled_pdf() -> Vec<u8> {
         for (index, line) in PROSE.iter().enumerate() {
             let y = 700 - 16 * i32::try_from(index).expect("eight lines fit in an i32");
             let text = if garble {
-                ciphered(line)
+                second(line)
             } else {
                 (*line).to_owned()
             };
@@ -1992,6 +2241,7 @@ pub fn shape(events: &[pb::parse_pdf_response::Event]) -> Vec<&'static str> {
             pb::parse_pdf_response::Event::Metadata(_) => "metadata",
             pb::parse_pdf_response::Event::Structure(_) => "structure",
             pb::parse_pdf_response::Event::Tables(_) => "tables",
+            pb::parse_pdf_response::Event::PageDocument(_) => "page_document",
         })
         .collect()
 }

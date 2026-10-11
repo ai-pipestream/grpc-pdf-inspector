@@ -39,6 +39,7 @@ pub fn page_tables(
     items: &[TextItem],
     rects: &[PdfRect],
     lines: &[PdfLine],
+    turned: bool,
 ) -> Option<pb::PageTables> {
     // The rectangle detector strips image placeholders before it clusters,
     // because an image's left edge is not a column edge, and the indices it
@@ -57,7 +58,7 @@ pub fn page_tables(
     }
     let tables: Vec<pb::TableRegion> = detected
         .iter()
-        .map(|table| region(table, &laid_out))
+        .map(|table| region(table, &laid_out, turned))
         .collect();
     (!tables.is_empty()).then_some(pb::PageTables { page_no, tables })
 }
@@ -197,16 +198,21 @@ pub fn has_data_table(tables: &pb::PageTables) -> bool {
         .any(|table| table.kind == pb::TableKind::Data as i32)
 }
 
-/// One detected table as the wire message.
-fn region(table: &Table, items: &[TextItem]) -> pb::TableRegion {
+/// One detected table as the wire message, in the frame the detector read
+/// it in; the cells' boxes are cut and placed with the page
+/// (`crate::frame::PageFrame::place_tables`).
+fn region(table: &Table, items: &[TextItem], turned: bool) -> pb::TableRegion {
     pb::TableRegion {
-        bbox: bbox(table, items),
+        bbox: bbox(table, items, turned),
         column_boundaries: table.columns.iter().map(|x| f64::from(*x)).collect(),
         row_boundaries: table.rows.iter().map(|y| f64::from(*y)).collect(),
         rows: table
             .cells
             .iter()
-            .map(|row| pb::TableCells { cells: row.clone() })
+            .map(|row| pb::TableCells {
+                cells: row.clone(),
+                boxes: Vec::new(),
+            })
             .collect(),
         kind: match table.kind {
             TableKind::Data => pb::TableKind::Data,
@@ -224,19 +230,26 @@ fn region(table: &Table, items: &[TextItem]) -> pb::TableRegion {
 /// the table's own edges are. The runs can: the table's extent is the hull
 /// of the items it took. A table that claims no run has no extent, and says
 /// so rather than reporting a point at the origin.
-fn bbox(table: &Table, items: &[TextItem]) -> Option<pb::Rect> {
+///
+/// A run's hull is the box its glyphs cover, where its own width is an
+/// estimate along the detector's x axis; on a page the library read
+/// sideways (`turned`) the hull is in user space and is brought into the
+/// library's frame (`x = Y`, `y = -X`) to be measured with the rest.
+fn bbox(table: &Table, items: &[TextItem], turned: bool) -> Option<pb::Rect> {
     let claimed = || {
-        table
-            .item_indices
-            .iter()
-            .filter_map(|index| items.get(*index))
+        table.item_indices.iter().filter_map(|index| {
+            let item = items.get(*index)?;
+            Some(match item.hull {
+                Some([x0, y0, x1, y1]) if turned => [y0, -x1, y1, -x0],
+                Some(hull) => hull,
+                None => [item.x, item.y, item.x + item.width, item.y + item.height],
+            })
+        })
     };
-    let left = claimed().map(|item| item.x).reduce(f32::min)?;
-    let right = claimed().map(|item| item.x + item.width).reduce(f32::max)?;
-    let bottom = claimed().map(|item| item.y).reduce(f32::min)?;
-    let top = claimed()
-        .map(|item| item.y + item.height)
-        .reduce(f32::max)?;
+    let left = claimed().map(|b| b[0].min(b[2])).reduce(f32::min)?;
+    let right = claimed().map(|b| b[0].max(b[2])).reduce(f32::max)?;
+    let bottom = claimed().map(|b| b[1].min(b[3])).reduce(f32::min)?;
+    let top = claimed().map(|b| b[1].max(b[3])).reduce(f32::max)?;
     Some(pb::Rect {
         x: f64::from(left),
         y: f64::from(bottom),
@@ -280,6 +293,7 @@ mod tests {
 
     fn item(text: &str, font_size: f32) -> TextItem {
         TextItem {
+            hull: None,
             text: text.to_owned(),
             x: 0.0,
             y: 0.0,
@@ -339,7 +353,7 @@ mod tests {
             vec![vec!["a".to_owned(), "b".to_owned()]],
             vec![0, 1],
         );
-        let region = region(&table, &items);
+        let region = region(&table, &items, false);
         let bbox = region.bbox.expect("claimed runs are an extent");
         assert!((bbox.x - 100.0).abs() < f64::EPSILON, "{bbox:?}");
         assert!(
@@ -355,7 +369,7 @@ mod tests {
     #[test]
     fn a_grid_that_claims_no_run_claims_no_extent() {
         let table = Table::new(Vec::new(), Vec::new(), Vec::new(), Vec::new());
-        assert!(region(&table, &[]).bbox.is_none());
+        assert!(region(&table, &[], false).bbox.is_none());
     }
 
     /// A vertical rule at `x` from `bottom` up to `top`.
@@ -414,7 +428,7 @@ mod tests {
             "the intro's run went back to the page: {:?}",
             table.item_indices
         );
-        let bbox = region(&table, &items).bbox.expect("an extent");
+        let bbox = region(&table, &items, false).bbox.expect("an extent");
         assert!(
             bbox.y + bbox.height < 640.0,
             "the extent stops at the grid: {bbox:?}"
@@ -489,7 +503,7 @@ mod tests {
             "the signature line's run went back to the page: {:?}",
             table.item_indices
         );
-        let bbox = region(&table, &items).bbox.expect("an extent");
+        let bbox = region(&table, &items, false).bbox.expect("an extent");
         assert!(bbox.y > 430.0, "the extent stops at the grid: {bbox:?}");
     }
 
@@ -523,7 +537,7 @@ mod tests {
             horizontal(170.0, 30.0, 630.0),
             vertical(330.0, 168.0, 362.0),
         ];
-        let tables = page_tables(1, &items, &[], &lines).expect("the grid is detected");
+        let tables = page_tables(1, &items, &[], &lines, false).expect("the grid is detected");
         let rows: Vec<&[String]> = tables.tables[0]
             .rows
             .iter()

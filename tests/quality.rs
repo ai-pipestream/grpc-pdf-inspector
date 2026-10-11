@@ -118,3 +118,31 @@ async fn the_document_carries_the_score_on_the_pages_quality() {
         "a measurement is not a verdict"
     );
 }
+
+#[tokio::test]
+async fn a_page_of_glyph_codes_read_as_symbols_is_routed_to_ocr() {
+    // A font with no ToUnicode CMap whose codes land on low ASCII: too few
+    // letters for the letter statistics, and every one of them a symbol.
+    let harness = common::start().await;
+    let events = harness.parse_ok(&common::symbol_soup_pdf()).await;
+
+    let pages = common::pages(&events);
+    assert_eq!(pages.len(), 2);
+    assert!(!pages[0].needs_ocr, "clean prose is usable");
+    assert!(
+        pages[1].needs_ocr,
+        "symbol soup is not: {:?}",
+        pages[1].markdown
+    );
+    assert_eq!(pages[1].ocr_reason, pb::OcrReason::SuspectedGarbled as i32);
+    assert_eq!(pages[1].replacement_runs, 0, "nothing failed to decode");
+
+    let status = common::status(&events);
+    assert!(status.has_encoding_issues);
+    let reasons: Vec<u32> = status
+        .extraction_ocr_reasons
+        .iter()
+        .map(|page| page.page)
+        .collect();
+    assert_eq!(reasons, [2], "only the broken page is named");
+}

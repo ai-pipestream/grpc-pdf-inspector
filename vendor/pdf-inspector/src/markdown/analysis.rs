@@ -838,7 +838,7 @@ mod tests {
     }
 
     fn line_of(text: &str, font_size: f32, bold: bool, y: f32) -> crate::types::TextLine {
-        let item = crate::types::TextItem {
+        let item = crate::types::TextItem { hull: None,
             text: text.into(),
             x: 72.0,
             y,

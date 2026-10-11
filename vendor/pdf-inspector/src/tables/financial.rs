@@ -97,7 +97,7 @@ pub(crate) fn try_split_financial_item(item: &TextItem) -> Option<Vec<TextItem>>
     let sub_width = spacing * 0.9;
     let mut sub_items = Vec::with_capacity(values.len());
     for (i, val) in values.iter().enumerate() {
-        sub_items.push(TextItem {
+        sub_items.push(TextItem { hull: None,
             text: val.clone(),
             x: item.x + spacing * i as f32 + spacing * 0.5,
             y: item.y,

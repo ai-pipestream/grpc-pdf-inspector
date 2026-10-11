@@ -19,7 +19,9 @@ use super::fonts::{
     CMapDecisionCache, FontStyleCache,
 };
 use super::underline::UnderlineLine;
-use super::xobjects::{extract_form_xobject_text, get_page_xobjects, FormWalkBudget, XObjectType};
+use super::xobjects::{
+    extract_form_xobject_text, get_page_xobjects, FormWalkBudget, InheritedTextState, XObjectType,
+};
 use super::{get_number, image_bbox_from_ctm, multiply_matrices};
 
 /// Strip PDF comments (% to end of line) from content stream bytes.
@@ -151,7 +153,7 @@ pub(crate) fn extract_page_text_items(
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
 ) -> Result<(PageExtraction, bool, bool, bool), PdfError> {
-    let (extraction, _forms, has_gid_fonts, coords_rotated, skipped_invisible) =
+    let (extraction, _forms, has_gid_fonts, turn, skipped_invisible) =
         extract_page_text_items_with_forms(
             doc,
             page_id,
@@ -161,7 +163,7 @@ pub(crate) fn extract_page_text_items(
             style_cache,
             form_budget,
         )?;
-    Ok((extraction, has_gid_fonts, coords_rotated, skipped_invisible))
+    Ok((extraction, has_gid_fonts, turn.is_turned(), skipped_invisible))
 }
 
 /// [`extract_page_text_items`] with the Form XObject placements of the walk
@@ -175,7 +177,7 @@ pub(crate) fn extract_page_text_items_with_forms(
     include_invisible: bool,
     style_cache: &mut FontStyleCache,
     form_budget: &mut FormWalkBudget,
-) -> Result<(PageExtraction, Vec<PdfForm>, bool, bool, bool), PdfError> {
+) -> Result<(PageExtraction, Vec<PdfForm>, bool, PageTurn, bool), PdfError> {
     let mut items = Vec::new();
     let mut forms: Vec<PdfForm> = Vec::new();
     let mut rects: Vec<PdfRect> = Vec::new();
@@ -299,7 +301,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                 (Vec::new(), Vec::new(), Vec::new()),
                 Vec::new(),
                 false,
-                false,
+                PageTurn::Upright,
                 false,
             ));
         }
@@ -321,6 +323,7 @@ pub(crate) fn extract_page_text_items_with_forms(
         word_spacing: f32,
         text_rise: f32,
         text_leading: f32,
+        horizontal_scale: f32,
         current_font: String,
         current_font_size: f32,
     }
@@ -333,6 +336,7 @@ pub(crate) fn extract_page_text_items_with_forms(
     let mut char_spacing: f32 = 0.0; // Tc parameter (extra spacing per character, unscaled)
     let mut word_spacing: f32 = 0.0; // Tw parameter (extra spacing per space char, unscaled)
     let mut text_rise: f32 = 0.0; // Ts parameter (baseline shift for super/subscripts, unscaled)
+    let mut horizontal_scale: f32 = 1.0; // Tz parameter as a factor: every advance and TJ offset scales by it
     let mut text_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut line_matrix = [1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
     let mut in_text_block = false;
@@ -340,10 +344,7 @@ pub(crate) fn extract_page_text_items_with_forms(
     // Track text direction votes: (horizontal_count, rotated_count).
     // For each text item, if |combined[0]| > |combined[1]| the text runs
     // horizontally (normal); otherwise it's rotated ~90°.
-    let mut rotation_votes = RotationVotes {
-        horizontal: 0,
-        rotated: 0,
-    };
+    let mut rotation_votes = RotationVotes::default();
 
     // Marked content tracking: (ActualText, MCID) per nesting level
     struct MarkedContentEntry {
@@ -376,6 +377,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                     word_spacing,
                     text_rise,
                     text_leading,
+                    horizontal_scale,
                     current_font: current_font.clone(),
                     current_font_size,
                 });
@@ -390,6 +392,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                     word_spacing = saved.word_spacing;
                     text_rise = saved.text_rise;
                     text_leading = saved.text_leading;
+                    horizontal_scale = saved.horizontal_scale;
                     current_font = saved.current_font;
                     current_font_size = saved.current_font_size;
                 }
@@ -470,6 +473,15 @@ pub(crate) fn extract_page_text_items_with_forms(
                     text_rise = ts;
                 }
             }
+            "Tz" => {
+                // Horizontal scaling, a percentage: it scales every glyph
+                // advance, the Tc and Tw spacing and every TJ offset.
+                if let Some(tz) = op.operands.first().and_then(get_number) {
+                    if tz > 0.0 {
+                        horizontal_scale = tz / 100.0;
+                    }
+                }
+            }
             "Td" | "TD" => {
                 // Move text position: TLM = T(tx,ty) × TLM; Tm = TLM
                 // tx,ty are in text space — must be scaled by the text line matrix
@@ -511,7 +523,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                     // Advance text matrix regardless of visibility
                     let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
                         get_operand_bytes(&op.operands[0]).map(|raw| {
-                            compute_string_width_ts(
+                            horizontal_scale * compute_string_width_ts(
                                 raw,
                                 fi,
                                 current_font_size,
@@ -571,11 +583,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                         let rendered_size = effective_font_size(current_font_size, &combined)
                             * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                         let (x, y) = (combined[4], combined[5]);
-                        if combined[0].abs() >= combined[1].abs() {
-                            rotation_votes.horizontal += 1;
-                        } else {
-                            rotation_votes.rotated += 1;
-                        }
+                        rotation_votes.cast(&combined);
                         let width = if let Some(w_ts) = w_ts_opt {
                             text_matrix[4] += w_ts * text_matrix[0];
                             text_matrix[5] += w_ts * text_matrix[1];
@@ -610,7 +618,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     }
                                 }
                             }
-                            items.push(TextItem {
+                            items.push(TextItem { hull: super::run_hull_if_known(font_widths.get(&current_font), w_ts_opt, &combined, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0)),
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -652,11 +660,6 @@ pub(crate) fn extract_page_text_items_with_forms(
                         }
                         let is_invisible = (text_rendering_mode == 3 && !include_invisible)
                             || suppress_glyph_extraction;
-                        // Capture first-glyph position for ActualText
-                        if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
-                            actual_text_glyph_tm = Some(text_matrix);
-                            actual_text_glyph_rise = Some(text_rise);
-                        }
 
                         // Compute space threshold based on font metrics when available
                         let space_threshold = if let Some(font_info) = font_info {
@@ -669,11 +672,16 @@ pub(crate) fn extract_page_text_items_with_forms(
                         let column_gap_threshold = space_threshold * 4.0;
 
                         // Track sub-items for column-gap splitting:
-                        // (text, start_width_ts, end_width_ts)
-                        let mut sub_items: Vec<(String, f32, f32)> = Vec::new();
+                        // (text, start_width_ts, end_width_ts, min_width_ts, max_width_ts),
+                        // the last two the furthest the pen went either way
+                        // while the segment was open, which is what the
+                        // segment's glyphs cover when an offset backtracks.
+                        let mut sub_items: Vec<(String, f32, f32, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
+                        let mut sub_min_width_ts: f32 = 0.0;
+                        let mut sub_max_width_ts: f32 = 0.0;
                         // Positive TJ offsets beyond a space width move the pen
                         // backward past painted glyphs — logical-order RTL
                         // producers position runs right-to-left this way.
@@ -682,7 +690,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                             match element {
                                 Object::Integer(n) => {
                                     let n_val = *n as f32;
-                                    let displacement = -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0 * current_font_size * horizontal_scale;
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -701,11 +709,27 @@ pub(crate) fn extract_page_text_items_with_forms(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            sub_min_width_ts,
+                                            sub_max_width_ts,
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_min_width_ts = total_width_ts;
+                                        sub_max_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                        sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
+                                        // A displacement before the segment's
+                                        // first glyph moves the pen, and so the
+                                        // segment's origin, before anything is
+                                        // shown: `[12719(31)]TJ` draws "31" a
+                                        // dozen ems to the left of the pen.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                            sub_min_width_ts = total_width_ts;
+                                            sub_max_width_ts = total_width_ts;
+                                        }
                                         if !is_invisible
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
@@ -718,7 +742,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                 }
                                 Object::Real(n) => {
                                     let n_val = *n;
-                                    let displacement = -n_val / 1000.0 * current_font_size;
+                                    let displacement = -n_val / 1000.0 * current_font_size * horizontal_scale;
                                     // A true backtrack puts the pen behind the
                                     // current segment's start — plain positive
                                     // kerning never does.
@@ -736,11 +760,27 @@ pub(crate) fn extract_page_text_items_with_forms(
                                             std::mem::take(&mut current_text),
                                             sub_start_width_ts,
                                             total_width_ts,
+                                            sub_min_width_ts,
+                                            sub_max_width_ts,
                                         ));
                                         total_width_ts += displacement;
                                         sub_start_width_ts = total_width_ts;
+                                        sub_min_width_ts = total_width_ts;
+                                        sub_max_width_ts = total_width_ts;
                                     } else {
                                         total_width_ts += displacement;
+                                        sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                        sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
+                                        // A displacement before the segment's
+                                        // first glyph moves the pen, and so the
+                                        // segment's origin, before anything is
+                                        // shown: `[12719(31)]TJ` draws "31" a
+                                        // dozen ems to the left of the pen.
+                                        if current_text.is_empty() {
+                                            sub_start_width_ts = total_width_ts;
+                                            sub_min_width_ts = total_width_ts;
+                                            sub_max_width_ts = total_width_ts;
+                                        }
                                         if !is_invisible
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
@@ -753,15 +793,31 @@ pub(crate) fn extract_page_text_items_with_forms(
                                 }
                                 _ => {}
                             }
+                            // The first glyph of an ActualText span is where
+                            // the pen is when the string is shown, after any
+                            // offset at the head of the array.
+                            if suppress_glyph_extraction && actual_text_glyph_tm.is_none() {
+                                actual_text_glyph_tm = Some([
+                                    text_matrix[0],
+                                    text_matrix[1],
+                                    text_matrix[2],
+                                    text_matrix[3],
+                                    text_matrix[4] + total_width_ts * text_matrix[0],
+                                    text_matrix[5] + total_width_ts * text_matrix[1],
+                                ]);
+                                actual_text_glyph_rise = Some(text_rise);
+                            }
                             if let Some(fi) = font_info {
                                 if let Some(raw_bytes) = get_operand_bytes(element) {
-                                    total_width_ts += compute_string_width_ts(
+                                    total_width_ts += horizontal_scale * compute_string_width_ts(
                                         raw_bytes,
                                         fi,
                                         current_font_size,
                                         char_spacing,
                                         word_spacing,
                                     );
+                                    sub_min_width_ts = sub_min_width_ts.min(total_width_ts);
+                                    sub_max_width_ts = sub_max_width_ts.max(total_width_ts);
                                 }
                             }
                             if !is_invisible {
@@ -783,16 +839,18 @@ pub(crate) fn extract_page_text_items_with_forms(
                         }
                         // Flush remaining text
                         if !is_invisible && !current_text.trim().is_empty() {
-                            sub_items.push((current_text, sub_start_width_ts, total_width_ts));
+                            sub_items.push((
+                                current_text,
+                                sub_start_width_ts,
+                                total_width_ts,
+                                sub_min_width_ts,
+                                sub_max_width_ts,
+                            ));
                         }
                         // Emit one TextItem per sub-item
                         if !sub_items.is_empty() {
                             let combined = multiply_matrices(&text_matrix, &ctm);
-                            if combined[0].abs() >= combined[1].abs() {
-                                rotation_votes.horizontal += 1;
-                            } else {
-                                rotation_votes.rotated += 1;
-                            }
+                            rotation_votes.cast(&combined);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let base_font = font_base_names
@@ -812,7 +870,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                             // per-sub-run geometry (mirrored matrices) still
                             // votes per sub-run, symmetric with candidates.
                             let mut op_backtrack_voted = false;
-                            for (text, start_w, end_w) in &sub_items {
+                            for (text, start_w, end_w, min_w, max_w) in &sub_items {
                                 let offset_tm = [
                                     text_matrix[0],
                                     text_matrix[1],
@@ -823,6 +881,16 @@ pub(crate) fn extract_page_text_items_with_forms(
                                 ];
                                 let combined =
                                     multiply_matrices(&rise_adjusted(&offset_tm, text_rise), &ctm);
+                                let hull_tm = [
+                                    text_matrix[0],
+                                    text_matrix[1],
+                                    text_matrix[2],
+                                    text_matrix[3],
+                                    text_matrix[4] + min_w * text_matrix[0],
+                                    text_matrix[5] + min_w * text_matrix[1],
+                                ];
+                                let hull_m =
+                                    multiply_matrices(&rise_adjusted(&hull_tm, text_rise), &ctm);
                                 let (x, y) = (combined[4], combined[5]);
                                 let width = if font_info.is_some() {
                                     ((end_w - start_w) * scale_x).abs()
@@ -843,7 +911,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         rtl_visual_candidates.push(items.len());
                                     }
                                 }
-                                items.push(TextItem {
+                                items.push(TextItem { hull: super::run_hull_if_known(font_info, font_info.map(|_| max_w - min_w), &hull_m, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0)),
                                     text: expand_ligatures(text),
                                     x,
                                     y,
@@ -895,7 +963,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                 // rejects it (`is_underline_candidate` needs width > 0).
                 let w_ts_opt = font_widths.get(&current_font).and_then(|fi| {
                     op.operands.first().and_then(get_operand_bytes).map(|raw| {
-                        compute_string_width_ts(
+                        horizontal_scale * compute_string_width_ts(
                             raw,
                             fi,
                             current_font_size,
@@ -933,11 +1001,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                         if !text.trim().is_empty() {
                             let combined =
                                 multiply_matrices(&rise_adjusted(&text_matrix, text_rise), &ctm);
-                            if combined[0].abs() >= combined[1].abs() {
-                                rotation_votes.horizontal += 1;
-                            } else {
-                                rotation_votes.rotated += 1;
-                            }
+                            rotation_votes.cast(&combined);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
@@ -964,7 +1028,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     rtl_logical_ops += 1;
                                 }
                             }
-                            items.push(TextItem {
+                            items.push(TextItem { hull: super::run_hull_if_known(font_widths.get(&current_font), w_ts_opt, &combined, current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0)),
                                 text: expand_ligatures(&text),
                                 x,
                                 y,
@@ -1013,7 +1077,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     // `[Image: Im0]` format that the markdown
                                     // emitter already recognizes.
                                     let (x, y, width, height) = image_bbox_from_ctm(&ctm);
-                                    items.push(TextItem {
+                                    items.push(TextItem { hull: Some([x, y, x + width, y + height]),
                                         text: format!("[Image: {}]", xobj_name),
                                         x,
                                         y,
@@ -1040,6 +1104,11 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         page_num,
                                         font_cmaps,
                                         &ctm,
+                                        InheritedTextState {
+                                            char_spacing,
+                                            word_spacing,
+                                            horizontal_scale,
+                                        },
                                         &mut cmap_decisions,
                                         style_cache,
                                         form_budget,
@@ -1108,11 +1177,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                         if let Some(start_tm) = glyph_tm.or(entry_tm) {
                             let rise = glyph_rise.unwrap_or(actual_text_start_rise);
                             let combined = multiply_matrices(&rise_adjusted(&start_tm, rise), &ctm);
-                            if combined[0].abs() >= combined[1].abs() {
-                                rotation_votes.horizontal += 1;
-                            } else {
-                                rotation_votes.rotated += 1;
-                            }
+                            rotation_votes.cast(&combined);
                             let rendered_size = effective_font_size(current_font_size, &combined)
                                 * type3_scales.get(&current_font).copied().unwrap_or(1.0);
                             let (x, y) = (combined[4], combined[5]);
@@ -1129,7 +1194,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     .get(&current_font)
                                     .copied()
                                     .unwrap_or((false, false));
-                                items.push(TextItem {
+                                items.push(TextItem { hull: Some(super::run_hull_between(&combined, &multiply_matrices(&rise_adjusted(&text_matrix, rise), &ctm), current_font_size * type3_scales.get(&current_font).copied().unwrap_or(1.0))),
                                     text: expand_ligatures(&at),
                                     x,
                                     y,
@@ -1467,9 +1532,9 @@ pub(crate) fn extract_page_text_items_with_forms(
     // Some PDFs embed landscape content in portrait pages using a rotated text
     // matrix (e.g. [0, b, -b, 0, tx, ty] for 90° CCW).  The layout engine
     // assumes x=horizontal, y=vertical — so we swap coordinates to match.
-    let (mut items, rects, lines, coords_rotated) =
+    let (mut items, rects, lines, turn) =
         correct_rotated_page(items, rects, lines, &rotation_votes);
-    if coords_rotated {
+    if turn.is_turned() {
         rotate_underline_graphics(&mut underline_rects, &mut underline_lines);
         // Form placements follow the rectangles into the rotated frame.
         for form in &mut forms {
@@ -1493,15 +1558,63 @@ pub(crate) fn extract_page_text_items_with_forms(
         (items, rects, lines),
         forms,
         has_gid_fonts,
-        coords_rotated,
+        turn,
         skipped_invisible,
     ))
 }
 
 /// Counts of text operators with horizontal vs rotated combined matrices.
+#[derive(Default)]
 struct RotationVotes {
     horizontal: u32,
     rotated: u32,
+    /// The rotated operators whose text runs down the sheet (towards
+    /// smaller user-space y, `[0, -b, b, 0]`).
+    downward: u32,
+}
+
+impl RotationVotes {
+    /// Count one show operator by its combined matrix.
+    fn cast(&mut self, combined: &[f32; 6]) {
+        if combined[0].abs() >= combined[1].abs() {
+            self.horizontal += 1;
+        } else {
+            self.rotated += 1;
+            if combined[1] < 0.0 {
+                self.downward += 1;
+            }
+        }
+    }
+
+    /// Which way the rotated text mostly runs.
+    fn turn(&self) -> PageTurn {
+        if self.downward * 2 > self.rotated {
+            PageTurn::ReadsDown
+        } else {
+            PageTurn::ReadsUp
+        }
+    }
+}
+
+/// Whether the walk swapped a page into its landscape frame, and which way
+/// the text it found there runs. Text reading up the sheet
+/// (`[0, b, -b, 0]`) runs towards larger x in that frame; text reading
+/// down (`[0, -b, b, 0]`) towards smaller x.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PageTurn {
+    /// Not swapped.
+    Upright,
+    /// Swapped, the text reading up the sheet.
+    ReadsUp,
+    /// Swapped, the text reading down the sheet.
+    ReadsDown,
+}
+
+impl PageTurn {
+    /// Whether the page was swapped into the landscape frame.
+    pub(crate) fn is_turned(self) -> bool {
+        self != Self::Upright
+    }
 }
 
 /// Detect if most text items on a page are rotated 90° or 270°, and if so,
@@ -1512,9 +1625,9 @@ fn correct_rotated_page(
     mut rects: Vec<PdfRect>,
     mut lines: Vec<PdfLine>,
     votes: &RotationVotes,
-) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>, bool) {
+) -> (Vec<TextItem>, Vec<PdfRect>, Vec<PdfLine>, PageTurn) {
     if items.len() < 2 {
-        return (items, rects, lines, false);
+        return (items, rects, lines, PageTurn::Upright);
     }
 
     // Use the combined-matrix direction votes collected during extraction.
@@ -1523,7 +1636,7 @@ fn correct_rotated_page(
     let total_votes = votes.horizontal + votes.rotated;
     if total_votes == 0 || votes.rotated * 3 < total_votes * 2 {
         // Less than ~67% of text operators are rotated → not a rotated page
-        return (items, rects, lines, false);
+        return (items, rects, lines, PageTurn::Upright);
     }
 
     log::debug!(
@@ -1574,7 +1687,7 @@ fn correct_rotated_page(
         line.y2 = new_y2;
     }
 
-    (items, rects, lines, true)
+    (items, rects, lines, votes.turn())
 }
 
 fn rotate_underline_graphics(rects: &mut [PdfRect], lines: &mut [UnderlineLine]) {
@@ -2275,5 +2388,88 @@ end"#;
             items.is_empty(),
             "pages over the operator cap must not be decoded"
         );
+    }
+
+    fn find_item<'a>(items: &'a [TextItem], text: &str) -> &'a TextItem {
+        items
+            .iter()
+            .find(|item| item.text == text)
+            .unwrap_or_else(|| panic!("no run {text:?} in {:?}", items.iter().map(|i| &i.text).collect::<Vec<_>>()))
+    }
+
+    #[test]
+    fn a_leading_tj_displacement_moves_the_run_not_its_width() {
+        // `[12719(31)]TJ` moves the pen 12.719 em left before "31" is
+        // shown, and `[-13365(7)]TJ` moves it 13.365 em right. The run
+        // starts where the pen is when its first glyph is shown, and its
+        // width is its glyphs' (600/1000 em each in this fixture).
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 1 0 0 1 500 700 Tm [12719(31)]TJ ET\n\
+              BT /F1 10 Tf 1 0 0 1 200 650 Tm [-13365(7)]TJ ET",
+        );
+        let left = find_item(&items, "31");
+        assert!((left.x - (500.0 - 127.19)).abs() < 0.05, "{left:?}");
+        assert!((left.width - 12.0).abs() < 0.05, "{left:?}");
+        let right = find_item(&items, "7");
+        assert!((right.x - (200.0 + 133.65)).abs() < 0.05, "{right:?}");
+        assert!((right.width - 6.0).abs() < 0.05, "{right:?}");
+        for item in [left, right] {
+            let hull = item.hull.expect("a shown run is measured");
+            assert!((hull[0] - item.x).abs() < 0.05 && (hull[2] - (item.x + item.width)).abs() < 0.05, "{hull:?}");
+        }
+    }
+
+    #[test]
+    fn a_turned_run_keeps_its_user_space_hull() {
+        // Two glyphs of 6 points each drawn with `0 1 -1 0 300 400 Tm` at
+        // 10 points: the advance runs 12 points up the page and the glyph
+        // height 10 points to the left, so the glyphs cover x 290..300 by
+        // y 400..412. The device-axis width is nothing, which is what the
+        // old box said about the run.
+        let items = extract_simple_items(b"BT /F1 10 Tf 0 1 -1 0 300 400 Tm (AB) Tj ET");
+        let run = find_item(&items, "AB");
+        assert!(run.width.abs() < 0.05, "{run:?}");
+        let hull = run.hull.expect("measured");
+        assert!(
+            (hull[0] - 290.0).abs() < 0.05
+                && (hull[1] - 400.0).abs() < 0.05
+                && (hull[2] - 300.0).abs() < 0.05
+                && (hull[3] - 412.0).abs() < 0.05,
+            "{hull:?}"
+        );
+        // An upright run's hull is its box.
+        let items = extract_simple_items(b"BT /F1 10 Tf 1 0 0 1 100 700 Tm (AB) Tj ET");
+        let run = find_item(&items, "AB");
+        assert_eq!(run.hull, Some([100.0, 700.0, 112.0, 710.0]));
+    }
+
+    #[test]
+    fn rise_spacing_and_scaling_shape_the_hull() {
+        // Ts lifts the glyph frame; Tc adds after every glyph and Tw after
+        // every space; Tz scales the advance.
+        let items = extract_simple_items(b"BT /F1 10 Tf 1 0 0 1 100 700 Tm 5 Ts (AB) Tj ET");
+        assert_eq!(find_item(&items, "AB").hull, Some([100.0, 705.0, 112.0, 715.0]));
+        let items = extract_simple_items(b"BT /F1 10 Tf 1 0 0 1 100 700 Tm 2 Tc 5 Tw (A B) Tj ET");
+        // 3 glyphs of 6, 3 times Tc, one Tw: 29.
+        let hull = find_item(&items, "A B").hull.unwrap();
+        assert!((hull[2] - 129.0).abs() < 0.05, "{hull:?}");
+        let items = extract_simple_items(b"BT /F1 10 Tf 50 Tz 1 0 0 1 100 700 Tm (AB) Tj ET");
+        let run = find_item(&items, "AB");
+        assert_eq!(run.hull, Some([100.0, 700.0, 106.0, 710.0]));
+        assert!((run.width - 6.0).abs() < 0.05, "{run:?}");
+        // q/Q scopes it like the rest of the text state.
+        let items = extract_simple_items(
+            b"q 50 Tz Q BT /F1 10 Tf 1 0 0 1 100 700 Tm (AB) Tj ET",
+        );
+        assert_eq!(find_item(&items, "AB").hull, Some([100.0, 700.0, 112.0, 710.0]));
+    }
+
+    #[test]
+    fn merged_runs_take_the_hull_around_both() {
+        let items = extract_simple_items(
+            b"BT /F1 10 Tf 1 0 0 1 100 700 Tm (AB) Tj ET BT /F1 10 Tf 1 0 0 1 113 700 Tm (CD) Tj ET",
+        );
+        let run = find_item(&items, "AB CD");
+        assert_eq!(run.hull, Some([100.0, 700.0, 125.0, 710.0]));
     }
 }

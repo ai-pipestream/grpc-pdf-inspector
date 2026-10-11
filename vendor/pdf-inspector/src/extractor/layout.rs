@@ -3063,7 +3063,7 @@ mod tests {
 
     /// Helper: create a TextItem at given position with given width text.
     fn make_item(page: u32, x: f32, y: f32, text: &str) -> TextItem {
-        TextItem {
+        TextItem { hull: None,
             text: text.to_string(),
             x,
             y,
@@ -3811,7 +3811,7 @@ mod tests {
                 let x = x_start + i as f32 * (x_end - x_start) / 3.0;
                 let text_len = (item_width / 6.0).ceil() as usize;
                 let text: String = "W".repeat(text_len);
-                items.push(TextItem {
+                items.push(TextItem { hull: None,
                     text,
                     x,
                     y,

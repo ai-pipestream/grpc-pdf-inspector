@@ -314,10 +314,13 @@ async fn the_fold_writes_the_metadata_the_schema_has_homes_for() {
         "#/pages/3"
     );
 
-    // Page geometry and the rotation that qualifies every box on that page.
+    // Page geometry and the rotation that qualifies every box on that page:
+    // the turned page is measured as it is shown, a quarter turn from the
+    // portrait sheet it is written on.
     let second = document.pages.get(&2).expect("page 2");
     let size = second.size.as_ref().expect("a measured page");
-    assert!((size.width - 612.0).abs() < f64::EPSILON);
+    assert!((size.width - 792.0).abs() < f64::EPSILON, "{size:?}");
+    assert!((size.height - 612.0).abs() < f64::EPSILON, "{size:?}");
     assert!(
         second.media_size.is_none(),
         "the sheet and the visible box are the same here, so only one is said"
