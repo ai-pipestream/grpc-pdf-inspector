@@ -345,3 +345,68 @@ async fn a_parse_stops_at_its_deadline_inside_the_extraction_pass() {
         "the parse finished the document after its deadline"
     );
 }
+
+/// Many small pages reach a client that reads nothing until the server has
+/// written the whole stream.
+///
+/// Each page here is one short line, so each `page` event is a few dozen
+/// bytes, and the parser renders a page between two of them. h2 charges every
+/// DATA frame under 256 bytes against a per-connection budget that refills
+/// only as the application reads, and closes the connection with GOAWAY
+/// `too_many_data_frames` when it runs out, so a server that wrote one frame
+/// per event would cut this client off a hundred or so pages in. The server
+/// parses only once the upload is complete, so the client is made to fall
+/// behind by not reading until the parse has finished. Every page has to
+/// arrive, in order, followed by the trailer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn many_small_pages_reach_a_client_that_reads_late() {
+    const SMALL_PAGES: u32 = 600;
+    let pdf = common::text_pdf(SMALL_PAGES, 0, "m");
+    let harness = common::start().await;
+    let mut client = harness.client.clone();
+    let frames = vec![
+        pb::ParsePdfRequest {
+            frame: Some(pb::parse_pdf_request::Frame::Options(
+                pb::PdfOptions::default(),
+            )),
+        },
+        pb::ParsePdfRequest {
+            frame: Some(pb::parse_pdf_request::Frame::Chunk(pdf)),
+        },
+    ];
+    let mut stream = client
+        .parse_pdf(tokio_stream::iter(frames))
+        .await
+        .expect("open the call")
+        .into_inner();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let progress = harness.metrics.snapshot();
+            if progress.parses_succeeded + progress.parses_failed > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the parse ends");
+
+    let mut events = Vec::new();
+    while let Some(response) = stream.message().await.expect("no error") {
+        events.push(response.event.expect("every response carries an event"));
+    }
+    assert_eq!(events.len(), SMALL_PAGES as usize + 2);
+    assert_eq!(common::info(&events).page_count, SMALL_PAGES);
+    for (page_no, event) in (1..=SMALL_PAGES).zip(&events[1..=SMALL_PAGES as usize]) {
+        let pb::parse_pdf_response::Event::Page(page) = event else {
+            panic!("expected page {page_no}, got {event:?}");
+        };
+        assert_eq!(page.page_no, page_no);
+        assert!(
+            page.markdown.contains(&format!("m page {page_no}")),
+            "page {page_no} rendered as {:?}",
+            page.markdown
+        );
+    }
+    assert_eq!(common::status(&events).pages_extracted, SMALL_PAGES);
+}
