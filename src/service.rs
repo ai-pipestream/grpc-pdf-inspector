@@ -11,11 +11,18 @@
 //! outbound channel is bounded, and the blocking thread waits on it, so a
 //! slow reader slows the parser rather than growing a queue behind it.
 
+use std::collections::VecDeque;
+use std::future::Future as _;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
+use prost::Message as _;
 use tokio::sync::mpsc;
+use tokio::time::Sleep;
+use tokio_stream::Stream;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -47,6 +54,113 @@ const CONSUMER_STALL: Duration = Duration::from_secs(30);
 /// Only bytes count: a frame with an empty chunk, or with no frame at all,
 /// is not progress.
 const UPLOAD_STALL: Duration = Duration::from_secs(30);
+
+/// Encoded event bytes a batch gathers before the transport gets it.
+///
+/// tonic packs the messages that are ready together into one HTTP/2 DATA
+/// frame, and h2 (0.4.18 and later) charges every DATA frame under 256 bytes
+/// against a per-connection budget that refills only as the application reads.
+/// A client that falls behind on reading would otherwise get one small frame
+/// per event and close the connection with GOAWAY `too_many_data_frames` after
+/// about a hundred of them.
+const BATCH_BYTES: usize = 256;
+
+/// The longest a small batch waits for more events, so a sparse stream still
+/// reaches the client promptly.
+const BATCH_WAIT: Duration = Duration::from_millis(2);
+
+/// The response stream: the parse's events, handed to the transport in
+/// batches.
+///
+/// Events go out once a batch holds at least [`BATCH_BYTES`], after
+/// [`BATCH_WAIT`], or at once when the batch holds the trailer or an error or
+/// the channel has closed, so the transport writes a few full DATA frames
+/// rather than one per page. A batch stops taking events once it holds
+/// [`BATCH_BYTES`], so it adds at most one event to what the channel already
+/// buffers, and a client that stops reading still stops the parse. Dropping
+/// it drops the receiver, which is how the parse learns the client has gone.
+pub struct Batched {
+    /// The events the parse sends.
+    events: ReceiverStream<Result<pb::ParsePdfResponse, Status>>,
+    /// Events taken from the channel and not yet handed to the transport.
+    batch: VecDeque<Result<pb::ParsePdfResponse, Status>>,
+    /// The encoded bytes of the events in `batch`.
+    batch_bytes: usize,
+    /// The channel has closed: nothing follows what is in `batch`.
+    closed: bool,
+    /// The batch is going out: every event in it is handed over before the
+    /// stream gathers again.
+    releasing: bool,
+    /// Runs while a small batch waits for more events.
+    wait: Option<Pin<Box<Sleep>>>,
+}
+
+impl Batched {
+    /// Batch the events arriving on `events`.
+    fn new(events: ReceiverStream<Result<pb::ParsePdfResponse, Status>>) -> Self {
+        Self {
+            events,
+            batch: VecDeque::new(),
+            batch_bytes: 0,
+            closed: false,
+            releasing: false,
+            wait: None,
+        }
+    }
+}
+
+impl Stream for Batched {
+    type Item = Result<pb::ParsePdfResponse, Status>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if !this.releasing {
+            let mut flush = false;
+            while !this.closed && !flush && this.batch_bytes < BATCH_BYTES {
+                match Pin::new(&mut this.events).poll_next(cx) {
+                    Poll::Pending => break,
+                    Poll::Ready(Some(item)) => {
+                        flush = match &item {
+                            Err(_) => true,
+                            Ok(response) => {
+                                this.batch_bytes += response.encoded_len();
+                                matches!(
+                                    response.event,
+                                    Some(pb::parse_pdf_response::Event::Status(_))
+                                )
+                            }
+                        };
+                        this.batch.push_back(item);
+                    }
+                    Poll::Ready(None) => this.closed = true,
+                }
+            }
+            if this.batch.is_empty() {
+                return if this.closed {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                };
+            }
+            if !flush && !this.closed && this.batch_bytes < BATCH_BYTES {
+                let wait = this
+                    .wait
+                    .get_or_insert_with(|| Box::pin(tokio::time::sleep(BATCH_WAIT)));
+                if wait.as_mut().poll(cx).is_pending() {
+                    return Poll::Pending;
+                }
+            }
+            this.releasing = true;
+            this.wait = None;
+        }
+        let item = this.batch.pop_front();
+        if this.batch.is_empty() {
+            this.releasing = false;
+            this.batch_bytes = 0;
+        }
+        Poll::Ready(item)
+    }
+}
 
 /// The `ai.pipestream.pdf.v1.PdfParseService` implementation.
 pub struct PdfGrpc {
@@ -123,7 +237,7 @@ impl PdfGrpc {
 
 #[tonic::async_trait]
 impl pb::pdf_parse_service_server::PdfParseService for PdfGrpc {
-    type ParsePdfStream = ReceiverStream<Result<pb::ParsePdfResponse, Status>>;
+    type ParsePdfStream = Batched;
 
     async fn parse_pdf(
         &self,
@@ -234,7 +348,7 @@ impl pb::pdf_parse_service_server::PdfParseService for PdfGrpc {
             drop(permit);
         });
 
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(Response::new(Batched::new(ReceiverStream::new(rx))))
     }
 
     async fn get_service_info(
