@@ -5,15 +5,32 @@ on: [ push, pull_request ]
 jobs:
   rust:
     runs-on: ubuntu-latest
+    # Docker Hardened Images Rust toolchain, the image the Dockerfile builds
+    # from. dhi.io signs in with the Docker Hub org credentials.
+    container:
+      image: dhi.io/rust:1-dev
+      credentials:
+        username: ${{ secrets.DOCKER_USER }}
+        password: ${{ secrets.DOCKER_TOKEN }}
     strategy:
       matrix:
         toolchain:
-          - "1.88"  # MSRV, set by tonic 0.14.
-          - stable
-          - beta
+          - "1.88"  # MSRV, set by tonic 0.14. Installed with rustup.
+          - stable  # The hardened image's own toolchain, rustfmt and clippy.
+          - beta    # Installed with rustup.
     steps:
+      # The hardened image ships the Rust toolchain (rustfmt and clippy
+      # included) and a C linker only. The build needs protoc, the actions
+      # need git and node.
+      - name: Install job tooling
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates curl git nodejs protobuf-compiler libprotobuf-dev
+          # The workspace mount belongs to the runner user, not root.
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - name: Install Rust toolchain
+        if: ${{ matrix.toolchain != 'stable' }}
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: ${{ matrix.toolchain }}
@@ -29,12 +46,6 @@ jobs:
       # so the step above never runs its unit tests.
       - name: Run the vendored crate's tests
         run: cargo test --locked --manifest-path vendor/pdf-inspector/Cargo.toml
-      - name: Install rustfmt, clippy
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
-        if: ${{ matrix.toolchain == 'stable' }}
-        with:
-          toolchain: ${{ matrix.toolchain }}
-          components: rustfmt, clippy
       - name: Format checks
         if: ${{ matrix.toolchain == 'stable' }}
         run: cargo fmt -- --check
@@ -46,9 +57,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: bufbuild/buf-action@8c6a16e16f12ba20b6470afa9c2ba9b5ba8c97c3 # v1.5.0
-        with:
-          setup_only: true
+      # A checksummed release download behaves the same on GitHub and Forgejo.
+      - name: Install buf
+        env:
+          BUF_VERSION: 1.71.0
+        run: |
+          base="https://github.com/bufbuild/buf/releases/download/v${BUF_VERSION}"
+          bin="buf-Linux-$(uname -m)"
+          cd "$RUNNER_TEMP"
+          curl -sSfLO "$base/$bin"
+          curl -sSfL "$base/sha256.txt" | grep " $bin\$" | sha256sum -c -
+          install -m 0755 "$bin" /usr/local/bin/buf
+          buf --version
       - name: Lint the protobuf contract
         run: |
           buf lint
