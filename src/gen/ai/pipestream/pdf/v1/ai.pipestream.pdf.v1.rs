@@ -390,6 +390,12 @@ pub struct PdfInfo {
     /// usable text layer, and reading it in order is the hard part.
     #[prost(bool, tag="8")]
     pub ocr_recommended: bool,
+    /// Why OCR is recommended: one or more reasons, in enum order, whenever
+    /// `ocr_recommended` is true, and none when it is false. A server older
+    /// than this field sends none either way, so an empty list beside a true
+    /// `ocr_recommended` means the reasons are unknown.
+    #[prost(enumeration="OcrRecommendationReason", repeated, tag="9")]
+    pub ocr_recommendation_reasons: ::prost::alloc::vec::Vec<i32>,
 }
 /// PageMarkdown is one extracted page, in requested page order.
 ///
@@ -1121,6 +1127,59 @@ impl OcrReason {
             "OCR_REASON_SCANNED" => Some(Self::Scanned),
             "OCR_REASON_SUSPECTED_GARBLED" => Some(Self::SuspectedGarbled),
             "OCR_REASON_VECTOR_TEXT" => Some(Self::VectorText),
+            _ => None,
+        }
+    }
+}
+/// OcrRecommendationReason names why detection recommends OCR for a
+/// document (`PdfInfo.ocr_recommended`). A caller that wants to scope the
+/// recommendation to `pages_needing_ocr` can do so only when every reason
+/// given is about those pages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum OcrRecommendationReason {
+    /// Never sent. Present because proto3 requires a zero value.
+    Unspecified = 0,
+    /// Pages without a text layer: a scan, an image-only page, outlined
+    /// (vector) text. The recommendation is about those pages, which
+    /// `pages_needing_ocr` names.
+    ScannedPages = 1,
+    /// Scanned pages carrying an invisible OCR layer (a searchable scan),
+    /// which no reader sees. The pages are named in `pages_needing_ocr`, and
+    /// recognition should replace the layer rather than add to it.
+    ScanOcrLayer = 2,
+    /// A page with a usable text layer is drawn over a page-sized image,
+    /// which can carry text the layer lacks (a form's labels printed in its
+    /// background). Such a page is not in `pages_needing_ocr`, so the
+    /// recommendation covers pages the list does not name.
+    TextOverPageImage = 3,
+    /// A dense newspaper layout whose reading order the text layer cannot be
+    /// trusted to keep. It names no page: the recommendation is about every
+    /// page.
+    DenseLayout = 4,
+}
+impl OcrRecommendationReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "OCR_RECOMMENDATION_REASON_UNSPECIFIED",
+            Self::ScannedPages => "OCR_RECOMMENDATION_REASON_SCANNED_PAGES",
+            Self::ScanOcrLayer => "OCR_RECOMMENDATION_REASON_SCAN_OCR_LAYER",
+            Self::TextOverPageImage => "OCR_RECOMMENDATION_REASON_TEXT_OVER_PAGE_IMAGE",
+            Self::DenseLayout => "OCR_RECOMMENDATION_REASON_DENSE_LAYOUT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "OCR_RECOMMENDATION_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "OCR_RECOMMENDATION_REASON_SCANNED_PAGES" => Some(Self::ScannedPages),
+            "OCR_RECOMMENDATION_REASON_SCAN_OCR_LAYER" => Some(Self::ScanOcrLayer),
+            "OCR_RECOMMENDATION_REASON_TEXT_OVER_PAGE_IMAGE" => Some(Self::TextOverPageImage),
+            "OCR_RECOMMENDATION_REASON_DENSE_LAYOUT" => Some(Self::DenseLayout),
             _ => None,
         }
     }

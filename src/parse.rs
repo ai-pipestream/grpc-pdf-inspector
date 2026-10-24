@@ -72,7 +72,10 @@
 use std::collections::{BTreeMap, HashSet};
 use std::time::{Duration, Instant};
 
-use pdf_inspector::{Interrupt, MarkdownOptions, ParseGuard, PdfOptions, PdfType, ProcessMode};
+use pdf_inspector::{
+    Interrupt, MarkdownOptions, OcrRecommendationReason, ParseGuard, PdfOptions, PdfType,
+    ProcessMode,
+};
 use tokio::sync::mpsc;
 use tonic::Status;
 
@@ -334,6 +337,11 @@ fn parse(
             .collect(),
         detection_time_ms: detected.processing_time_ms,
         ocr_recommended: detected.ocr_recommended,
+        ocr_recommendation_reasons: detected
+            .ocr_recommendation_reasons
+            .iter()
+            .map(|reason| ocr_recommendation_reason(*reason).into())
+            .collect(),
     }))?;
 
     // What the file says about itself, read from its own dictionaries by a
@@ -1196,6 +1204,18 @@ fn pdf_type(pdf_type: PdfType) -> pb::PdfType {
         PdfType::Scanned => pb::PdfType::Scanned,
         PdfType::ImageBased => pb::PdfType::ImageBased,
         PdfType::Mixed => pb::PdfType::Mixed,
+    }
+}
+
+/// Map one of detection's reasons for recommending OCR onto the wire enum.
+fn ocr_recommendation_reason(reason: OcrRecommendationReason) -> pb::OcrRecommendationReason {
+    match reason {
+        OcrRecommendationReason::ScannedPages => pb::OcrRecommendationReason::ScannedPages,
+        OcrRecommendationReason::ScanOcrLayer => pb::OcrRecommendationReason::ScanOcrLayer,
+        OcrRecommendationReason::TextOverPageImage => {
+            pb::OcrRecommendationReason::TextOverPageImage
+        }
+        OcrRecommendationReason::DenseLayout => pb::OcrRecommendationReason::DenseLayout,
     }
 }
 
