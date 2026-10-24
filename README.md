@@ -23,6 +23,14 @@ It is the fleet's cheap routing answer for PDF:
   OCRs.
 - **Mixed** PDFs get both: text pages stream, the rest are reported.
 
+When detection sets `ocr_recommended`, `ocr_recommendation_reasons` says why:
+`SCANNED_PAGES` alone means the pages `pages_needing_ocr` names are all it
+covers. The others ask for more: `TEXT_OVER_PAGE_IMAGE` for a text page the
+list leaves off that sits on a page-sized image, `SCAN_OCR_LAYER` for a
+scan's own invisible OCR text that recognition should replace, and
+`DENSE_LAYOUT` for a layout whose reading order the text layer cannot be
+trusted to keep.
+
 Every page is judged on its own content, so a scanned page inside a
 text-based document is named too, sampled or not. A scan made searchable
 (an OCRmyPDF, ABBYY or Acrobat page image with an invisible OCR layer

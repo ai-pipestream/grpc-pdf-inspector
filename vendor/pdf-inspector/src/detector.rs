@@ -22,6 +22,28 @@ pub enum PdfType {
     Mixed,
 }
 
+/// Why detection recommends OCR. A recommendation carries one or more, so a
+/// caller can tell one it may scope to the named pages from one about the
+/// whole document.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum OcrRecommendationReason {
+    /// Pages without a text layer: a scan, an image-only page, outlined
+    /// (vector) text. The recommendation is about those pages, which
+    /// `pages_needing_ocr` names.
+    ScannedPages,
+    /// Scanned pages carrying an invisible OCR layer, which no reader sees
+    /// and recognition should replace rather than add to. The pages are
+    /// named in `pages_needing_ocr`.
+    ScanOcrLayer,
+    /// A page with a usable text layer is drawn over a page-sized image,
+    /// which can carry text the layer lacks (a form's labels printed in its
+    /// background). Such a page is not in `pages_needing_ocr`.
+    TextOverPageImage,
+    /// A dense newspaper layout whose reading order the text layer cannot be
+    /// trusted to keep. It names no page.
+    DenseLayout,
+}
+
 /// Strategy for which pages to scan during detection
 #[derive(Debug, Clone)]
 pub enum ScanStrategy {
@@ -57,6 +79,9 @@ pub struct PdfTypeResult {
     /// Whether OCR is recommended for better extraction
     /// True when images provide essential context (e.g., template-based PDFs)
     pub ocr_recommended: bool,
+    /// Why OCR is recommended, sorted and without repeats; empty exactly
+    /// when `ocr_recommended` is false.
+    pub ocr_recommendation_reasons: Vec<OcrRecommendationReason>,
     /// 1-indexed page numbers that need OCR (image-only or insufficient text).
     /// Empty for TextBased. All pages for Scanned/ImageBased. Specific pages for Mixed.
     pub pages_needing_ocr: Vec<u32>,
@@ -315,6 +340,7 @@ pub(crate) fn detect_from_document(
     // 1. Template images are present (text alone is insufficient), OR
     // 2. PDF is scanned/image-based
     let ocr_recommended: bool;
+    let mut ocr_recommendation_reasons: Vec<OcrRecommendationReason> = Vec::new();
 
     // A scan carrying an OCR layer is Mixed rather than Scanned: no reader
     // sees its text, so every such page needs OCR, but the layer is still a
@@ -325,6 +351,16 @@ pub(crate) fn detect_from_document(
     // Classification logic
     let (pdf_type, confidence) = if is_template {
         ocr_recommended = true;
+        // The template pages counted above are the scan-like ones, named
+        // below like any scan; an OCR-layer page is named too, with a layer
+        // recognition should replace. A text page drawn over a page-sized
+        // image is found after the page list is built.
+        if has_template_images {
+            ocr_recommendation_reasons.push(OcrRecommendationReason::ScannedPages);
+        }
+        if pages_with_ocr_layer > 0 {
+            ocr_recommendation_reasons.push(OcrRecommendationReason::ScanOcrLayer);
+        }
         // Template-based PDF: has text but images provide essential context
         (PdfType::Mixed, 0.5 + (0.3 * (1.0 - template_ratio)))
     } else if text_ratio >= config.text_page_ratio_threshold {
@@ -333,6 +369,7 @@ pub(crate) fn detect_from_document(
     } else if pages_with_text == 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
         // No extractable text but has images or vector-outlined text
         ocr_recommended = true;
+        ocr_recommendation_reasons.push(OcrRecommendationReason::ScannedPages);
         if total_text_ops == 0 && pages_with_vector_text == 0 {
             (PdfType::Scanned, 0.95)
         } else {
@@ -340,9 +377,11 @@ pub(crate) fn detect_from_document(
         }
     } else if pages_with_text > 0 && (pages_with_images > 0 || pages_with_vector_text > 0) {
         ocr_recommended = true;
+        ocr_recommendation_reasons.push(OcrRecommendationReason::ScannedPages);
         (PdfType::Mixed, 0.7)
     } else if total_text_ops == 0 {
         ocr_recommended = true;
+        ocr_recommendation_reasons.push(OcrRecommendationReason::ScannedPages);
         (PdfType::Scanned, 0.9)
     } else {
         ocr_recommended = false;
@@ -380,6 +419,7 @@ pub(crate) fn detect_from_document(
         }
         let newspaper_ratio = newspaper_pages as f32 / pages_sampled as f32;
         if newspaper_ratio >= 0.5 {
+            ocr_recommendation_reasons.push(OcrRecommendationReason::DenseLayout);
             log::debug!(
                 "newspaper layout detected: {}/{} pages with high text_ops + font_changes → OCR recommended",
                 newspaper_pages, pages_sampled
@@ -479,6 +519,20 @@ pub(crate) fn detect_from_document(
     pages_needing_ocr.sort();
     pages_needing_ocr.dedup();
 
+    // A mixed document's page list was built from every page, so the cache
+    // holds them all: a page left off it that still sits on a page-sized
+    // image is text over a template, and the recommendation covers it too.
+    if ocr_recommended && pdf_type == PdfType::Mixed {
+        let text_over_page_image = analysis_cache.iter().any(|(page_num, analysis)| {
+            analysis.has_template_image && !pages_needing_ocr.contains(page_num)
+        });
+        if text_over_page_image {
+            ocr_recommendation_reasons.push(OcrRecommendationReason::TextOverPageImage);
+        }
+    }
+    ocr_recommendation_reasons.sort();
+    ocr_recommendation_reasons.dedup();
+
     // Explain each OCR-flagged page. Pages we analyzed get a signal-derived
     // reason; pages flagged only by whole-document classification (unsampled
     // pages of a Scanned/ImageBased doc) default to `scanned`.
@@ -503,6 +557,7 @@ pub(crate) fn detect_from_document(
         confidence,
         title,
         ocr_recommended,
+        ocr_recommendation_reasons,
         pages_needing_ocr,
         ocr_reasons_by_page,
     })
@@ -4086,5 +4141,113 @@ mod tests {
             analysis.has_decodable_text_fonts,
             "P3: inherited decodable font should be detected as used"
         );
+    }
+}
+
+#[cfg(test)]
+mod ocr_recommendation_reason_tests {
+    use super::*;
+    use lopdf::{dictionary, Stream};
+
+    /// Pages of prose, except `scanned`, which are a page-sized raster and
+    /// nothing else; with `backgrounds` every prose page draws its text over
+    /// such a raster too, the way a filled form sits on its scanned blank.
+    fn packet(pages: u32, scanned: &[u32], backgrounds: bool) -> Vec<u8> {
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type1",
+            "BaseFont" => "Helvetica",
+        });
+        let mut kids = Vec::new();
+        for page in 1..=pages {
+            let mut image = Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Image",
+                    "Width" => 850,
+                    "Height" => 1100,
+                    "ColorSpace" => "DeviceGray",
+                    "BitsPerComponent" => 8,
+                },
+                vec![0xee; 850 * 1100],
+            );
+            image.set_plain_content(vec![0xee; 850 * 1100]);
+            let image_id = doc.add_object(image);
+            let mut content = String::from("q 612 0 0 792 0 0 cm /Im1 Do Q\n");
+            if !scanned.contains(&page) {
+                if !backgrounds {
+                    content.clear();
+                }
+                content.push_str("BT /F1 12 Tf 72 740 Td\n");
+                for line in 0..20 {
+                    content.push_str(&format!(
+                        "0 -16 Td (Line {line} of page {page}: the quick brown fox jumps.) Tj\n"
+                    ));
+                }
+                content.push_str("ET");
+            }
+            let mut resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+            if content.contains("/Im1 Do") {
+                resources.set("XObject", dictionary! { "Im1" => image_id });
+            }
+            let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+            let page_id = doc.add_object(dictionary! {
+                "Type" => "Page",
+                "Parent" => pages_id,
+                "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => resources,
+                "Contents" => content_id,
+            });
+            kids.push(Object::Reference(page_id));
+        }
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dictionary! {
+                "Type" => "Pages",
+                "Kids" => kids,
+                "Count" => pages,
+            }),
+        );
+        let catalog_id = doc.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages_id });
+        doc.trailer.set("Root", catalog_id);
+        let mut bytes = Vec::new();
+        doc.save_to(&mut bytes).expect("serialize fixture");
+        bytes
+    }
+
+    #[test]
+    fn a_scan_beside_text_pages_is_recommended_for_its_own_pages() {
+        let result = detect_pdf_type_mem(&packet(3, &[2], false)).unwrap();
+        assert_eq!(result.pdf_type, PdfType::Mixed);
+        assert_eq!(result.pages_needing_ocr, vec![2]);
+        assert!(result.ocr_recommended);
+        assert_eq!(
+            result.ocr_recommendation_reasons,
+            vec![OcrRecommendationReason::ScannedPages]
+        );
+    }
+
+    #[test]
+    fn text_over_a_page_sized_image_widens_the_recommendation() {
+        let result = detect_pdf_type_mem(&packet(3, &[3], true)).unwrap();
+        assert_eq!(result.pdf_type, PdfType::Mixed);
+        assert_eq!(result.pages_needing_ocr, vec![3]);
+        assert_eq!(
+            result.ocr_recommendation_reasons,
+            vec![
+                OcrRecommendationReason::ScannedPages,
+                OcrRecommendationReason::TextOverPageImage
+            ]
+        );
+    }
+
+    #[test]
+    fn a_text_document_gives_no_reason() {
+        let result = detect_pdf_type_mem(&packet(2, &[], false)).unwrap();
+        assert_eq!(result.pdf_type, PdfType::TextBased);
+        assert!(!result.ocr_recommended);
+        assert!(result.ocr_recommendation_reasons.is_empty());
     }
 }

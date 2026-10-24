@@ -1806,6 +1806,19 @@ fn searchable_scan_with_layer(pages: u32, layer: fn(u32) -> String) -> Vec<u8> {
 /// document can keep its scans out of the sample entirely.
 #[must_use]
 pub fn mixed_text_and_scan_pdf(pages: u32, scanned: &[u32]) -> Vec<u8> {
+    text_and_scan_pdf(pages, scanned, false)
+}
+
+/// Build a form packet: [`mixed_text_and_scan_pdf`]'s pages, except that
+/// every text page draws its text (two rounds of the prose) over a
+/// page-sized raster, the way a filled form sits on the scanned blank whose
+/// labels are only pixels.
+#[must_use]
+pub fn form_over_background_pdf(pages: u32, scanned: &[u32]) -> Vec<u8> {
+    text_and_scan_pdf(pages, scanned, true)
+}
+
+fn text_and_scan_pdf(pages: u32, scanned: &[u32], backgrounds: bool) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -1823,15 +1836,25 @@ pub fn mixed_text_and_scan_pdf(pages: u32, scanned: &[u32]) -> Vec<u8> {
                 dictionary! { "XObject" => dictionary! { "Im1" => image_id } },
             )
         } else {
-            let mut content = format!("BT /F1 12 Tf 72 740 Td (Born digital page {page}) Tj\n");
-            for line in PROSE {
+            let mut content = String::new();
+            let mut resources = dictionary! { "Font" => dictionary! { "F1" => font_id } };
+            if backgrounds {
+                let image_id = scan_image(&mut doc);
+                content.push_str("q 612 0 0 792 0 0 cm /Im1 Do Q\n");
+                resources.set("XObject", dictionary! { "Im1" => image_id });
+            }
+            content.push_str(&format!(
+                "BT /F1 12 Tf 72 740 Td (Born digital page {page}) Tj\n"
+            ));
+            // A form's filled values are more than one paragraph: enough
+            // show operators that detection counts the page as text with
+            // the picture under it.
+            let rounds = if backgrounds { 2 } else { 1 };
+            for line in PROSE.iter().cycle().take(PROSE.len() * rounds) {
                 content.push_str(&format!("0 -16 Td ({line}) Tj\n"));
             }
             content.push_str("ET");
-            (
-                content,
-                dictionary! { "Font" => dictionary! { "F1" => font_id } },
-            )
+            (content, resources)
         };
         let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
         let page_id = doc.add_object(dictionary! {
