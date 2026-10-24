@@ -341,6 +341,45 @@ async fn info_says_when_detection_recommends_ocr() {
 }
 
 #[tokio::test]
+async fn info_says_why_detection_recommends_ocr() {
+    use pb::OcrRecommendationReason as Why;
+    let harness = common::start().await;
+    for (pdf, named, reasons) in [
+        // A born-digital page beside a scan: the recommendation is the scan.
+        (
+            common::mixed_text_and_scan_pdf(2, &[2]),
+            vec![2],
+            vec![Why::ScannedPages],
+        ),
+        // The same packet as a filled form: its text pages sit on page-sized
+        // rasters, so the recommendation also covers pages it does not name.
+        (
+            common::form_over_background_pdf(3, &[3]),
+            vec![3],
+            vec![Why::ScannedPages, Why::TextOverPageImage],
+        ),
+        // A searchable scan: scans, with a layer recognition replaces.
+        (
+            common::searchable_scan_pdf(2),
+            vec![1, 2],
+            vec![Why::ScannedPages, Why::ScanOcrLayer],
+        ),
+        (common::image_pdf(2), vec![1, 2], vec![Why::ScannedPages]),
+        (common::text_pdf(3, 60, "prose"), vec![], vec![]),
+    ] {
+        let events = harness
+            .parse(&pdf, detect_only())
+            .await
+            .expect("the fixture should parse");
+        let info = common::info(&events);
+        assert_eq!(info.pages_needing_ocr, named, "{info:?}");
+        let given: Vec<Why> = info.ocr_recommendation_reasons().collect();
+        assert_eq!(given, reasons, "{info:?}");
+        assert_eq!(info.ocr_recommended, !reasons.is_empty(), "{info:?}");
+    }
+}
+
+#[tokio::test]
 async fn a_misread_ocr_layer_flags_its_page_and_not_the_whole_document() {
     // A document-wide encoding verdict sends every page to recognition,
     // so one scanned page's misread OCR layer must not raise it: the

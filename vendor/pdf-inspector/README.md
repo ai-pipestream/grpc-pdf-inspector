@@ -100,6 +100,16 @@ The private APIs, and what each unblocks:
     and `OcrLayerExtraction.downward_pages` names the rotated pages whose
     text mostly reads down. The frame itself is unchanged.
 
+13. **Why detection recommends OCR** (`src/detector.rs`, `src/lib.rs`).
+    `ocr_recommended` came from several branches with different reasons
+    behind it (scanned pages beside text, a scan's OCR layer, text over a
+    page-sized image, a dense newspaper layout), and only the bit escaped.
+    `PdfTypeResult.ocr_recommendation_reasons` and
+    `PdfProcessResult.ocr_recommendation_reasons` carry an
+    `OcrRecommendationReason` list beside it, so a caller can tell a
+    recommendation about the named pages from one about the whole
+    document.
+
 ## Patches that change what the crate does
 
 Three patches go further than visibility, because the service could not be

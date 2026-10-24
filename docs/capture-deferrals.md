@@ -256,6 +256,31 @@ and a scanned page outside detection's eight-page sample was never named.
 - *Tests*: `tests/ocr_routing.rs`, over a generated searchable scan and a
   twenty-page text document with two unsampled scanned pages.
 
+**Routing review (2026-10-24): why OCR is recommended.** Detection sets
+`ocr_recommended` on every mixed document, so to gRParse the flag said
+nothing a mixed document's page list did not. Scoping it to the named
+pages kept a born-digital page beside a scan on its exact text layer, and
+dropped the labels of a form packet whose filled pages sit on scanned
+blanks; widening it OCR'd every born-digital page of every mixed document.
+The detector knew which case it was in and kept it to itself.
+
+- *Patch* `14d82ab`: `PdfTypeResult.ocr_recommendation_reasons` and
+  `PdfProcessResult.ocr_recommendation_reasons`, a sorted list of
+  `OcrRecommendationReason` set in every branch that recommends OCR:
+  `ScannedPages` for scan, image-only and outlined-text pages and
+  `ScanOcrLayer` for scans carrying an invisible OCR layer (both kinds
+  named in `pages_needing_ocr`), `TextOverPageImage` when a mixed
+  document's page left off that list still sits on a page-sized image,
+  `DenseLayout` for the newspaper case. The classification and the page
+  list are unchanged.
+- *Wired*: `PdfInfo.ocr_recommendation_reasons`, field 9, typed
+  `OcrRecommendationReason`; empty exactly when `ocr_recommended` is
+  false, and empty from a server that predates it.
+- *Tests*: `tests/ocr_routing.rs` (`info_says_why_detection_recommends_ocr`,
+  over a text page beside a scan, a form packet whose text pages sit on
+  page-sized rasters, a searchable scan, an image document and a text
+  document) and the crate's `detector::ocr_recommendation_reason_tests`.
+
 **Follow-up (2026-10-03): the rendering mode is graphics state.** Both the
 detector's scanner and the extractor set the text rendering mode back to 0
 at `BT`, which the PDF spec does not do (ISO 32000-1, 9.3.1): `Tr` holds

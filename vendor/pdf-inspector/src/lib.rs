@@ -48,7 +48,8 @@ pub mod vision;
 
 pub use detector::{
     detect_pdf_type, detect_pdf_type_mem, detect_pdf_type_mem_with_config,
-    detect_pdf_type_with_config, DetectionConfig, PdfType, PdfTypeResult, ScanStrategy,
+    detect_pdf_type_with_config, DetectionConfig, OcrRecommendationReason, PdfType, PdfTypeResult,
+    ScanStrategy,
 };
 pub use extractor::{
     extract_text, extract_text_with_positions, extract_text_with_positions_and_rects_mem,
@@ -171,6 +172,9 @@ pub struct PdfProcessResult {
     /// essential context (a template or a scan) or the layout is a dense
     /// newspaper the reading order cannot follow.
     pub ocr_recommended: bool,
+    /// Detection's [`PdfTypeResult::ocr_recommendation_reasons`]: why OCR is
+    /// recommended, empty when it is not.
+    pub ocr_recommendation_reasons: Vec<OcrRecommendationReason>,
 }
 
 // =========================================================================
@@ -4170,6 +4174,7 @@ fn process_document(
     let title = detection.title;
     let confidence = detection.confidence;
     let ocr_recommended = detection.ocr_recommended;
+    let ocr_recommendation_reasons = detection.ocr_recommendation_reasons;
     let detection_ocr_reasons = detection.ocr_reasons_by_page;
 
     // DetectOnly → return immediately
@@ -4186,6 +4191,7 @@ fn process_document(
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
             ocr_recommended,
+            ocr_recommendation_reasons,
         });
     }
 
@@ -4203,6 +4209,7 @@ fn process_document(
             layout: LayoutComplexity::default(),
             has_encoding_issues: false,
             ocr_recommended,
+            ocr_recommendation_reasons,
         });
     }
 
@@ -4538,6 +4545,7 @@ fn process_document(
         layout,
         has_encoding_issues,
         ocr_recommended,
+        ocr_recommendation_reasons,
     })
 }
 
