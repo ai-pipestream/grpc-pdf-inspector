@@ -446,6 +446,36 @@ enum OcrReason {
   OCR_REASON_VECTOR_TEXT = 4;
 }
 
+// OcrRecommendationReason names why detection recommends OCR for a
+// document (`PdfInfo.ocr_recommended`). A caller that wants to scope the
+// recommendation to `pages_needing_ocr` can do so only when every reason
+// given is about those pages.
+enum OcrRecommendationReason {
+  // Never sent. Present because proto3 requires a zero value.
+  OCR_RECOMMENDATION_REASON_UNSPECIFIED = 0;
+
+  // Pages without a text layer: a scan, an image-only page, outlined
+  // (vector) text. The recommendation is about those pages, which
+  // `pages_needing_ocr` names.
+  OCR_RECOMMENDATION_REASON_SCANNED_PAGES = 1;
+
+  // Scanned pages carrying an invisible OCR layer (a searchable scan),
+  // which no reader sees. The pages are named in `pages_needing_ocr`, and
+  // recognition should replace the layer rather than add to it.
+  OCR_RECOMMENDATION_REASON_SCAN_OCR_LAYER = 2;
+
+  // A page with a usable text layer is drawn over a page-sized image,
+  // which can carry text the layer lacks (a form's labels printed in its
+  // background). Such a page is not in `pages_needing_ocr`, so the
+  // recommendation covers pages the list does not name.
+  OCR_RECOMMENDATION_REASON_TEXT_OVER_PAGE_IMAGE = 3;
+
+  // A dense newspaper layout whose reading order the text layer cannot be
+  // trusted to keep. It names no page: the recommendation is about every
+  // page.
+  OCR_RECOMMENDATION_REASON_DENSE_LAYOUT = 4;
+}
+
 // PageOcrReasons lists the OCR reasons for one page.
 message PageOcrReasons {
   // The 1-indexed page the reasons concern.
@@ -516,6 +546,12 @@ message PdfInfo {
   // in `pages_needing_ocr`, which is the newspaper case: every page has a
   // usable text layer, and reading it in order is the hard part.
   bool ocr_recommended = 8;
+
+  // Why OCR is recommended: one or more reasons, in enum order, whenever
+  // `ocr_recommended` is true, and none when it is false. A server older
+  // than this field sends none either way, so an empty list beside a true
+  // `ocr_recommended` means the reasons are unknown.
+  repeated OcrRecommendationReason ocr_recommendation_reasons = 9;
 }
 
 // PageMarkdown is one extracted page, in requested page order.
