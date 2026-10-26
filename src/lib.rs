@@ -34,6 +34,7 @@ pub mod metrics;
 pub mod page_runs;
 pub mod parse;
 pub mod proto;
+pub mod rendered_table;
 pub mod service;
 pub mod spans;
 pub mod structure;

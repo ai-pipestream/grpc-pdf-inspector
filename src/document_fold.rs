@@ -83,6 +83,7 @@ use crate::emphasis;
 use crate::page_runs::{Located, PageRuns, Picture, page_ref};
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
+use crate::rendered_table::RenderedRows;
 use crate::structure;
 use crate::{COLLECTOR, PARSER, VERSION};
 
@@ -935,41 +936,64 @@ impl DocumentFold {
     ///
     /// The detector found the grid; the renderer printed pipe characters;
     /// this puts the grid back. The grid is the one on this page that is
-    /// the same table ([`matching_grid`]); when there is none, because no
+    /// the same table ([`matching_grid`]). When there is none, because no
     /// detector reported this table or because the stream carried no
-    /// grids, the pipe characters are kept as a paragraph, which is what
-    /// they were before.
+    /// grids, the renderer's own rows are the grid
+    /// ([`RenderedRows`]): a table is never folded as a paragraph of pipe
+    /// characters.
     fn on_table(&mut self, text: &str, page_no: u32, located: Located) {
         self.close_list();
+        let rendered = RenderedRows::parse(text);
         let region = self
             .detected_tables
             .as_mut()
             .filter(|tables| tables.page_no == page_no)
             .and_then(|tables| {
-                matching_grid(&tables.tables, text, located.bbox.as_ref())
+                matching_grid(&tables.tables, rendered.as_ref(), located.bbox.as_ref())
                     .map(|index| tables.tables.remove(index))
             });
-        let Some(region) = region else {
+        if let Some(region) = region {
+            let bbox = region.bbox.as_ref().map(bounding_box).or(located.bbox);
+            let kind = pb::TableKind::try_from(region.kind).unwrap_or(pb::TableKind::Unspecified);
+            // A table of contents is navigation rather than data, and the
+            // detector says which it found.
+            let label = if kind == pb::TableKind::Contents {
+                doc::DocItemLabel::DocumentIndex
+            } else {
+                doc::DocItemLabel::Table
+            };
+            self.push_table(table_data(&region), label, page_no, bbox);
+        } else if let Some(rendered) = rendered {
+            self.push_table(
+                rendered_table_data(&rendered),
+                doc::DocItemLabel::Table,
+                page_no,
+                located.bbox,
+            );
+        } else {
+            // Pipes and dashes with no cell text in them: nothing tabular
+            // was printed, and the characters are all there is to keep.
             self.push_text(text, page_no, Kind::Paragraph, located);
-            return;
-        };
+        }
+    }
+
+    /// Append one table under the current parent.
+    fn push_table(
+        &mut self,
+        data: doc::TableData,
+        label: doc::DocItemLabel,
+        page_no: u32,
+        bbox: Option<doc::BoundingBox>,
+    ) {
         let parent = self.current_parent();
         let self_ref = format!("#/tables/{}", self.document.tables.len());
-        let bbox = region.bbox.as_ref().map(bounding_box).or(located.bbox);
-        let kind = pb::TableKind::try_from(region.kind).unwrap_or(pb::TableKind::Unspecified);
         self.document.tables.push(doc::TableItem {
             self_ref: self_ref.clone(),
             parent: Some(reference(&parent)),
             content_layer: doc::ContentLayer::Body as i32,
-            // A table of contents is navigation rather than data, and the
-            // detector says which it found.
-            label: if kind == pb::TableKind::Contents {
-                doc::DocItemLabel::DocumentIndex
-            } else {
-                doc::DocItemLabel::Table
-            } as i32,
+            label: label as i32,
             prov: provenance(page_no, bbox),
-            data: Some(table_data(&region)),
+            data: Some(data),
             source: vec![doc::SourceType {
                 source: Some(doc::source_type::Source::Collector(self.source.clone())),
             }],
@@ -1193,28 +1217,48 @@ impl Kind {
 /// the convention the renderer itself follows when it prints the grid as
 /// markdown; the detector reports no header row of its own.
 fn table_data(region: &pb::TableRegion) -> doc::TableData {
-    let columns = region
-        .rows
-        .iter()
-        .map(|row| row.cells.len())
-        .max()
-        .unwrap_or(0);
+    let rows: Vec<&[String]> = region.rows.iter().map(|row| row.cells.as_slice()).collect();
     let header_rows = usize::from(region.kind == pb::TableKind::Data as i32);
+    grid_data(&rows, header_rows, |row_index, column_index| {
+        // The box the detector cut and the page placed; a region that
+        // carries none (an older producer, or a table with no extent) is
+        // cut here from its boundaries, which is right only on a page
+        // shown as it was read.
+        region
+            .rows
+            .get(row_index)
+            .and_then(|row| row.boxes.get(column_index))
+            .map(bounding_box)
+            .or_else(|| cell_bbox(region, row_index, column_index))
+    })
+}
+
+/// The grid the renderer printed, when no detector reported it.
+///
+/// The renderer printed no cell boxes, so the cells have none; the table's
+/// own extent is the runs it was found in, on its provenance.
+fn rendered_table_data(rendered: &RenderedRows) -> doc::TableData {
+    let rows: Vec<&[String]> = rendered.rows.iter().map(Vec::as_slice).collect();
+    grid_data(&rows, rendered.header_rows, |_, _| None)
+}
+
+/// Rows of cell text as a `TableData`, every cell one row by one column.
+///
+/// The first `header_rows` rows are column headers, and `bbox` answers
+/// each cell's box by row and column.
+fn grid_data(
+    rows: &[&[String]],
+    header_rows: usize,
+    bbox: impl Fn(usize, usize) -> Option<doc::BoundingBox>,
+) -> doc::TableData {
+    let columns = rows.iter().map(|row| row.len()).max().unwrap_or(0);
     let mut cells = Vec::new();
     let mut grid = Vec::new();
-    for (row_index, row) in region.rows.iter().enumerate() {
+    for (row_index, row) in rows.iter().enumerate() {
         let mut row_cells = Vec::new();
-        for (column_index, text) in row.cells.iter().enumerate() {
-            // The box the detector cut and the page placed; a region
-            // that carries none (an older producer, or a table with no
-            // extent) is cut here from its boundaries, which is right
-            // only on a page shown as it was read.
+        for (column_index, text) in row.iter().enumerate() {
             let cell = doc::TableCell {
-                bbox: row
-                    .boxes
-                    .get(column_index)
-                    .map(bounding_box)
-                    .or_else(|| cell_bbox(region, row_index, column_index)),
+                bbox: bbox(row_index, column_index),
                 row_span: 1,
                 col_span: 1,
                 start_row_offset_idx: i32::try_from(row_index).unwrap_or(i32::MAX),
@@ -1232,7 +1276,7 @@ fn table_data(region: &pb::TableRegion) -> doc::TableData {
     }
     doc::TableData {
         table_cells: cells,
-        num_rows: i32::try_from(region.rows.len()).unwrap_or(i32::MAX),
+        num_rows: i32::try_from(rows.len()).unwrap_or(i32::MAX),
         num_cols: i32::try_from(columns).unwrap_or(i32::MAX),
         grid,
         ..doc::TableData::default()
@@ -1253,10 +1297,12 @@ const SAME_TABLE: f64 = 0.5;
 /// a grid nothing matches is never forced onto the next block.
 fn matching_grid(
     grids: &[pb::TableRegion],
-    block: &str,
+    rendered: Option<&RenderedRows>,
     located: Option<&doc::BoundingBox>,
 ) -> Option<usize> {
-    let block_cells = pipe_cells(block);
+    let block_cells: Vec<&str> = rendered
+        .map(|rows| rows.filled_cells().collect())
+        .unwrap_or_default();
     let block_letters: String = block_cells.iter().map(|cell| letters(cell)).collect();
     let mut best: Option<(usize, f64)> = None;
     for (index, grid) in grids.iter().enumerate() {
@@ -1269,10 +1315,7 @@ fn matching_grid(
                     .flat_map(|row| row.cells.iter().map(String::as_str))
                     .collect();
                 let grid_letters: String = grid_cells.iter().map(|cell| letters(cell)).collect();
-                found_in(&grid_cells, &block_letters).min(found_in(
-                    &block_cells.iter().map(String::as_str).collect::<Vec<_>>(),
-                    &grid_letters,
-                ))
+                found_in(&grid_cells, &block_letters).min(found_in(&block_cells, &grid_letters))
             }
         };
         // The first of equally good matches, which is the first in
@@ -1282,23 +1325,6 @@ fn matching_grid(
         }
     }
     best.map(|(index, _)| index)
-}
-
-/// The cells of a pipe-syntax block, row by row, without the separator
-/// row and without empty cells.
-fn pipe_cells(block: &str) -> Vec<String> {
-    block
-        .lines()
-        .filter(|line| {
-            !line
-                .chars()
-                .all(|character| matches!(character, '|' | '-' | ':' | ' ' | '\t'))
-        })
-        .flat_map(|line| line.split('|'))
-        .map(str::trim)
-        .filter(|cell| !cell.is_empty())
-        .map(ToOwned::to_owned)
-        .collect()
 }
 
 /// The share of `cells` whose letters appear in `haystack`.
@@ -2714,8 +2740,8 @@ mod tests {
     #[test]
     fn a_grid_no_pipe_block_matches_is_not_forced_onto_one() {
         // Only the ruled grid was detected, and the only pipe block is the
-        // borderless table: they are not the same table, so the block stays
-        // what the renderer printed rather than carrying the other table's
+        // borderless table: they are not the same table, so the block is
+        // folded from its own rows rather than carrying the other table's
         // cells, and the borderless table's words are not lost.
         let (ruled, _) = ruled_and_borderless();
         let mut fold = DocumentFold::new();
@@ -2726,8 +2752,15 @@ mod tests {
         }));
         fold.consume(&page(1, "| Year | Cards |\n| 1837 | Punched |\n"));
         let document = fold.take();
-        assert!(document.tables.is_empty(), "{:?}", first_cells(&document));
-        assert!(base_of(&document.texts[0]).text.contains("Punched"));
+        assert_eq!(document.tables.len(), 1);
+        assert_eq!(
+            rendered_cells(&document.tables[0]),
+            ["Year", "Cards", "1837", "Punched"]
+        );
+        assert!(
+            document.texts.is_empty(),
+            "no pipe characters left in a paragraph"
+        );
         assert_sound(&document);
     }
 
@@ -2748,18 +2781,74 @@ mod tests {
         // carries the same words as the first page's grid.
         fold.consume(&page(2, "| Year | Cards |\n| 1837 | Punched |\n"));
         let document = fold.take();
-        assert!(document.tables.is_empty(), "{:?}", first_cells(&document));
+        assert_eq!(document.tables.len(), 1, "{:?}", first_cells(&document));
+        let table = &document.tables[0];
+        assert_eq!(table.prov[0].page_no, 2);
+        assert!(
+            table
+                .data
+                .as_ref()
+                .expect("a grid")
+                .table_cells
+                .iter()
+                .all(|cell| cell.bbox.is_none()),
+            "the rendered grid carries no box borrowed from page 1's grid"
+        );
+        assert_sound(&document);
+    }
+
+    fn rendered_cells(table: &doc::TableItem) -> Vec<&str> {
+        table
+            .data
+            .as_ref()
+            .expect("a grid")
+            .table_cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn pipe_characters_with_no_detected_grid_become_the_rendered_grid() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&page(
+            1,
+            "|Year|Count|\n|---|---|\n|1843|7|\n|1844|a\\|b|\n",
+        ));
+        let document = fold.take();
+        assert!(
+            document.texts.is_empty(),
+            "no text item carries pipe syntax"
+        );
+        assert_eq!(document.tables.len(), 1, "nothing was lost either");
+        let table = &document.tables[0];
+        assert_eq!(table.label, doc::DocItemLabel::Table as i32);
+        assert_eq!(
+            rendered_cells(table),
+            ["Year", "Count", "1843", "7", "1844", "a|b"]
+        );
+        let data = table.data.as_ref().expect("a grid");
+        assert_eq!((data.num_rows, data.num_cols), (3, 2));
+        let headers: Vec<bool> = data
+            .table_cells
+            .iter()
+            .map(|cell| cell.column_header)
+            .collect();
+        assert_eq!(headers, [true, true, false, false, false, false]);
+        assert!(
+            data.table_cells.iter().all(|cell| cell.bbox.is_none()),
+            "no box was printed"
+        );
         assert_sound(&document);
     }
 
     #[test]
-    fn pipe_characters_with_no_detected_grid_stay_a_paragraph() {
+    fn a_pipe_block_with_no_cell_text_stays_what_it_printed() {
         let mut fold = DocumentFold::new();
-        fold.consume(&page(1, "| Year | Count |\n| 1843 | 7 |\n"));
+        fold.consume(&page(1, "| | |\n|---|---|\n"));
         let document = fold.take();
-        assert!(document.tables.is_empty(), "nothing was detected");
-        assert_eq!(document.texts.len(), 1, "so nothing was lost either");
-        assert!(base_of(&document.texts[0]).text.contains('|'));
+        assert!(document.tables.is_empty());
+        assert_eq!(document.texts.len(), 1);
         assert_sound(&document);
     }
 
