@@ -112,7 +112,7 @@ The private APIs, and what each unblocks:
 
 ## Patches that change what the crate does
 
-Three patches go further than visibility, because the service could not be
+Some patches go further than visibility, because the service could not be
 made safe or correct from outside the crate. Each is written up with its
 reasons in `docs/capture-deferrals.md`.
 
@@ -160,6 +160,12 @@ reasons in `docs/capture-deferrals.md`.
   `ParseGuard` stop a run at a deadline or on cancellation at page
   boundaries. `PdfError` gained an `Interrupted` variant for it, which is
   the one change to a public type's shape.
+
+- **Zero-width format characters are kept** (`src/text_utils.rs`,
+  `src/extractor/content_stream.rs`, `src/extractor/xobjects.rs`). U+200B,
+  ZWNJ, ZWJ and the word joiner are source characters and pass through
+  `expand_ligatures`, and a kerning gap next to one does not become a word
+  space. The soft hyphen and the byte-order mark are still removed.
 
 ## How the patches are kept auditable
 
