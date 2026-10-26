@@ -1355,6 +1355,99 @@ pub fn invisible_text_pdf(watermark: &str) -> Vec<u8> {
     bytes
 }
 
+/// How [`zero_width_pdf`] draws the zero-width spaces between the letters
+/// of its marked word.
+#[derive(Clone, Copy, Debug)]
+pub enum ZeroWidthLayout {
+    /// One show operator, every mark zero wide: the letters touch.
+    Packed,
+    /// One TJ array with a kerning gap on each side of every mark, as a
+    /// generator that letter-spaces its output writes it.
+    Kerned,
+}
+
+/// Build a one-page PDF whose first line reads "The contract was approved
+/// by the board.", with a U+200B ZERO WIDTH SPACE between each letter of
+/// "approved", and a second line with the word written plainly.
+///
+/// Helvetica cannot name U+200B, so the marks are glyph code 1 with a
+/// ToUnicode CMap mapping it there and every printable code to itself,
+/// which is how a producer embeds a character its encoding has no name for.
+#[must_use]
+pub fn zero_width_pdf(layout: ZeroWidthLayout) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let cmap = b"/CIDInit /ProcSet findresource begin 12 dict begin begincmap\n\
+/CIDSystemInfo << /Registry (Adobe) /Ordering (UCS) /Supplement 0 >> def\n\
+/CMapName /Adobe-Identity-UCS def /CMapType 2 def\n\
+1 begincodespacerange <00> <FF> endcodespacerange\n\
+1 beginbfrange <20> <7E> <0020> endbfrange\n\
+1 beginbfchar <01> <200B> endbfchar\n\
+endcmap CMapName currentdict /CMap defineresource pop end end\n"
+        .to_vec();
+    let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap));
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "ToUnicode" => cmap_id,
+    });
+
+    let word = "approved";
+    let first = match layout {
+        ZeroWidthLayout::Packed => {
+            let marked: Vec<String> = word.chars().map(String::from).collect();
+            format!(
+                "(The contract was {} by the board.) Tj",
+                marked.join("\\001")
+            )
+        }
+        ZeroWidthLayout::Kerned => {
+            let mut parts: Vec<String> = vec!["(The contract was )".to_owned()];
+            let letters: Vec<char> = word.chars().collect();
+            for (index, letter) in letters.iter().enumerate() {
+                parts.push(format!("({letter})"));
+                if index + 1 < letters.len() {
+                    parts.push("-300 (\\001) -300".to_owned());
+                }
+            }
+            parts.push("( by the board.)".to_owned());
+            format!("[{}] TJ", parts.join(" "))
+        }
+    };
+    let content = format!(
+        "BT /F1 14 Tf 72 720 Td {first} ET\nBT /F1 14 Tf 72 600 Td (Plain approved line.) Tj ET\n"
+    );
+
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Build a one-page landscape PDF the way Acrobat Distiller writes one: a
 /// portrait 612 x 792 sheet with `/Rotate 90`, and every line of [`PROSE`]
 /// drawn with a text matrix turned a quarter, so the page reads as

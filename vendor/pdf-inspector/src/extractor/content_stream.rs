@@ -5,6 +5,7 @@
 
 use crate::text_utils::{
     decode_text_string, effective_font_size, expand_ligatures, is_bold_font, is_italic_font,
+    is_zero_width_format, push_shown_text,
 };
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, PageExtraction, PdfForm, PdfLine, PdfRect, TextItem};
@@ -678,6 +679,9 @@ pub(crate) fn extract_page_text_items_with_forms(
                         // segment's glyphs cover when an offset backtracks.
                         let mut sub_items: Vec<(String, f32, f32, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
+                        // Whether the last character of `current_text` is a space
+                        // the walker put in for a kerning gap.
+                        let mut kerned_space = false;
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         let mut sub_min_width_ts: f32 = 0.0;
@@ -734,8 +738,10 @@ pub(crate) fn extract_page_text_items_with_forms(
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
+                                            && !current_text.ends_with(is_zero_width_format)
                                         {
                                             current_text.push(' ');
+                                            kerned_space = true;
                                         }
                                     }
                                     continue;
@@ -785,8 +791,10 @@ pub(crate) fn extract_page_text_items_with_forms(
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
+                                            && !current_text.ends_with(is_zero_width_format)
                                         {
                                             current_text.push(' ');
+                                            kerned_space = true;
                                         }
                                     }
                                     continue;
@@ -833,7 +841,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                     &mut cmap_decisions,
                                     &font_widths,
                                 ) {
-                                    current_text.push_str(&text);
+                                    push_shown_text(&mut current_text, &mut kerned_space, &text);
                                 }
                             }
                         }

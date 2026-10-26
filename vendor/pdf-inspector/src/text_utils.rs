@@ -374,12 +374,14 @@ pub(crate) fn expand_ligatures(text: &str) -> String {
             '\u{FB03}' => result.push_str("ffi"),
             '\u{FB04}' => result.push_str("ffl"),
             '\u{FB05}' | '\u{FB06}' => result.push_str("st"),
-            // Strip invisible Unicode characters that pollute markdown output
-            '\u{00AD}' => {}              // soft hyphen
-            '\u{200B}' => {}              // zero-width space
-            '\u{FEFF}' => {}              // BOM / zero-width no-break space
-            '\u{200C}' | '\u{200D}' => {} // ZWNJ / ZWJ
-            '\u{2060}' => {}              // word joiner
+            // Strip the soft hyphen (a line-break hint, not content) and the
+            // byte-order mark. The zero-width space, ZWNJ, ZWJ and word
+            // joiner are source characters: ZWNJ and ZWJ change how Persian,
+            // Indic and emoji sequences read, and a zero-width space is the
+            // only record of a break opportunity the author placed. They are
+            // kept, as the other PDF text extractors keep them.
+            '\u{00AD}' => {} // soft hyphen
+            '\u{FEFF}' => {} // BOM / zero-width no-break space
             // Normalize typographic spaces to ASCII space so downstream
             // spacing logic (should_join_items) can detect word boundaries.
             // Excludes NBSP (U+00A0) which is common in PDFs and handled
@@ -882,6 +884,27 @@ fn compute_single_char_join_threshold(items: &[TextItem]) -> f32 {
     best_threshold.clamp(0.05, 2.0)
 }
 
+/// Zero-width space, ZWNJ, ZWJ and word joiner: characters that draw
+/// nothing and mark how the text on either side breaks or joins.
+pub(crate) fn is_zero_width_format(c: char) -> bool {
+    matches!(c, '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}')
+}
+
+/// Append a string a TJ array shows to the segment being built. When the
+/// walker turned the kerning gap before it into a word space and the string
+/// opens with a zero-width format character, that space is taken back: the
+/// gap was the mark's own room, and the mark already says what it is.
+pub(crate) fn push_shown_text(current: &mut String, kerned_space: &mut bool, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    if *kerned_space && current.ends_with(' ') && text.starts_with(is_zero_width_format) {
+        current.pop();
+    }
+    current.push_str(text);
+    *kerned_space = false;
+}
+
 /// Determine if two adjacent text items should be joined without a space
 /// based on their physical positions on the page and character case.
 /// Uses a hybrid approach: position-based with case-aware thresholds.
@@ -900,6 +923,15 @@ pub(crate) fn should_join_items(
     // Get the last character of previous and first character of current
     let prev_last = prev_item.text.trim_end().chars().last();
     let curr_first = curr_item.text.trim_start().chars().next();
+
+    // A zero-width format character on either side is the author's own
+    // break or join mark, and the gap beside it is its advance or kerning.
+    // Turning that gap into a space would add a character the page never had.
+    if prev_last.is_some_and(is_zero_width_format)
+        || curr_first.is_some_and(is_zero_width_format)
+    {
+        return true;
+    }
 
     // Always join if current starts with punctuation that typically follows without space
     // e.g., "www" + ".com" → "www.com", not "www .com"
@@ -1128,8 +1160,8 @@ mod tests {
     }
 
     #[test]
-    fn strip_zero_width_space() {
-        assert_eq!(expand_ligatures("hello\u{200B}world"), "helloworld");
+    fn keep_zero_width_space() {
+        assert_eq!(expand_ligatures("hello\u{200B}world"), "hello\u{200B}world");
     }
 
     #[test]
@@ -1138,8 +1170,11 @@ mod tests {
     }
 
     #[test]
-    fn strip_zwnj_zwj_word_joiner() {
-        assert_eq!(expand_ligatures("a\u{200C}b\u{200D}c\u{2060}d"), "abcd");
+    fn keep_zwnj_zwj_word_joiner() {
+        assert_eq!(
+            expand_ligatures("a\u{200C}b\u{200D}c\u{2060}d"),
+            "a\u{200C}b\u{200D}c\u{2060}d"
+        );
     }
 
     #[test]
@@ -1731,6 +1766,21 @@ mod tests {
             item_type: ItemType::Text,
             mcid: None,
         }
+    }
+
+    #[test]
+    fn zero_width_space_gap_is_not_a_word_space() {
+        // "a" + ZWSP + "p" drawn with a word-sized gap on each side of the
+        // zero-width space: the gap is the mark's own advance, not a space.
+        let fs = 14.0;
+        let a = make_text_item("a", 100.0, 7.8, fs);
+        let zwsp = make_text_item("\u{200B}", 112.0, 0.0, fs);
+        let p = make_text_item("p", 116.0, 7.8, fs);
+        assert!(should_join_items(&a, &zwsp, 0.1));
+        assert!(should_join_items(&zwsp, &p, 0.1));
+        // The same gap with no mark beside it is still a word space.
+        let word = make_text_item("p", 112.0, 7.8, fs);
+        assert!(!should_join_items(&a, &word, 0.1));
     }
 
     #[test]
