@@ -427,6 +427,25 @@ of which the crate already marks dead; and **U4**, `pages_sampled` /
 second detection call this service chooses not to make. (`ocr_recommended`
 was the third, and is wired now: see the routing review above.)
 
+**LLM tester report (2026-10-26): zero-width characters.** A word with
+U+200B between its letters lost all of the marks, and when the producer
+kerned a gap around each mark, a space took the place of each one
+(gRParse#172). `expand_ligatures` stripped U+200B, ZWNJ, ZWJ and the word
+joiner along with the soft hyphen and the byte-order mark, and the TJ
+array walk turned each kerning gap into a word space. Poppler and MuPDF
+preserve the marks.
+
+- *Patch* `593adba`: `expand_ligatures` passes the zero-width format
+  characters through; the soft hyphen and the byte-order mark are still
+  removed. The TJ walk adds no kerning space after a mark and takes back
+  one it added just before a mark (`push_shown_text`), and
+  `should_join_items` joins runs that meet at a mark without a space.
+- *Wired*: no new fields. The marks arrive in `PageMarkdown.markdown` and
+  in the Document items' `orig` and `text` as the page encodes them. No
+  normalization policy touches them, so there is no option to add.
+- *Tests*: `tests/text_fidelity.rs`, one fixture in a packed and a kerned
+  layout; unit tests next to the crate's in `text_utils.rs`.
+
 ### What the patches did not change
 
 The FULL layout verdict and the per-page OCR reasons are computed from the

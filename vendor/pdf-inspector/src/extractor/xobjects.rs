@@ -1,7 +1,10 @@
 //! Form XObject and image XObject extraction.
 
 use super::fonts::descriptor_style_flags;
-use crate::text_utils::{effective_font_size, expand_ligatures, is_bold_font, is_italic_font};
+use crate::text_utils::{
+    effective_font_size, expand_ligatures, is_bold_font, is_italic_font, is_zero_width_format,
+    push_shown_text,
+};
 use crate::tounicode::FontCMaps;
 use crate::types::{ItemType, PdfForm, TextItem};
 use lopdf::{Document, Encoding, Object, ObjectId};
@@ -803,6 +806,9 @@ fn extract_form_xobject_text_inner(
 
                         let mut sub_items: Vec<(String, f32, f32, f32, f32)> = Vec::new();
                         let mut current_text = String::new();
+                        // Whether the last character of `current_text` is a space
+                        // the walker put in for a kerning gap.
+                        let mut kerned_space = false;
                         let mut sub_start_width_ts: f32 = 0.0;
                         let mut total_width_ts: f32 = 0.0;
                         let mut sub_min_width_ts: f32 = 0.0;
@@ -858,8 +864,10 @@ fn extract_form_xobject_text_inner(
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
+                                            && !current_text.ends_with(is_zero_width_format)
                                         {
                                             current_text.push(' ');
+                                            kerned_space = true;
                                         }
                                     }
                                     continue;
@@ -909,8 +917,10 @@ fn extract_form_xobject_text_inner(
                                             && n_val < -space_threshold
                                             && !current_text.is_empty()
                                             && !current_text.ends_with(' ')
+                                            && !current_text.ends_with(is_zero_width_format)
                                         {
                                             current_text.push(' ');
+                                            kerned_space = true;
                                         }
                                     }
                                     continue;
@@ -943,7 +953,7 @@ fn extract_form_xobject_text_inner(
                                     cmap_decisions,
                                     &font_widths,
                                 ) {
-                                    current_text.push_str(&text);
+                                    push_shown_text(&mut current_text, &mut kerned_space, &text);
                                 }
                             }
                         }
