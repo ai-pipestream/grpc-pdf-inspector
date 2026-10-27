@@ -343,7 +343,7 @@ impl StructTree {
     /// Build per-page MCID → StructRole lookup.
     ///
     /// Returns a map: page_number (1-indexed) → (MCID → StructRole).
-    /// The `page_ids` map should come from `doc.get_pages()`.
+    /// The `page_ids` map should come from `crate::page_tree::pages(doc)`.
     pub fn mcid_to_roles(
         &self,
         page_ids: &std::collections::BTreeMap<u32, ObjectId>,
@@ -1619,7 +1619,7 @@ mod tests {
         );
 
         // Verify mcid_to_roles produces a populated map
-        let page_ids = doc.get_pages();
+        let page_ids = crate::page_tree::pages(&doc);
         let role_map = tree.mcid_to_roles(&page_ids);
         assert!(!role_map.is_empty(), "Should have MCID→role mappings");
     }

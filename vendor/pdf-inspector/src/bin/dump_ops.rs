@@ -9,7 +9,7 @@ fn main() {
     let search = std::env::args().nth(3);
 
     let doc = Document::load(&path).unwrap();
-    let pages = doc.get_pages();
+    let pages = pdf_inspector::page_tree::pages(&doc);
     let page_id = pages[&target_page];
     let content_ids = doc.get_page_contents(page_id);
 

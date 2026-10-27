@@ -82,13 +82,21 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     /// Index a document's pages so destinations can be resolved.
+    ///
+    /// The pages are taken one at a time rather than collected: lopdf's
+    /// page iterator hints a size read from the tree's own `/Count`, which
+    /// nothing has verified, and a collect that reserved the hint would
+    /// ask the allocator for whatever a hostile node claims.
     fn new(doc: &'a Document, max_stream_bytes: usize) -> Self {
-        let pages = doc.get_pages();
+        let mut page_ids = Vec::new();
+        for (index, page_id) in doc.page_iter().enumerate() {
+            page_ids.push((index as u32 + 1, page_id));
+        }
         Self {
             doc,
             max_stream_bytes,
-            page_numbers: pages.iter().map(|(number, id)| (*id, *number)).collect(),
-            page_ids: pages.into_iter().collect(),
+            page_numbers: page_ids.iter().map(|(number, id)| (*id, *number)).collect(),
+            page_ids,
         }
     }
 
