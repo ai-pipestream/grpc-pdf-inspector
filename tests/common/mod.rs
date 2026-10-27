@@ -2252,6 +2252,34 @@ pub fn count_lie_pdf(count: i64) -> Vec<u8> {
     bytes
 }
 
+/// Build a text PDF of `pages` pages whose `/PageLabels` numbers every
+/// page in `style` (`D`, `R`, `r`, `A` or `a`) starting at `start`.
+///
+/// A real document starts a range at 1 or at the page number its front
+/// matter ran to; `start` can be anything the field holds.
+#[must_use]
+pub fn labelled_pdf(pages: u32, style: &str, start: u32) -> Vec<u8> {
+    let mut doc = Document::load_mem(&text_pdf(pages, 10, "label-marker")).expect("reload");
+    let page_labels_id = doc.add_object(dictionary! {
+        "Nums" => vec![
+            0.into(),
+            Object::Dictionary(dictionary! { "S" => style, "St" => i64::from(start) }),
+        ],
+    });
+    let catalog_id = doc
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .expect("the catalog");
+    doc.get_dictionary_mut(catalog_id)
+        .expect("the catalog dictionary")
+        .set("PageLabels", page_labels_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 // --- Server harness -------------------------------------------------------
 
 use std::sync::Arc;

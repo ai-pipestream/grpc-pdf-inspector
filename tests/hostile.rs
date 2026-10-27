@@ -54,3 +54,56 @@ async fn a_page_tree_node_lying_about_its_count_costs_only_the_pages_it_holds() 
         .await;
     assert_eq!(common::pages(&events).len(), 2);
 }
+
+#[tokio::test]
+async fn a_page_label_range_starting_near_the_top_stays_a_label() {
+    let harness = common::start().await;
+    for style in ["a", "A", "r", "R"] {
+        let pdf = common::labelled_pdf(2, style, u32::MAX - 1);
+        assert!(pdf.len() < 2048, "{} bytes", pdf.len());
+
+        let started = Instant::now();
+        let events = harness
+            .parse(
+                &pdf,
+                pb::PdfOptions {
+                    mode: pb::ProcessMode::DetectOnly.into(),
+                    emit_metadata: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_or_else(|status| panic!("style {style}: {status:?}"));
+        assert!(
+            started.elapsed() < BUDGET,
+            "style {style}: {:?}",
+            started.elapsed()
+        );
+
+        let pages = &common::metadata(&events).pages;
+        assert_eq!(pages.len(), 2, "style {style}");
+        for page in pages {
+            assert!(
+                !page.label.is_empty() && page.label.len() <= 64,
+                "style {style}: page {} has a label of {} bytes",
+                page.page_no,
+                page.label.len()
+            );
+        }
+    }
+
+    // A label that fits its style is still rendered in it.
+    let pdf = common::labelled_pdf(1, "a", 27);
+    let events = harness
+        .parse(
+            &pdf,
+            pb::PdfOptions {
+                mode: pb::ProcessMode::DetectOnly.into(),
+                emit_metadata: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("a sane label range parses");
+    assert_eq!(common::metadata(&events).pages[0].label, "aa");
+}
