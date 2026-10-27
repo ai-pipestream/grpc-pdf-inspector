@@ -67,7 +67,7 @@ pub fn extract_text_mem(buffer: &[u8]) -> Result<String, PdfError> {
 
 /// Extract text from loaded document
 fn extract_text_from_doc(doc: &Document) -> Result<String, PdfError> {
-    let pages = doc.get_pages();
+    let pages = crate::page_tree::pages(doc);
     let page_nums: Vec<u32> = pages.keys().cloned().collect();
 
     doc.extract_text_with_limit(&page_nums, crate::guard::max_stream_bytes())
@@ -244,8 +244,7 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
             None,
             true,
         )?;
-    let page_boxes = doc
-        .get_pages()
+    let page_boxes = crate::page_tree::pages(&doc)
         .iter()
         .filter(|(page_num, _)| page_filter.is_none_or(|filter| filter.contains(page_num)))
         .map(|(page_num, &page_id)| (*page_num, page_box(&doc, page_id)))
@@ -423,7 +422,7 @@ fn extract_positioned_text_with_folio_context_impl(
         include_invisible,
         None,
     )?;
-    if !layout::needs_document_page_number_context(&selected_items, doc.get_pages().len()) {
+    if !layout::needs_document_page_number_context(&selected_items, crate::page_tree::pages(doc).len()) {
         return Ok((
             (selected_items, selected_rects, selected_lines),
             page_thresholds,
@@ -431,8 +430,7 @@ fn extract_positioned_text_with_folio_context_impl(
         ));
     }
 
-    let context_pages: HashSet<u32> = doc
-        .get_pages()
+    let context_pages: HashSet<u32> = crate::page_tree::pages(doc)
         .keys()
         .copied()
         .filter(|page| !required_pages.contains(page))
@@ -540,7 +538,7 @@ fn extract_positioned_text_impl_reporting_invisible(
     ),
     PdfError,
 > {
-    let pages = doc.get_pages();
+    let pages = crate::page_tree::pages(doc);
     let mut all_items = Vec::new();
     let mut all_rects = Vec::new();
     let mut all_lines = Vec::new();

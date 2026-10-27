@@ -161,6 +161,15 @@ reasons in `docs/capture-deferrals.md`.
   boundaries. `PdfError` gained an `Interrupted` variant for it, which is
   the one change to a public type's shape.
 
+- **The page tree is walked without trusting its `/Count`**
+  (`src/page_tree.rs`, and every former `Document::get_pages` call site).
+  lopdf's page iterator reports the `/Count` of the `/Pages` nodes still
+  ahead of it as its size hint, and `get_pages` collects through a `Vec`
+  that reserves the hint before it has seen a second page. An empty inner
+  node claiming 2^40 descendants aborted the process with a failed
+  allocation of terabytes, and one claiming 2^60 panicked on capacity
+  overflow. `page_tree::pages` finds the same pages in the same order,
+  inserted one at a time.
 - **Zero-width format characters are kept** (`src/text_utils.rs`,
   `src/extractor/content_stream.rs`, `src/extractor/xobjects.rs`). U+200B,
   ZWNJ, ZWJ and the word joiner are source characters and pass through

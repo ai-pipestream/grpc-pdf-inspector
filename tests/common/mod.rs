@@ -2199,6 +2199,87 @@ pub fn garbage() -> Vec<u8> {
     b"this is not a PDF, it is not even trying to be one".to_vec()
 }
 
+/// Build a one-page text PDF whose page tree also holds an empty inner
+/// `/Pages` node claiming `count` descendants.
+///
+/// The claim is a lie the walk never has to believe: the node has no
+/// kids, so the document has exactly one page whatever `count` says.
+/// What a reader does with the number before it has looked is the point.
+#[must_use]
+pub fn count_lie_pdf(count: i64) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let content_id = doc.add_object(Stream::new(
+        dictionary! {},
+        b"BT /F1 12 Tf 50 750 Td (count-lie marker) Tj ET".to_vec(),
+    ));
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => font_id },
+        },
+        "Contents" => content_id,
+    });
+    let liar_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Parent" => pages_id,
+        "Kids" => Vec::<Object>::new(),
+        "Count" => count,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id), Object::Reference(liar_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a text PDF of `pages` pages whose `/PageLabels` numbers every
+/// page in `style` (`D`, `R`, `r`, `A` or `a`) starting at `start`.
+///
+/// A real document starts a range at 1 or at the page number its front
+/// matter ran to; `start` can be anything the field holds.
+#[must_use]
+pub fn labelled_pdf(pages: u32, style: &str, start: u32) -> Vec<u8> {
+    let mut doc = Document::load_mem(&text_pdf(pages, 10, "label-marker")).expect("reload");
+    let page_labels_id = doc.add_object(dictionary! {
+        "Nums" => vec![
+            0.into(),
+            Object::Dictionary(dictionary! { "S" => style, "St" => i64::from(start) }),
+        ],
+    });
+    let catalog_id = doc
+        .trailer
+        .get(b"Root")
+        .and_then(Object::as_reference)
+        .expect("the catalog");
+    doc.get_dictionary_mut(catalog_id)
+        .expect("the catalog dictionary")
+        .set("PageLabels", page_labels_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 // --- Server harness -------------------------------------------------------
 
 use std::sync::Arc;

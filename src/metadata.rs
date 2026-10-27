@@ -82,13 +82,21 @@ struct Reader<'a> {
 
 impl<'a> Reader<'a> {
     /// Index a document's pages so destinations can be resolved.
+    ///
+    /// The pages are taken one at a time rather than collected: lopdf's
+    /// page iterator hints a size read from the tree's own `/Count`, which
+    /// nothing has verified, and a collect that reserved the hint would
+    /// ask the allocator for whatever a hostile node claims.
     fn new(doc: &'a Document, max_stream_bytes: usize) -> Self {
-        let pages = doc.get_pages();
+        let mut page_ids = Vec::new();
+        for (index, page_id) in doc.page_iter().enumerate() {
+            page_ids.push((index as u32 + 1, page_id));
+        }
         Self {
             doc,
             max_stream_bytes,
-            page_numbers: pages.iter().map(|(number, id)| (*id, *number)).collect(),
-            page_ids: pages.into_iter().collect(),
+            page_numbers: page_ids.iter().map(|(number, id)| (*id, *number)).collect(),
+            page_ids,
         }
     }
 
@@ -804,23 +812,37 @@ fn split_list(value: Option<&str>) -> Vec<String> {
         .collect()
 }
 
+/// The longest numeral the repeating styles render before the number
+/// falls back to digits.
+///
+/// Roman numerals spend one letter per thousand and the alphabetic style
+/// one per 26, so a start value near the top of the field makes a label
+/// of millions of characters per page, which no reader prints and which
+/// a hostile file can ask for in a few bytes. Real labels are a handful of
+/// characters; past this many the digits say the same thing in ten.
+const MAX_NUMERAL_CHARS: u32 = 32;
+
 /// Render a page number in one of the five numbering styles.
 ///
 /// An unknown or absent style means the range is a prefix only, which is
-/// how a document labels a run of pages "Cover" with no number at all.
+/// how a document labels a run of pages "Cover" with no number at all. A
+/// number too large for the roman or alphabetic style to render within
+/// [`MAX_NUMERAL_CHARS`] is rendered in digits instead.
 fn numbering(style: &Option<Vec<u8>>, number: u32) -> String {
+    let digits = || number.to_string();
     match style.as_deref() {
-        Some(b"D") => number.to_string(),
-        Some(b"R") => roman(number).to_uppercase(),
-        Some(b"r") => roman(number),
-        Some(b"A") => letters(number).to_uppercase(),
-        Some(b"a") => letters(number),
+        Some(b"D") => digits(),
+        Some(b"R") => roman(number).map_or_else(digits, |numeral| numeral.to_uppercase()),
+        Some(b"r") => roman(number).unwrap_or_else(digits),
+        Some(b"A") => letters(number).map_or_else(digits, |numeral| numeral.to_uppercase()),
+        Some(b"a") => letters(number).unwrap_or_else(digits),
         _ => String::new(),
     }
 }
 
-/// Lower-case roman numerals. 0 has no numeral and yields nothing.
-fn roman(mut number: u32) -> String {
+/// Lower-case roman numerals. 0 has no numeral and yields nothing, and a
+/// number past [`MAX_NUMERAL_CHARS`] thousands has none here either.
+fn roman(mut number: u32) -> Option<String> {
     const NUMERALS: [(u32, &str); 13] = [
         (1000, "m"),
         (900, "cm"),
@@ -836,6 +858,9 @@ fn roman(mut number: u32) -> String {
         (4, "iv"),
         (1, "i"),
     ];
+    if number / 1000 > MAX_NUMERAL_CHARS {
+        return None;
+    }
     let mut out = String::new();
     for (value, numeral) in NUMERALS {
         while number >= value {
@@ -843,19 +868,23 @@ fn roman(mut number: u32) -> String {
             number -= value;
         }
     }
-    out
+    Some(out)
 }
 
-/// The alphabetic style: a, b, ... z, aa, bb, ... — a repeated letter
-/// rather than a base-26 count, as the specification requires.
-fn letters(number: u32) -> String {
+/// The alphabetic style: a, b, ... z, aa, bb, ... (a repeated letter
+/// rather than a base-26 count, as the specification requires), or
+/// nothing for a number that would repeat past [`MAX_NUMERAL_CHARS`].
+fn letters(number: u32) -> Option<String> {
     if number == 0 {
-        return String::new();
+        return Some(String::new());
     }
     let index = (number - 1) % 26;
     let repeats = (number - 1) / 26 + 1;
+    if repeats > MAX_NUMERAL_CHARS {
+        return None;
+    }
     let letter = char::from(b'a' + index as u8);
-    std::iter::repeat_n(letter, repeats as usize).collect()
+    Some(std::iter::repeat_n(letter, repeats as usize).collect())
 }
 
 /// A PDF date string as an instant.
@@ -1005,6 +1034,21 @@ mod tests {
             "",
             "a range with no style is a prefix only"
         );
+    }
+
+    #[test]
+    fn a_numeral_too_long_to_print_is_rendered_in_digits() {
+        assert_eq!(
+            numbering(&Some(b"r".to_vec()), 32_999),
+            "m".repeat(32) + "cmxcix"
+        );
+        assert_eq!(numbering(&Some(b"R".to_vec()), 33_000), "33000");
+        assert_eq!(numbering(&Some(b"a".to_vec()), 32 * 26), "z".repeat(32));
+        assert_eq!(numbering(&Some(b"A".to_vec()), 32 * 26 + 1), "833");
+        for style in [b"r", b"R", b"a", b"A"] {
+            let label = numbering(&Some(style.to_vec()), u32::MAX);
+            assert_eq!(label, "4294967295", "{}", String::from_utf8_lossy(style));
+        }
     }
 
     #[test]
