@@ -42,7 +42,7 @@ RUN cargo build --release --locked
 # (`grpc.health.v1.Health/Check`, which this server registers) rather than a
 # Dockerfile HEALTHCHECK, because there is no shell here to run one with.
 # ---------------------------------------------------------------------------
-FROM dhi.io/debian-base:trixie-debian13@sha256:de80b468d8c492508f24b30e529accfaa8c59fe4505ddd72e969b324d276ad21
+FROM dhi.io/debian-base:trixie-debian13@sha256:feaf699b573671a25b33733f784646b0cc350f804d899005979edb7f38e251c7
 
 COPY --from=builder /src/target/release/grpc-pdf-inspector /usr/local/bin/grpc-pdf-inspector
 
