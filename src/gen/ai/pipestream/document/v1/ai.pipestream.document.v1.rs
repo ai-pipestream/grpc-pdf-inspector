@@ -717,6 +717,27 @@ pub struct TextItemBase {
     /// Empty for single-source items. Extension beyond the upstream dialect.
     #[prost(message, repeated, tag="25")]
     pub field_sources: ::prost::alloc::vec::Vec<FieldSource>,
+    /// Markup attributes in source order, including lexical presence and locations.
+    #[prost(message, repeated, tag="26")]
+    pub source_attributes: ::prost::alloc::vec::Vec<SourceAttribute>,
+}
+/// A markup attribute's decoded value and source spelling. Presence distinguishes
+/// a bare attribute from an explicitly empty value without inventing source bytes.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct SourceAttribute {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag="2")]
+    pub name_raw: ::prost::alloc::string::String,
+    #[prost(string, optional, tag="3")]
+    pub value: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag="4")]
+    pub name_span: ::core::option::Option<ByteSpan>,
+    #[prost(message, optional, tag="5")]
+    pub value_span: ::core::option::Option<ByteSpan>,
+    /// Absent when an older producer cannot distinguish lexical value presence.
+    #[prost(bool, optional, tag="6")]
+    pub value_present: ::core::option::Option<bool>,
 }
 /// TitleItem represents a document title or major heading.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1413,6 +1434,24 @@ pub struct TableData {
     /// the upstream dialect.
     #[prost(message, optional, tag="10")]
     pub record_layout: ::core::option::Option<RecordLayoutMeta>,
+    /// Named source table declarations, distinct from the sheet-wide cell grid.
+    #[prost(message, repeated, tag="11")]
+    pub declared_tables: ::prost::alloc::vec::Vec<DeclaredSheetTable>,
+}
+/// One named table declared by a workbook, preserving its own schema and bands.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct DeclaredSheetTable {
+    #[prost(string, tag="1")]
+    pub name: ::prost::alloc::string::String,
+    /// Absolute sheet coordinates with inclusive last row and column.
+    #[prost(message, optional, tag="2")]
+    pub range: ::core::option::Option<GridSpan>,
+    #[prost(uint32, tag="3")]
+    pub header_row_count: u32,
+    #[prost(uint32, tag="4")]
+    pub totals_row_count: u32,
+    #[prost(string, repeated, tag="5")]
+    pub columns: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 /// TableRow represents a single row in the table.
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1916,6 +1955,21 @@ pub struct DocumentMeta {
     pub field_sources: ::prost::alloc::vec::Vec<FieldSource>,
     #[prost(map="string, string", tag="100")]
     pub extra: ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    /// Source-declared workbook/document properties, retained as typed metadata.
+    #[prost(string, optional, tag="36")]
+    pub description: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="37")]
+    pub category: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="38")]
+    pub content_status: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="39")]
+    pub revision: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="40")]
+    pub application_version: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="41")]
+    pub company: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag="42")]
+    pub manager: ::core::option::Option<::prost::alloc::string::String>,
 }
 /// Identifier is one source-scoped identifier.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1989,6 +2043,17 @@ pub struct CellValue {
     /// The source's display format string for the value.
     #[prost(string, optional, tag="10")]
     pub number_format: ::core::option::Option<::prost::alloc::string::String>,
+    /// The source formula alongside its cached typed result in `kind`. Older
+    /// producers may instead use the legacy `formula` arm without a cached value.
+    #[prost(string, optional, tag="11")]
+    pub formula_source: ::core::option::Option<::prost::alloc::string::String>,
+    /// Source workbook style index when the reader exposes it.
+    #[prost(uint32, optional, tag="12")]
+    pub style_id: ::core::option::Option<u32>,
+    /// Source number-format identifier, including reserved/localized formats
+    /// whose display code is unavailable.
+    #[prost(uint32, optional, tag="13")]
+    pub number_format_id: ::core::option::Option<u32>,
     #[prost(oneof="cell_value::Kind", tags="1, 2, 3, 4, 5")]
     pub kind: ::core::option::Option<cell_value::Kind>,
 }
