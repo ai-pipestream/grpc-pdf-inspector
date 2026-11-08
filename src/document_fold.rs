@@ -263,6 +263,24 @@ impl DocumentFold {
         std::mem::replace(&mut self.document, Self::new().document)
     }
 
+    /// Finish the fragment and take it without its items: the
+    /// document-wide fields, the `pages` map and the two root groups'
+    /// children, with the `texts`, `tables`, `pictures` and `groups` arenas
+    /// empty. The fold is empty afterwards.
+    ///
+    /// This is the `document` event for a caller that already has every
+    /// item from the [`page_document`](Self::page_document) slices: the
+    /// root groups' children keep the refs the slices' items carry, so the
+    /// slices' arenas, concatenated in order, are the arenas left out here.
+    pub fn take_without_items(&mut self) -> doc::Document {
+        let mut document = self.take();
+        document.texts = Vec::new();
+        document.tables = Vec::new();
+        document.pictures = Vec::new();
+        document.groups = Vec::new();
+        document
+    }
+
     /// Where the fold stands now, so the items the next page adds can be
     /// cut out afterwards by [`page_document`](Self::page_document).
     #[must_use]

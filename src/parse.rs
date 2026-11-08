@@ -772,7 +772,14 @@ fn parse(
     if options.emit_document
         && let Some(fold) = events.fold.as_mut()
     {
-        sink.send(pb::parse_pdf_response::Event::Document(fold.take()))?;
+        // A caller that took every item from the slices asked for the
+        // rest of the Document only, so no item crosses the wire twice.
+        let document = if options.emit_page_documents && options.document_without_items {
+            fold.take_without_items()
+        } else {
+            fold.take()
+        };
+        sink.send(pb::parse_pdf_response::Event::Document(document))?;
     }
     sink.send(pb::parse_pdf_response::Event::Status(pb::ParseStatus {
         pages_extracted,
