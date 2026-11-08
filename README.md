@@ -86,7 +86,9 @@ page_document
           page, that page's share of the Document fold
 document  only when options.emit_document is set: the whole parse folded
           into one ai.pipestream.document.v1.Document, after the last
-          page, before status
+          page, before status; with options.emit_page_documents and
+          options.document_without_items also set, without the items
+          the page_document slices already carried
 status    trailer: pages_extracted, warnings, layout complexity,
           has_encoding_issues, has_invisible_text, per-page extraction OCR
           reasons, total processing_time_ms
@@ -162,7 +164,11 @@ collector's parse of the same document. With `options.emit_page_documents`
 set, the same fold also goes out page by page: each `page` is followed by a
 `page_document` holding exactly the items folding that page added, under
 the refs they carry in the whole Document, so a consumer can show page one
-while the rest are still being read:
+while the rest are still being read. Adding
+`options.document_without_items` to both flags makes the trailing
+`document` event carry only what the slices do not: the document-wide
+fields, the `pages` map and the two root groups' children, with empty item
+arenas, so every item crosses the wire once:
 
 - Headings come from the document's own tagging when it is tagged, and
   from the markdown's ATX levels when it is not. Lists become `ListItem`s

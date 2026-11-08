@@ -237,3 +237,114 @@ async fn page_encoding_verdicts_account_for_the_document_flag() {
         );
     }
 }
+
+#[tokio::test]
+async fn document_without_items_leaves_the_items_to_the_slices() {
+    let harness = common::start().await;
+    let fixtures = [
+        ("text", common::text_pdf(3, 40, "slice-marker")),
+        ("furniture", common::furniture_pdf(3, "A Running Head")),
+        (
+            "illustrated",
+            common::illustrated_pdf("https://example.com/figure"),
+        ),
+        ("table", common::table_pdf()),
+        ("mixed", common::mixed_text_and_scan_pdf(3, &[2])),
+    ];
+    for (name, pdf) in fixtures {
+        let full = harness
+            .parse(&pdf, rich(true))
+            .await
+            .expect("the document should parse");
+        let lean = harness
+            .parse(
+                &pdf,
+                pb::PdfOptions {
+                    document_without_items: true,
+                    ..rich(true)
+                },
+            )
+            .await
+            .expect("the document should parse");
+        assert_eq!(
+            common::shape(&lean),
+            common::shape(&full),
+            "{name}: the option changes no event's place"
+        );
+        let whole = common::documents(&full)[0];
+        let header = common::documents(&lean)[0];
+        assert!(header.texts.is_empty(), "{name}: no texts on the document");
+        assert!(
+            header.tables.is_empty(),
+            "{name}: no tables on the document"
+        );
+        assert!(
+            header.pictures.is_empty(),
+            "{name}: no pictures on the document"
+        );
+        assert!(
+            header.groups.is_empty(),
+            "{name}: no groups on the document"
+        );
+
+        // Everything else is the whole Document's, field for field.
+        let mut expected = whole.clone();
+        expected.texts.clear();
+        expected.tables.clear();
+        expected.pictures.clear();
+        expected.groups.clear();
+        assert_eq!(
+            header, &expected,
+            "{name}: the rest of the document is unchanged"
+        );
+
+        // The slices are what they were, so they still carry every item
+        // the header left out.
+        let slices: Vec<_> = page_documents(&lean)
+            .into_iter()
+            .map(|slice| slice.document.clone().expect("a slice carries a document"))
+            .collect();
+        let full_slices: Vec<_> = page_documents(&full)
+            .into_iter()
+            .map(|slice| slice.document.clone().expect("a slice carries a document"))
+            .collect();
+        assert_eq!(slices, full_slices, "{name}: the slices are unchanged");
+        let texts: Vec<_> = slices.iter().flat_map(|d| d.texts.clone()).collect();
+        let tables: Vec<_> = slices.iter().flat_map(|d| d.tables.clone()).collect();
+        let pictures: Vec<_> = slices.iter().flat_map(|d| d.pictures.clone()).collect();
+        let groups: Vec<_> = slices.iter().flat_map(|d| d.groups.clone()).collect();
+        assert_eq!(texts, whole.texts, "{name}: the slices hold the texts");
+        assert_eq!(tables, whole.tables, "{name}: the slices hold the tables");
+        assert_eq!(
+            pictures, whole.pictures,
+            "{name}: the slices hold the pictures"
+        );
+        assert_eq!(groups, whole.groups, "{name}: the slices hold the groups");
+    }
+}
+
+#[tokio::test]
+async fn document_without_items_needs_the_slices() {
+    let harness = common::start().await;
+    let pdf = common::text_pdf(2, 40, "no-slices");
+    let events = harness
+        .parse(
+            &pdf,
+            pb::PdfOptions {
+                emit_document: true,
+                document_without_items: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the document should parse");
+    assert!(
+        page_documents(&events).is_empty(),
+        "the option alone asks for no slices"
+    );
+    let document = common::documents(&events)[0];
+    assert!(
+        !document.texts.is_empty(),
+        "without slices the document keeps its items"
+    );
+}

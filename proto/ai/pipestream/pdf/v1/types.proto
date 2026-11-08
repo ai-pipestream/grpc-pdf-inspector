@@ -200,6 +200,18 @@ message PdfOptions {
   // `emit_document` is set; the `document` event itself still goes out
   // only when `emit_document` asks for it.
   bool emit_page_documents = 13;
+
+  // With `emit_document` and `emit_page_documents` both set, send the
+  // `document` event without the items the `page_document` slices already
+  // carried: the document-wide fields (`name`, `origin`, `source_meta`,
+  // `outline`, `attachments`, `anchors` and the rest), the `pages` map and
+  // the two root groups' children, with empty `texts`, `tables`,
+  // `pictures` and `groups` arenas. The refs in the root groups' children
+  // and in the slices are the same refs, so a consumer that kept the
+  // slices in order rebuilds the whole Document by putting their arenas
+  // back, and every item crosses the wire once instead of twice. Ignored
+  // unless both flags are set. Default false.
+  bool document_without_items = 14;
 }
 
 // TableKind separates a real data table from a table of contents.

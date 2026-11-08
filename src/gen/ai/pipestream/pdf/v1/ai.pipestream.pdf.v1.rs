@@ -160,6 +160,18 @@ pub struct PdfOptions {
     /// only when `emit_document` asks for it.
     #[prost(bool, tag="13")]
     pub emit_page_documents: bool,
+    /// With `emit_document` and `emit_page_documents` both set, send the
+    /// `document` event without the items the `page_document` slices already
+    /// carried: the document-wide fields (`name`, `origin`, `source_meta`,
+    /// `outline`, `attachments`, `anchors` and the rest), the `pages` map and
+    /// the two root groups' children, with empty `texts`, `tables`,
+    /// `pictures` and `groups` arenas. The refs in the root groups' children
+    /// and in the slices are the same refs, so a consumer that kept the
+    /// slices in order rebuilds the whole Document by putting their arenas
+    /// back, and every item crosses the wire once instead of twice. Ignored
+    /// unless both flags are set. Default false.
+    #[prost(bool, tag="14")]
+    pub document_without_items: bool,
 }
 /// TableCells is one row of a detected table.
 #[derive(Clone, PartialEq, ::prost::Message)]
