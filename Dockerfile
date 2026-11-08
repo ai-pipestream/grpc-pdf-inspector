@@ -13,7 +13,7 @@
 # buf.gen.yaml) and the generated Rust is checked in, so the image build needs
 # a Rust toolchain and nothing else.
 # ---------------------------------------------------------------------------
-FROM dhi.io/rust:1@sha256:388f7105a9b592d0303af05937b4b525f48c45695e197b6c3553371cf08f7aa1 AS builder
+FROM dhi.io/rust:1@sha256:6a324834b3e9ed48cab9c8780b4fbcd520e8c79bad4a39b26b5655d94a50e466 AS builder
 
 # The hardened toolchain image runs as a nonroot user; the build needs to
 # write only under /src and the cargo home, so give it a writable workspace.
@@ -42,7 +42,7 @@ RUN cargo build --release --locked
 # (`grpc.health.v1.Health/Check`, which this server registers) rather than a
 # Dockerfile HEALTHCHECK, because there is no shell here to run one with.
 # ---------------------------------------------------------------------------
-FROM dhi.io/debian-base:trixie-debian13@sha256:de80b468d8c492508f24b30e529accfaa8c59fe4505ddd72e969b324d276ad21
+FROM dhi.io/debian-base:trixie-debian13@sha256:5c9d8c2c90a0a4672f44a42a485c99e1b95f4bfad5c8ef49934f34b7ffb6e23b
 
 COPY --from=builder /src/target/release/grpc-pdf-inspector /usr/local/bin/grpc-pdf-inspector
 
