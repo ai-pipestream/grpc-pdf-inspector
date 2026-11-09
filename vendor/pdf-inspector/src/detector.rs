@@ -211,7 +211,7 @@ pub(crate) fn detect_from_document(
     page_count: u32,
     config: &DetectionConfig,
 ) -> Result<PdfTypeResult, PdfError> {
-    let pages = doc.get_pages();
+    let pages = crate::page_tree::pages(doc);
     let total_pages = pages.len() as u32;
 
     // Select pages to scan based on strategy

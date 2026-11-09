@@ -324,6 +324,17 @@ font, CMap and Form XObject streams without limit.
   the first checkpoint is after it, so a document slow to load holds its
   slot past its time and its caller until loading ends.
 
+**Hostile-input review (2026-10-26): the page tree's own count.** A
+one-page document whose page tree held an empty inner `/Pages` node with
+`/Count 1099511627776` took the server down with SIGABRT before a page
+was read: lopdf's page iterator hints the unverified `/Count` as its
+size, `Document::get_pages` collects through a `Vec` that reserves the
+hint, and the allocator refused terabytes. A count of 2^60 panicked on
+capacity overflow instead, ending the call as INTERNAL. Every page walk in
+the crate and the service's own metadata reader now take the pages one at
+a time (`vendor/pdf-inspector/src/page_tree.rs`, `src/metadata.rs`).
+`tests/hostile.rs` holds the call to one page and a bounded clock.
+
 **Real-corpus run (2026-10-04): symbol soup.** A font with no ToUnicode
 CMap and a custom encoding passes its glyph codes through; when they are
 small integers (Type 3 fonts number glyphs from 1) a page of prose

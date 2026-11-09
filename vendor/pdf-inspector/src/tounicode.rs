@@ -2064,7 +2064,7 @@ impl FontCMaps {
     ) -> Self {
         let mut by_obj_num: HashMap<u32, CMapEntry> = HashMap::new();
 
-        for (page_num, &page_id) in doc.get_pages().iter() {
+        for (page_num, &page_id) in crate::page_tree::pages(doc).iter() {
             if let Some(filter) = page_filter {
                 if !filter.contains(page_num) {
                     continue;

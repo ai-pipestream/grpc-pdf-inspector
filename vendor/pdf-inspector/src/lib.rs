@@ -36,6 +36,7 @@ pub mod detector;
 pub mod extractor;
 pub mod glyph_names;
 pub mod guard;
+pub mod page_tree;
 pub mod markdown;
 pub mod process_mode;
 pub mod structure_tree;
@@ -587,7 +588,7 @@ fn extract_pages_markdown_mem_impl(
     let mut ocr_reasons_by_page = BTreeMap::new();
     #[cfg(all(feature = "ocr", not(target_arch = "wasm32")))]
     let mut supplemental_ocr_regions = BTreeMap::new();
-    let lopdf_pages = doc.get_pages();
+    let lopdf_pages = page_tree::pages(&doc);
 
     for &page_0idx in pages_slice {
         // Out-of-range pages → empty + needs_ocr
@@ -949,7 +950,7 @@ pub fn extract_structure_elements_mem(
     let Some(tree) = structure_tree::StructTree::from_doc(&doc) else {
         return Ok(Vec::new());
     };
-    let page_ids = doc.get_pages();
+    let page_ids = page_tree::pages(&doc);
     let roles = tree.mcid_to_roles(&page_ids);
 
     let page_filter: Option<HashSet<u32>> = pages.map(|p| p.iter().copied().collect());
@@ -1074,7 +1075,7 @@ pub fn extract_text_in_regions_mem(
 ) -> Result<Vec<PageRegionResult>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let pages = doc.get_pages();
+    let pages = page_tree::pages(&doc);
 
     // Build a set of pages we need to extract (1-indexed for lopdf)
     let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
@@ -1287,7 +1288,7 @@ pub fn extract_tables_in_regions_mem(
 ) -> Result<Vec<PageRegionResult>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let pages = doc.get_pages();
+    let pages = page_tree::pages(&doc);
 
     let needed_pages: HashSet<u32> = page_regions.iter().map(|(p, _)| p + 1).collect();
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
@@ -1610,7 +1611,7 @@ pub fn detect_vector_grid_in_region_mem(
 ) -> Result<Option<VectorGridDetection>, PdfError> {
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let pages = doc.get_pages();
+    let pages = page_tree::pages(&doc);
 
     let page_1idx = page_idx + 1;
     let Some(&page_id) = pages.get(&page_1idx) else {
@@ -1812,7 +1813,7 @@ mod vector_grid_tests {
         let path = "tests/fixtures/forecast_table_chart.pdf";
         let buf = fs::read(path).unwrap();
         let doc = Document::load_mem(&buf).unwrap();
-        let pages = doc.get_pages();
+        let pages = crate::page_tree::pages(&doc);
         let &page_id = pages.get(&1).unwrap();
         let needed: HashSet<u32> = HashSet::from([1]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
@@ -1856,7 +1857,7 @@ mod vector_grid_tests {
 
         let buf = fs::read(path).unwrap();
         let doc = Document::load_mem(&buf).unwrap();
-        let pages = doc.get_pages();
+        let pages = crate::page_tree::pages(&doc);
         let &page_id = pages.get(&page_num).unwrap();
         let needed: HashSet<u32> = HashSet::from([page_num]);
         let cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed));
@@ -2591,7 +2592,7 @@ pub fn extract_tables_with_structure_cells_mem(
 
     validate_pdf_bytes(buffer)?;
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let pages = doc.get_pages();
+    let pages = page_tree::pages(&doc);
 
     let needed_pages: HashSet<u32> = inputs.iter().map(|t| t.page + 1).collect();
     let font_cmaps = FontCMaps::from_doc_pages_fast(&doc, Some(&needed_pages));
@@ -3406,7 +3407,7 @@ fn detect_tsr_quality_issue(
     // SLANet failed to separate. Cells declared `rowspan>1` are
     // expected to be multi-line and are excluded.
     let (doc, _page_count) = load_document_from_mem(buffer)?;
-    let pages = doc.get_pages();
+    let pages = page_tree::pages(&doc);
     let page_1idx = input.page + 1;
     let Some(&page_id) = pages.get(&page_1idx) else {
         return Ok(None);
@@ -3935,7 +3936,7 @@ pub(crate) fn load_document_from_mem_with_password(
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
-                        let page_count = doc.get_pages().len() as u32;
+                        let page_count = page_tree::pages(&doc).len() as u32;
                         return Ok((doc, page_count));
                     }
                     Err(e) => {
@@ -3948,7 +3949,7 @@ pub(crate) fn load_document_from_mem_with_password(
             return Err(first_err.into());
         }
     };
-    let page_count = doc.get_pages().len() as u32;
+    let page_count = page_tree::pages(&doc).len() as u32;
     Ok((doc, page_count))
 }
 
@@ -4273,7 +4274,7 @@ fn process_document(
     // Parse structure tree for tagged PDFs (reuses the loaded document)
     let (struct_roles, struct_tables) = structure_tree::StructTree::from_doc(&doc)
         .map(|tree| {
-            let page_ids = doc.get_pages();
+            let page_ids = page_tree::pages(&doc);
             let roles = tree.mcid_to_roles(&page_ids);
             let tables = tree.extract_tables(&page_ids);
             if !roles.is_empty() {
