@@ -86,7 +86,8 @@ pub struct PdfTypeResult {
     /// Empty for TextBased. All pages for Scanned/ImageBased. Specific pages for Mixed.
     pub pages_needing_ocr: Vec<u32>,
     /// Per-page explanation for `pages_needing_ocr`: 1-indexed page → reason
-    /// codes (`scanned`, `no_text`, `vector_text`, `suspected_garbled_text`).
+    /// codes (`scanned`, `no_text`, `vector_text`, `suspected_garbled_text`,
+    /// `unreadable_content`).
     /// Only contains pages that need OCR.
     pub ocr_reasons_by_page: std::collections::BTreeMap<u32, Vec<String>>,
 }
@@ -213,6 +214,18 @@ pub(crate) fn detect_from_document(
 ) -> Result<PdfTypeResult, PdfError> {
     let pages = doc.get_pages();
     let total_pages = pages.len() as u32;
+    // Nothing below can classify a document it has no page of. The chain
+    // of ratios would fall through to "no text operators, so a scan", an
+    // answer about pages nobody read.
+    if total_pages == 0 {
+        return Err(PdfError::Parse(if page_count == 0 {
+            "the document has no pages".to_string()
+        } else {
+            format!(
+                "the document declares {page_count} pages and its page tree reaches none of them"
+            )
+        }));
+    }
 
     // Select pages to scan based on strategy
     let (sample_indices, allow_early_exit) = match &config.strategy {
@@ -246,10 +259,33 @@ pub(crate) fn detect_from_document(
     let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
     let mut pages_actually_sampled = 0u32;
 
-    for page_num in &sample_indices {
-        crate::guard::checkpoint()?;
-        if let Some(&page_id) = pages.get(page_num) {
+    // The sample, and then, only if the sample did not hold one page whose
+    // content could be read, every other page: a damaged page says nothing
+    // about the document, and a verdict needs a page that says something.
+    let unsampled: Vec<u32> = if sample_indices.len() < total_pages as usize {
+        (1..=total_pages)
+            .filter(|page_num| !sample_indices.contains(page_num))
+            .collect()
+    } else {
+        Vec::new()
+    };
+    'rounds: for round in [&sample_indices, &unsampled] {
+        if pages_actually_sampled > 0 {
+            break;
+        }
+        for page_num in round {
+            crate::guard::checkpoint()?;
+            let Some(&page_id) = pages.get(page_num) else {
+                continue;
+            };
             let analysis = analyze_page_content(doc, page_id);
+            if analysis.read_nothing() {
+                // Kept for the page list below, which names it, and left
+                // out of every count: it is not a page without text, it is
+                // a page nobody could read.
+                analysis_cache.insert(*page_num, analysis);
+                continue;
+            }
             pages_actually_sampled += 1;
             log::debug!(
                 "page {}: text_ops={} images={} image_count={} template={} unique_chars={} alphanum={} path_ops={} vector_text={} image_area={} identity_h_no_tounicode={} type3_only={} font_changes={} decodable_fonts={}",
@@ -315,9 +351,17 @@ pub(crate) fn detect_from_document(
                     || analysis.unique_text_chars < 5)
                 && (analysis.has_images || analysis.has_template_image)
             {
-                break;
+                break 'rounds;
             }
         }
+    }
+
+    // Every page was looked at and none could be read. There is no class
+    // for that, and "scanned, confidence 0.9" is what this used to answer.
+    if pages_actually_sampled == 0 {
+        return Err(PdfError::Parse(format!(
+            "the content of every one of the document's {total_pages} pages is missing or damaged"
+        )));
     }
 
     let pages_sampled = pages_actually_sampled;
@@ -472,7 +516,11 @@ pub(crate) fn detect_from_document(
                 // this in sync with `page_ocr_signals`.
                 let sparse_text_over_scan = analysis.has_template_image
                     && analysis.text_operator_count < config.min_text_ops_per_page.max(10);
-                if (analysis.has_template_image && looks_like_scan)
+                // A page whose content is missing or damaged is listed
+                // whatever was read from it: the text that came out is
+                // what survived, not what the page says.
+                if analysis.damaged_content
+                    || (analysis.has_template_image && looks_like_scan)
                     || analysis.has_vector_text
                     || sparse_text_over_scan
                     || (analysis.text_operator_count < config.min_text_ops_per_page
@@ -491,7 +539,9 @@ pub(crate) fn detect_from_document(
     // - Identity-H/V without ToUnicode: raw CID values can't map to Unicode
     // - Type3-only without ToUnicode: glyph bitmaps can't map to Unicode
     for (&page_num, analysis) in &analysis_cache {
-        if (analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts)
+        if (analysis.has_identity_h_no_tounicode
+            || analysis.has_only_type3_fonts
+            || analysis.damaged_content)
             && !pages_needing_ocr.contains(&page_num)
         {
             pages_needing_ocr.push(page_num);
@@ -507,7 +557,10 @@ pub(crate) fn detect_from_document(
             crate::guard::checkpoint()?;
             if let Some(&page_id) = pages.get(&page_num) {
                 let analysis = analyze_page_content(doc, page_id);
-                if analysis.has_identity_h_no_tounicode || analysis.has_only_type3_fonts {
+                if analysis.has_identity_h_no_tounicode
+                    || analysis.has_only_type3_fonts
+                    || analysis.damaged_content
+                {
                     pages_needing_ocr.push(page_num);
                     // Cache so the reason pass reports suspected_garbled_text
                     // rather than defaulting to "scanned".
@@ -638,15 +691,41 @@ struct PageAnalysis {
     /// CID-encoded text with ToUnicode produces low unique_alphanum_chars in raw
     /// bytes but is fully decodable — this flag prevents misclassifying it as a scan.
     has_decodable_text_fonts: bool,
+    /// Whether part of the page's content could not be read: `/Contents`
+    /// names an object the file does not hold or one that is not a stream,
+    /// or a content stream's filter fails on its bytes. Every count above
+    /// is then a count of what survived.
+    damaged_content: bool,
+}
+
+impl PageAnalysis {
+    /// A damaged page that gave up nothing at all: no text operator, no
+    /// image or form invocation, no path. It is evidence of nothing, and
+    /// counting it as a page without text is how a broken file used to be
+    /// classified a scan.
+    fn read_nothing(&self) -> bool {
+        self.damaged_content
+            && self.text_operator_count == 0
+            && self.invisible_text_operator_count == 0
+            && self.image_count == 0
+            && self.path_op_count == 0
+    }
 }
 
 /// Explain *why* a page needs OCR, from its content analysis. Priority:
 /// undecodable fonts (`suspected_garbled_text`) and vector-outlined text
 /// (`vector_text`) come first because they persist even when a text layer is
 /// present; otherwise a page with no extractable text is `scanned` when an
-/// image backs it or `no_text` when nothing does.
+/// image backs it or `no_text` when nothing does. A page whose content is
+/// missing or damaged is `unreadable_content` before any of them, and is
+/// never `scanned` or `no_text`: those describe a page that was read.
 fn page_ocr_reasons(a: &PageAnalysis) -> Vec<&'static str> {
     let mut reasons = Vec::new();
+    // First, because it qualifies everything after it: the other reasons
+    // describe the content that was read, and this says not all of it was.
+    if a.damaged_content {
+        reasons.push(crate::OCR_REASON_UNREADABLE_CONTENT);
+    }
     if a.has_identity_h_no_tounicode || a.has_only_type3_fonts {
         reasons.push(crate::OCR_REASON_SUSPECTED_GARBLED_TEXT);
     }
@@ -843,9 +922,21 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
     // inline and indirect resource dicts respectively.
     let page_resources = doc.get_page_resources(page_id).ok();
 
+    // Whether any of the content this page declares could not be read.
+    // Each case below used to count as a page with nothing on it.
+    let mut damaged_content = content_streams.is_empty() && contents_lead_nowhere(doc, page_id);
+
     for content_id in content_streams {
-        if let Ok(Object::Stream(stream)) = doc.get_object(content_id) {
-            let content = crate::guard::inflate_or_raw(stream);
+        let Ok(Object::Stream(stream)) = doc.get_object(content_id) else {
+            // `/Contents` names an object the file does not hold, or one
+            // that is not a stream.
+            damaged_content = true;
+            continue;
+        };
+        {
+            let inflated = crate::guard::inflate_checked(stream);
+            damaged_content |= !inflated.intact;
+            let content = inflated.data;
 
             // Scan for text operators, collecting raw font names
             let mut page_font_names: HashSet<Vec<u8>> = HashSet::new();
@@ -960,7 +1051,28 @@ fn analyze_page_content(doc: &Document, page_id: ObjectId) -> PageAnalysis {
         has_only_type3_fonts,
         font_change_count: font_changes,
         has_decodable_text_fonts,
+        damaged_content,
     }
+}
+
+/// Whether a page that yielded no content stream declares content all the
+/// same.
+///
+/// A page without `/Contents`, or with an empty array or `null` there, is
+/// a blank page and says so. One whose `/Contents` resolves to anything
+/// else that is not a stream (a dictionary, a number, a reference chain
+/// that never ends) declares content this reader cannot find.
+fn contents_lead_nowhere(doc: &Document, page_id: ObjectId) -> bool {
+    let Ok(page) = doc.get_dictionary(page_id) else {
+        return true;
+    };
+    let Ok(contents) = page.get(b"Contents") else {
+        return false;
+    };
+    !matches!(
+        doc.dereference(contents),
+        Ok((_, Object::Array(_) | Object::Null | Object::Stream(_)))
+    )
 }
 
 /// Check if a page has Type0 fonts with Identity-H/V encoding and no ToUnicode CMap.
@@ -2147,6 +2259,39 @@ fn get_document_title(doc: &Document) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_damaged_page_is_unreadable_before_anything_else() {
+        // Nothing survived: unreadable, and not the "no text" or "scanned"
+        // a page that was read would be.
+        let nothing = PageAnalysis {
+            damaged_content: true,
+            ..Default::default()
+        };
+        assert!(nothing.read_nothing());
+        assert_eq!(
+            page_ocr_reasons(&nothing),
+            vec![crate::OCR_REASON_UNREADABLE_CONTENT]
+        );
+
+        // Part of it survived: unreadable first, then what the surviving
+        // part shows.
+        let partly = PageAnalysis {
+            damaged_content: true,
+            text_operator_count: 12,
+            unique_text_chars: 20,
+            has_only_type3_fonts: true,
+            ..Default::default()
+        };
+        assert!(!partly.read_nothing());
+        assert_eq!(
+            page_ocr_reasons(&partly),
+            vec![
+                crate::OCR_REASON_UNREADABLE_CONTENT,
+                crate::OCR_REASON_SUSPECTED_GARBLED_TEXT
+            ]
+        );
+    }
 
     #[test]
     fn page_ocr_reasons_classify() {
