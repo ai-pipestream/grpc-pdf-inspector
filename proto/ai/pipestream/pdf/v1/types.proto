@@ -1206,9 +1206,11 @@ enum ParseWarningCode {
   // one event per page.
   PARSE_WARNING_CODE_PASSWORD_FALLBACK = 1;
 
-  // `emit_metadata` was set but the document's dictionaries could not be
-  // read, so no `metadata` event was sent. The text extraction is
-  // unaffected: this reports a gap, not a failure.
+  // `emit_metadata` or `emit_document` was set but the document's
+  // dictionaries could not be read: no `metadata` event was sent, and the
+  // `document` event carries no source metadata, outline, attachments, page
+  // geometry or link targets. The text extraction is unaffected: this
+  // reports a gap, not a failure.
   PARSE_WARNING_CODE_METADATA_UNAVAILABLE = 2;
 
   // Some pages listed in `PdfOptions.pages` are past the end of the
@@ -1219,6 +1221,12 @@ enum ParseWarningCode {
   // such page event names why in `truncations` and needs OCR; the message
   // lists the pages.
   PARSE_WARNING_CODE_CONTENT_TRUNCATED = 4;
+
+  // The metadata reader panicked on this document. Everything
+  // PARSE_WARNING_CODE_METADATA_UNAVAILABLE says is missing is missing,
+  // for a different reason: a bug in the reader rather than a document it
+  // cannot open. The text extraction is unaffected.
+  PARSE_WARNING_CODE_METADATA_READER_PANICKED = 5;
 }
 
 // ParseWarning is one non-fatal observation, carried on ParseStatus.

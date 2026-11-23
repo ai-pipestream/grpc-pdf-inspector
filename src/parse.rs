@@ -371,23 +371,40 @@ fn parse(
         metrics.parser_pass();
         let metadata = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::metadata::read(bytes, password, guard.max_stream_bytes)
-        }))
-        .ok()
-        .flatten();
+        }));
+        // Whoever asked, the event or the fold, a read that failed is
+        // reported. The fold used to go out without its source metadata,
+        // outline, attachments, page geometry and link targets, and say
+        // nothing.
+        let asked_by = match (options.emit_metadata, options.emit_document) {
+            (true, true) => "no metadata event was sent and the document carries none of it",
+            (true, false) => "no metadata event was sent",
+            (false, _) => {
+                "the document carries no source metadata, outline, attachments, page \
+                 geometry or link targets"
+            }
+        };
         match metadata {
-            Some(metadata) => {
+            Ok(Ok(metadata)) => {
                 events.route(
                     pb::parse_pdf_response::Event::Metadata(metadata),
                     options.emit_metadata,
                 )?;
             }
-            None if options.emit_metadata => warnings.push(pb::ParseWarning {
+            Ok(Err(error)) => warnings.push(pb::ParseWarning {
                 code: pb::ParseWarningCode::MetadataUnavailable.into(),
-                message: "the document's own dictionaries could not be read, so no \
-                          metadata event was sent; the text extraction is unaffected"
-                    .to_owned(),
+                message: format!(
+                    "the document's own dictionaries could not be read ({error}), so {asked_by}; \
+                     the text extraction is unaffected"
+                ),
             }),
-            None => {}
+            Err(_) => warnings.push(pb::ParseWarning {
+                code: pb::ParseWarningCode::MetadataReaderPanicked.into(),
+                message: format!(
+                    "the metadata reader panicked on this document, so {asked_by}; \
+                     the text extraction is unaffected"
+                ),
+            }),
         }
     }
 
