@@ -92,7 +92,7 @@ use crate::tables;
 pub enum Outcome {
     /// A `status` trailer was delivered. The stream ends cleanly.
     Complete,
-    /// The client stopped reading. Nothing further can be said to it.
+    /// The client hung up. Nothing further can be said to it.
     Abandoned,
     /// The call must end with this gRPC status.
     Failed(Box<Status>),
@@ -100,7 +100,7 @@ pub enum Outcome {
 
 /// Internal control flow: either the client is gone or the call has failed.
 enum Abort {
-    /// The client stopped reading.
+    /// The client hung up.
     Gone,
     /// The call must end with this status.
     Failed(Box<Status>),
@@ -117,7 +117,8 @@ impl From<Status> for Abort {
 /// Backpressure lives here. The fast path is a non-blocking `try_send`; only a
 /// consumer that is genuinely behind reaches the waiting path, and that wait
 /// is bounded, because a client that has stopped reading altogether would
-/// otherwise pin a blocking-pool thread forever.
+/// otherwise pin a blocking-pool thread forever. A wait that runs out fails
+/// the call with `ABORTED`; only a reader that hung up ends it in silence.
 pub struct Sink {
     /// The channel feeding the tonic response stream.
     tx: mpsc::Sender<Result<pb::ParsePdfResponse, Status>>,
@@ -141,18 +142,31 @@ impl Sink {
             Err(mpsc::error::TrySendError::Closed(_)) => return Err(Abort::Gone),
             Err(mpsc::error::TrySendError::Full(message)) => message,
         };
-        // Inside `spawn_blocking` there is always a runtime handle; be
-        // defensive anyway, because blocking without one panics.
+        // Inside `spawn_blocking` there is always a runtime handle. Without
+        // one there is no way to wait for the reader, and saying nothing
+        // would end the stream as if it were complete, so the call fails.
         let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-            return Err(Abort::Gone);
+            return Err(Status::internal(
+                "the response channel is full and there is no runtime to wait for the reader on,                  which is a bug in grpc-pdf-inspector",
+            )
+            .into());
         };
         match runtime.block_on(self.tx.send_timeout(message, self.stall)) {
             Ok(()) => Ok(()),
-            // A client that has read nothing for the whole stall window has
-            // abandoned the call. Reporting a status to it would mean sending
-            // on the channel it is not draining, so there is nothing useful
-            // left to do but free the thread.
-            Err(_) => Err(Abort::Gone),
+            // The reader hung up. Nobody is left to tell, and silence is the
+            // right answer to nobody.
+            Err(mpsc::error::SendTimeoutError::Closed(_)) => Err(Abort::Gone),
+            // The reader is still connected and has taken nothing for the
+            // whole stall window. That is not the same thing as gone: it may
+            // be back-pressured by its own consumer, and a stream that ended
+            // here without a word would read to it as a complete document
+            // with pages missing. The thread is freed either way; the call
+            // ends with a status the reader finds when it reads again.
+            Err(mpsc::error::SendTimeoutError::Timeout(_)) => Err(Status::aborted(format!(
+                "the reader took no event for {:?}, so the parse was stopped with pages                  undelivered; the events already sent are valid but the document is incomplete",
+                self.stall
+            ))
+            .into()),
         }
     }
 }
