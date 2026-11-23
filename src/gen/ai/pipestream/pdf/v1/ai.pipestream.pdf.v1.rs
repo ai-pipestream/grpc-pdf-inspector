@@ -396,6 +396,20 @@ pub struct PdfInfo {
     /// `ocr_recommended` means the reasons are unknown.
     #[prost(enumeration="OcrRecommendationReason", repeated, tag="9")]
     pub ocr_recommendation_reasons: ::prost::alloc::vec::Vec<i32>,
+    /// How many readable pages `pdf_type` was decided from. Fewer than
+    /// `page_count` means the verdict came from a sample: detection reads up
+    /// to eight pages (first, last and evenly spaced) of a longer document.
+    /// Only a TEXT_BASED or MIXED verdict comes from a sample, and its pages
+    /// are still judged one by one for `pages_needing_ocr`. A SCANNED or
+    /// IMAGE_BASED verdict switches extraction off, so it is given only once
+    /// every page was read and none had a text layer; a page with one makes
+    /// the document MIXED. A page whose content could not be read is not
+    /// counted. Zero from a server older than this field.
+    #[prost(uint32, tag="10")]
+    pub pages_sampled: u32,
+    /// How many of the `pages_sampled` pages detection counted as text pages.
+    #[prost(uint32, tag="11")]
+    pub pages_with_text: u32,
 }
 /// PageMarkdown is one extracted page, in requested page order.
 ///

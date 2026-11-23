@@ -335,6 +335,8 @@ fn parse(
         pdf_type: pdf_type(detected.pdf_type).into(),
         confidence: detected.confidence,
         page_count: detected.page_count,
+        pages_sampled: detected.pages_sampled,
+        pages_with_text: detected.pages_with_text,
         title: detected.title.unwrap_or_default(),
         pages_needing_ocr: detected.pages_needing_ocr,
         ocr_reasons: detected

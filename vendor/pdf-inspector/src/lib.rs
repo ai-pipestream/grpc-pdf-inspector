@@ -160,6 +160,14 @@ pub struct PdfProcessResult {
     pub markdown: Option<String>,
     /// Page count.
     pub page_count: u32,
+    /// Detection's [`PdfTypeResult::pages_sampled`]: the readable pages the
+    /// verdict was taken from. Fewer than `page_count` means the verdict
+    /// came from a sample (a text or mixed one; a scanned verdict reads
+    /// every page).
+    pub pages_sampled: u32,
+    /// Detection's [`PdfTypeResult::pages_with_text`]: how many of the
+    /// sampled pages counted as text pages.
+    pub pages_with_text: u32,
     /// Processing time in milliseconds.
     pub processing_time_ms: u64,
     /// 1-indexed page numbers that need OCR.
@@ -4204,6 +4212,8 @@ fn process_document(
     // Step 1 — Detection (cheap: scans content streams for text operators)
     let detection = detector::detect_from_document(&doc, page_count, &options.detection)?;
     let pdf_type = detection.pdf_type;
+    let pages_sampled = detection.pages_sampled;
+    let pages_with_text = detection.pages_with_text;
     let pages_needing_ocr = detection.pages_needing_ocr;
     let title = detection.title;
     let confidence = detection.confidence;
@@ -4217,6 +4227,8 @@ fn process_document(
             pdf_type,
             markdown: None,
             page_count,
+            pages_sampled,
+            pages_with_text,
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
@@ -4236,6 +4248,8 @@ fn process_document(
             pdf_type,
             markdown: None,
             page_count,
+            pages_sampled,
+            pages_with_text,
             processing_time_ms: start.elapsed_ms(),
             pages_needing_ocr,
             ocr_reasons_by_page: page_ocr_reasons_vec(detection_ocr_reasons),
@@ -4580,6 +4594,8 @@ fn process_document(
         pdf_type,
         markdown,
         page_count,
+        pages_sampled,
+        pages_with_text,
         processing_time_ms: start.elapsed_ms(),
         pages_needing_ocr,
         ocr_reasons_by_page: {

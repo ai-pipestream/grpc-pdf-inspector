@@ -259,9 +259,16 @@ pub(crate) fn detect_from_document(
     let mut analysis_cache: HashMap<u32, PageAnalysis> = HashMap::new();
     let mut pages_actually_sampled = 0u32;
 
-    // The sample, and then, only if the sample did not hold one page whose
-    // content could be read, every other page: a damaged page says nothing
-    // about the document, and a verdict needs a page that says something.
+    // The sample, and then every other page when the sample cannot carry
+    // the verdict: when it did not hold one page whose content could be
+    // read (a damaged page says nothing about the document, and a verdict
+    // needs a page that says something), or when a sample found no text
+    // page. A text or mixed verdict is checked page by page below, so a
+    // sample is enough for it; a scanned verdict lists every page for OCR
+    // and switches extraction off, so it is a verdict on every page and
+    // has to have read them. A born-digital page the sample missed used to
+    // lose its text layer to it.
+    let sampling = matches!(config.strategy, ScanStrategy::Sample(_));
     let unsampled: Vec<u32> = if sample_indices.len() < total_pages as usize {
         (1..=total_pages)
             .filter(|page_num| !sample_indices.contains(page_num))
@@ -270,7 +277,8 @@ pub(crate) fn detect_from_document(
         Vec::new()
     };
     'rounds: for round in [&sample_indices, &unsampled] {
-        if pages_actually_sampled > 0 {
+        let no_text_page_yet = pages_with_text == 0 && pages_with_ocr_layer == 0;
+        if pages_actually_sampled > 0 && !(sampling && no_text_page_yet) {
             break;
         }
         for page_num in round {

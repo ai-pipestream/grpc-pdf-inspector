@@ -173,6 +173,15 @@ reasons in `docs/capture-deferrals.md`.
   spacing and every TJ offset, in both walkers, and is saved and restored
   with q and Q. A Form XObject starts in its caller's Tz, Tc and Tw, as
   the graphics state it runs in says.
+- **A scanned verdict reads every page** (`src/detector.rs`, `src/lib.rs`).
+  Detection samples eight pages, and a text or mixed verdict is checked
+  page by page afterwards, but a scanned one was given from the sample
+  alone: it listed every page for OCR and turned extraction off, so a
+  born-digital page outside the sample lost its text layer. When the
+  sample finds no text page, every other page is now read before the
+  verdict, so a text page anywhere makes the document `Mixed`.
+  `PdfProcessResult` carries detection's `pages_sampled` and
+  `pages_with_text`.
 - **Decoding is bounded** (`src/guard.rs`, and every decoding call site).
   Every stream the crate decodes goes through the guard module, which holds
   it to a per-stream ceiling and a per-run budget, loads documents with the
