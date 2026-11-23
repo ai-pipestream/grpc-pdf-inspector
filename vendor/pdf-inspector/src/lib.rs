@@ -132,6 +132,12 @@ pub const OCR_REASON_NO_TEXT: &str = "no_text";
 /// rather than real text operators, so it cannot be extracted as characters.
 pub const OCR_REASON_VECTOR_TEXT: &str = "vector_text";
 
+/// OCR reason: part or all of the page's content could not be read. The
+/// object `/Contents` names is missing from the file or is not a stream, or
+/// a content stream's filter fails on its bytes. Text reported for the page
+/// is what was read before the damage.
+pub const OCR_REASON_UNREADABLE_CONTENT: &str = "unreadable_content";
+
 // =========================================================================
 // Result type
 // =========================================================================

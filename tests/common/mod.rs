@@ -2280,6 +2280,172 @@ pub fn inflating_pdf(pages: u32, inflated_bytes: usize) -> Vec<u8> {
     bytes
 }
 
+/// A PDF that opens and has no page in it: a catalog whose page tree is an
+/// empty `/Pages` node.
+///
+/// There is nothing on it to classify. The only true statements about it are
+/// "it has no pages" and "this is not a document anybody can index".
+#[must_use]
+pub fn pageless_pdf() -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.add_object(dictionary! {
+        "Type" => "Pages",
+        "Kids" => Vec::<Object>::new(),
+        "Count" => 0,
+    });
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// What stands where a page's content should be in [`damaged_content_pdf`].
+///
+/// The first five are damage. The last two are the controls: a page that
+/// looks damaged to a careless check and is not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Contents {
+    /// The content stream says `/FlateDecode` and its bytes are not deflate
+    /// data at all: nothing can be read from it.
+    BrokenFlate,
+    /// `/Contents` names an object the file does not hold.
+    MissingObject,
+    /// `/Contents` names an object that is not a stream.
+    NotAStream,
+    /// A real compressed content stream with a run of its bytes
+    /// overwritten partway through: the page's first lines decode and the
+    /// rest does not.
+    CorruptedMidway,
+    /// Two content streams, the first whole and the second
+    /// [`Contents::BrokenFlate`].
+    SecondStreamBroken,
+    /// Not damage. A real compressed content stream with its trailing
+    /// checksum cut off, which writers do and every reader accepts: all of
+    /// the page decodes.
+    NoChecksum,
+    /// Not damage. The page has no `/Contents` at all, which is how a
+    /// blank page is written.
+    Absent,
+}
+
+/// A text document of `pages` pages in which the pages in `altered`
+/// (1-indexed) have `contents` where their content should be.
+///
+/// Every page of this document was written as born-digital text: a first
+/// line carrying `marker` and the page number, and forty numbered body
+/// lines. A damaged page still has its page dictionary, its font and its
+/// place in the tree. What it lost is the one thing that says what is drawn
+/// on it.
+#[must_use]
+pub fn damaged_content_pdf(
+    pages: u32,
+    altered: &[u32],
+    contents: Contents,
+    marker: &str,
+) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let broken_flate = || {
+        Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            // Not a zlib header, and not deflate after it either.
+            b"\xde\xad\xbe\xef this was a compressed page once ".repeat(40),
+        )
+    };
+
+    let mut kids = Vec::new();
+    for page in 1..=pages {
+        let mut text = String::from("BT /F1 12 Tf 50 750 Td\n");
+        text.push_str(&format!("({marker} page {page}) Tj\n"));
+        for line in 0..40 {
+            // The numbers keep the lines from compressing into one
+            // back-reference, so the stream is long enough to damage in
+            // the middle.
+            text.push_str(&format!(
+                "0 -14 Td (line {line} of page {page} holds {} and {}) Tj\n",
+                (line + 3) * 7919 % 1009,
+                (line + 11) * 104_729 % 997,
+            ));
+        }
+        text.push_str("ET");
+        let whole = Stream::new(dictionary! {}, text.into_bytes());
+        let compressed = || {
+            let mut stream = whole.clone();
+            stream.compress().expect("compress the content stream");
+            assert!(stream.content.len() > 200, "{}", stream.content.len());
+            stream
+        };
+
+        let contents: Option<Object> = if altered.contains(&page) {
+            match contents {
+                Contents::BrokenFlate => Some(doc.add_object(broken_flate()).into()),
+                Contents::MissingObject => Some(doc.new_object_id().into()),
+                Contents::NotAStream => Some(doc.add_object(dictionary! { "Length" => 0 }).into()),
+                Contents::CorruptedMidway => {
+                    let mut stream = compressed();
+                    let middle = stream.content.len() / 2;
+                    stream.content[middle..middle + 24].fill(0xff);
+                    Some(doc.add_object(stream).into())
+                }
+                Contents::SecondStreamBroken => {
+                    let first = doc.add_object(whole);
+                    let second = doc.add_object(broken_flate());
+                    Some(vec![Object::Reference(first), Object::Reference(second)].into())
+                }
+                Contents::NoChecksum => {
+                    let mut stream = compressed();
+                    let cut = stream.content.len() - 4;
+                    stream.set_content(stream.content[..cut].to_vec());
+                    Some(doc.add_object(stream).into())
+                }
+                Contents::Absent => None,
+            }
+        } else {
+            Some(doc.add_object(whole).into())
+        };
+        let mut page_dict = dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => dictionary! {
+                "Font" => dictionary! { "F1" => font_id },
+            },
+        };
+        if let Some(contents) = contents {
+            page_dict.set("Contents", contents);
+        }
+        kids.push(Object::Reference(doc.add_object(page_dict)));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Bytes that are not a PDF at all.
 #[must_use]
 pub fn garbage() -> Vec<u8> {
