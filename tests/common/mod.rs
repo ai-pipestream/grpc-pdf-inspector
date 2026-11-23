@@ -2305,6 +2305,17 @@ pub async fn start_with(limits: Limits) -> Harness {
 /// Start a server on an ephemeral localhost port, built by `build` around
 /// the counters the harness will report.
 pub async fn start_with_service(build: impl FnOnce(Arc<Metrics>) -> PdfGrpc) -> Harness {
+    start_with_service_and_endpoint(build, |endpoint| endpoint).await
+}
+
+/// [`start_with_service`], with the client's connection settings passed
+/// through `configure` first. A test that needs the transport to stop
+/// buffering for a reader that is not reading narrows the flow-control
+/// windows here.
+pub async fn start_with_service_and_endpoint(
+    build: impl FnOnce(Arc<Metrics>) -> PdfGrpc,
+    configure: impl FnOnce(Endpoint) -> Endpoint,
+) -> Harness {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral port");
@@ -2320,8 +2331,7 @@ pub async fn start_with_service(build: impl FnOnce(Arc<Metrics>) -> PdfGrpc) -> 
             .expect("server failed");
     });
 
-    let channel = Endpoint::from_shared(format!("http://{addr}"))
-        .expect("endpoint")
+    let channel = configure(Endpoint::from_shared(format!("http://{addr}")).expect("endpoint"))
         .connect()
         .await
         .expect("connect to server");

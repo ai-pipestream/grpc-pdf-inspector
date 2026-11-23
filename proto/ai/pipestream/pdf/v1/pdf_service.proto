@@ -69,6 +69,10 @@ service PdfParseService {
   //                       budget (a minute by default), or its upload
   //                       sent no bytes for 30 seconds; empty chunks are
   //                       not bytes
+  //   ABORTED             the caller took no event for 30 seconds while
+  //                       the parse had more to send, so the parse was
+  //                       stopped with pages undelivered. A caller that
+  //                       hangs up instead is sent nothing.
   //   INTERNAL            a bug here; the parser panicked
   //
   // Events already delivered before a failure remain valid. They describe
