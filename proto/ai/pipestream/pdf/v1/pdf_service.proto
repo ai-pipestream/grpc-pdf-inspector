@@ -58,7 +58,9 @@ service PdfParseService {
   //                       document inflates past its decompression limits
   //                       (`ServerLimits.max_stream_bytes`,
   //                       `ServerLimits.max_decompressed_bytes`)
-  //   INVALID_ARGUMENT    not a PDF, truncated or malformed, encrypted
+  //   INVALID_ARGUMENT    not a PDF, truncated or malformed, a document
+  //                       with no pages or none of whose pages' content
+  //                       can be read, encrypted
   //                       without a working password, or a page selection
   //                       that names page 0, sets both `options.pages`
   //                       and a span, runs backwards, or selects no page
