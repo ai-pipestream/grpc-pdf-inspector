@@ -1146,7 +1146,8 @@ enum ParseWarningCode {
 
   // A password was supplied, so FULL mode used whole-document extraction:
   // the markdown arrived as one `page` event with `page_no` 0 instead of
-  // one event per page.
+  // one event per page, or, when the text was withheld, as no `page` event
+  // at all (see PARSE_WARNING_CODE_TEXT_WITHHELD).
   PARSE_WARNING_CODE_PASSWORD_FALLBACK = 1;
 
   // `emit_metadata` was set but the document's dictionaries could not be
@@ -1157,6 +1158,10 @@ enum ParseWarningCode {
   // Some pages listed in `PdfOptions.pages` are past the end of the
   // document. They were left out; the pages that exist were processed.
   PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE = 3;
+
+  // The whole-document pipeline returned no text for a text-bearing
+  // document. `ParseStatus.text_withheld` says why.
+  PARSE_WARNING_CODE_TEXT_WITHHELD = 6;
 }
 
 // ParseWarning is one non-fatal observation, carried on ParseStatus.
@@ -1227,6 +1232,46 @@ message ParseStatus {
   // about is the thing this field exists to prevent. Set the option to see
   // the runs themselves on `PageMarkdown.invisible`.
   bool has_invisible_text = 7;
+
+  // Why a text-bearing document produced no text, when the whole-document
+  // pipeline ran: in ANALYZE, and in FULL when a password was supplied.
+  // TEXT_WITHHELD_UNSPECIFIED when nothing was withheld. A withheld result
+  // also carries PARSE_WARNING_CODE_TEXT_WITHHELD, and no `page` event.
+  TextWithheld text_withheld = 8;
+
+  // The 1-indexed pages the whole-document pipeline says need OCR, when it
+  // ran (ANALYZE, and FULL with a password). A superset of the pages in
+  // `extraction_ocr_reasons`: it also names pages flagged without a
+  // reason code, such as every page of a document whose text is garbage,
+  // pages drawn with glyph-id fonts, and every page of a text document
+  // whose extraction came out too sparse to trust. Empty in per-page FULL,
+  // where each `page` event carries its own `needs_ocr`.
+  repeated uint32 pages_needing_ocr = 9;
+}
+
+// TextWithheld says why the whole-document pipeline returned no text for a
+// document detection classified as having a text layer.
+enum TextWithheld {
+  // Nothing was withheld.
+  TEXT_WITHHELD_UNSPECIFIED = 0;
+
+  // Extraction failed on a MIXED document. It is not fatal, because a
+  // mixed document's text layer is partial anyway, but nothing came out.
+  // The warning's message carries the extraction's own error.
+  TEXT_WITHHELD_EXTRACTION_FAILED = 1;
+
+  // A MIXED document's text was mostly garbage, so the document was
+  // reclassified as scanned and its text dropped. `PdfInfo.pdf_type`,
+  // sent before extraction ran, still says MIXED.
+  TEXT_WITHHELD_RECLASSIFIED_SCANNED = 2;
+
+  // A TEXT_BASED document's text was mostly garbage: its fonts cannot be
+  // decoded. Every page is in `pages_needing_ocr`.
+  TEXT_WITHHELD_GARBAGE_TEXT = 3;
+
+  // Every page draws its text with glyph-id fonts that map to no
+  // characters, so the text was dropped.
+  TEXT_WITHHELD_ALL_PAGES_GID_ENCODED = 4;
 }
 
 // ServerLimits reports the ceilings a server actually enforces.

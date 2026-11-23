@@ -880,6 +880,21 @@ pub struct ParseStatus {
     /// the runs themselves on `PageMarkdown.invisible`.
     #[prost(bool, tag="7")]
     pub has_invisible_text: bool,
+    /// Why a text-bearing document produced no text, when the whole-document
+    /// pipeline ran: in ANALYZE, and in FULL when a password was supplied.
+    /// TEXT_WITHHELD_UNSPECIFIED when nothing was withheld. A withheld result
+    /// also carries PARSE_WARNING_CODE_TEXT_WITHHELD, and no `page` event.
+    #[prost(enumeration="TextWithheld", tag="8")]
+    pub text_withheld: i32,
+    /// The 1-indexed pages the whole-document pipeline says need OCR, when it
+    /// ran (ANALYZE, and FULL with a password). A superset of the pages in
+    /// `extraction_ocr_reasons`: it also names pages flagged without a
+    /// reason code, such as every page of a document whose text is garbage,
+    /// pages drawn with glyph-id fonts, and every page of a text document
+    /// whose extraction came out too sparse to trust. Empty in per-page FULL,
+    /// where each `page` event carries its own `needs_ocr`.
+    #[prost(uint32, repeated, tag="9")]
+    pub pages_needing_ocr: ::prost::alloc::vec::Vec<u32>,
 }
 /// ServerLimits reports the ceilings a server actually enforces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1486,7 +1501,8 @@ pub enum ParseWarningCode {
     Unspecified = 0,
     /// A password was supplied, so FULL mode used whole-document extraction:
     /// the markdown arrived as one `page` event with `page_no` 0 instead of
-    /// one event per page.
+    /// one event per page, or, when the text was withheld, as no `page` event
+    /// at all (see PARSE_WARNING_CODE_TEXT_WITHHELD).
     PasswordFallback = 1,
     /// `emit_metadata` was set but the document's dictionaries could not be
     /// read, so no `metadata` event was sent. The text extraction is
@@ -1495,6 +1511,9 @@ pub enum ParseWarningCode {
     /// Some pages listed in `PdfOptions.pages` are past the end of the
     /// document. They were left out; the pages that exist were processed.
     PagesOutOfRange = 3,
+    /// The whole-document pipeline returned no text for a text-bearing
+    /// document. `ParseStatus.text_withheld` says why.
+    TextWithheld = 6,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1507,6 +1526,7 @@ impl ParseWarningCode {
             Self::PasswordFallback => "PARSE_WARNING_CODE_PASSWORD_FALLBACK",
             Self::MetadataUnavailable => "PARSE_WARNING_CODE_METADATA_UNAVAILABLE",
             Self::PagesOutOfRange => "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE",
+            Self::TextWithheld => "PARSE_WARNING_CODE_TEXT_WITHHELD",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1516,6 +1536,55 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_PASSWORD_FALLBACK" => Some(Self::PasswordFallback),
             "PARSE_WARNING_CODE_METADATA_UNAVAILABLE" => Some(Self::MetadataUnavailable),
             "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE" => Some(Self::PagesOutOfRange),
+            "PARSE_WARNING_CODE_TEXT_WITHHELD" => Some(Self::TextWithheld),
+            _ => None,
+        }
+    }
+}
+/// TextWithheld says why the whole-document pipeline returned no text for a
+/// document detection classified as having a text layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TextWithheld {
+    /// Nothing was withheld.
+    Unspecified = 0,
+    /// Extraction failed on a MIXED document. It is not fatal, because a
+    /// mixed document's text layer is partial anyway, but nothing came out.
+    /// The warning's message carries the extraction's own error.
+    ExtractionFailed = 1,
+    /// A MIXED document's text was mostly garbage, so the document was
+    /// reclassified as scanned and its text dropped. `PdfInfo.pdf_type`,
+    /// sent before extraction ran, still says MIXED.
+    ReclassifiedScanned = 2,
+    /// A TEXT_BASED document's text was mostly garbage: its fonts cannot be
+    /// decoded. Every page is in `pages_needing_ocr`.
+    GarbageText = 3,
+    /// Every page draws its text with glyph-id fonts that map to no
+    /// characters, so the text was dropped.
+    AllPagesGidEncoded = 4,
+}
+impl TextWithheld {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TEXT_WITHHELD_UNSPECIFIED",
+            Self::ExtractionFailed => "TEXT_WITHHELD_EXTRACTION_FAILED",
+            Self::ReclassifiedScanned => "TEXT_WITHHELD_RECLASSIFIED_SCANNED",
+            Self::GarbageText => "TEXT_WITHHELD_GARBAGE_TEXT",
+            Self::AllPagesGidEncoded => "TEXT_WITHHELD_ALL_PAGES_GID_ENCODED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TEXT_WITHHELD_UNSPECIFIED" => Some(Self::Unspecified),
+            "TEXT_WITHHELD_EXTRACTION_FAILED" => Some(Self::ExtractionFailed),
+            "TEXT_WITHHELD_RECLASSIFIED_SCANNED" => Some(Self::ReclassifiedScanned),
+            "TEXT_WITHHELD_GARBAGE_TEXT" => Some(Self::GarbageText),
+            "TEXT_WITHHELD_ALL_PAGES_GID_ENCODED" => Some(Self::AllPagesGidEncoded),
             _ => None,
         }
     }

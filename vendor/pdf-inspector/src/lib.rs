@@ -177,6 +177,32 @@ pub struct PdfProcessResult {
     /// Detection's [`PdfTypeResult::ocr_recommendation_reasons`]: why OCR is
     /// recommended, empty when it is not.
     pub ocr_recommendation_reasons: Vec<OcrRecommendationReason>,
+    /// Why `markdown` is `None` in [`ProcessMode::Full`] although the
+    /// document has a text layer: the extraction failed, or its text was
+    /// judged unusable and withheld. `None` when nothing was withheld.
+    pub text_withheld: Option<TextWithheld>,
+}
+
+/// Why the whole-document pipeline returned no markdown for a document it
+/// classified as having text.
+///
+/// Without this a withheld result and an empty document looked the same:
+/// `markdown: None` and a successful return.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextWithheld {
+    /// Extraction failed on a mixed document. The failure was not fatal,
+    /// because a mixed document's text layer is partial anyway, but nothing
+    /// came out of it; the message is the extraction's own error.
+    ExtractionFailed(String),
+    /// A mixed document's text was mostly garbage, so it was reclassified
+    /// as scanned (`pdf_type` says so) and its text dropped.
+    ReclassifiedScanned,
+    /// A text document's text was mostly garbage: its fonts cannot be
+    /// decoded, and every page was flagged for OCR.
+    GarbageText,
+    /// Every page draws its text with glyph-id fonts that map to no
+    /// characters, so the text was dropped.
+    AllPagesGidEncoded,
 }
 
 // =========================================================================
@@ -4194,6 +4220,7 @@ fn process_document(
             has_encoding_issues: false,
             ocr_recommended,
             ocr_recommendation_reasons,
+            text_withheld: None,
         });
     }
 
@@ -4212,6 +4239,7 @@ fn process_document(
             has_encoding_issues: false,
             ocr_recommended,
             ocr_recommendation_reasons,
+            text_withheld: None,
         });
     }
 
@@ -4265,9 +4293,17 @@ fn process_document(
         }
     };
 
-    // For Mixed PDFs, extraction failure is non-fatal
+    // For Mixed PDFs, extraction failure is non-fatal, but it is not
+    // silent: the result says the text was withheld and why.
+    let mut text_withheld = None;
     let extracted = if pdf_type == PdfType::Mixed {
-        extracted.ok()
+        match extracted {
+            Ok(extracted) => Some(extracted),
+            Err(error) => {
+                text_withheld = Some(TextWithheld::ExtractionFailed(error.to_string()));
+                None
+            }
+        }
     } else {
         Some(extracted?)
     };
@@ -4451,6 +4487,7 @@ fn process_document(
     // layer comes from a bad OCR pass, and callers should use proper OCR.
     let (pdf_type, markdown, confidence) =
         if pdf_type == PdfType::Mixed && markdown.as_ref().is_some_and(|m| is_garbage_text(m)) {
+            text_withheld = Some(TextWithheld::ReclassifiedScanned);
             (PdfType::Scanned, None, 0.95)
         } else {
             (pdf_type, markdown, confidence)
@@ -4463,6 +4500,7 @@ fn process_document(
         && markdown.as_ref().is_some_and(|m| is_garbage_text(m))
     {
         log::debug!("TextBased PDF has garbage text — flagging all pages for OCR");
+        text_withheld = Some(TextWithheld::GarbageText);
         (None, true, true)
     } else {
         (markdown, has_encoding_issues, false)
@@ -4524,6 +4562,9 @@ fn process_document(
             "all {} pages have gid-encoded fonts — suppressing markdown output",
             page_count
         );
+        if markdown.is_some() {
+            text_withheld = Some(TextWithheld::AllPagesGidEncoded);
+        }
         None
     } else {
         markdown
@@ -4548,6 +4589,7 @@ fn process_document(
         has_encoding_issues,
         ocr_recommended,
         ocr_recommendation_reasons,
+        text_withheld,
     })
 }
 
