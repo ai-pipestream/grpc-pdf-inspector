@@ -531,6 +531,15 @@ pub struct PageMarkdown {
     /// rendering comes from a pipeline that does not report them.
     #[prost(uint32, repeated, tag="11")]
     pub literal_offsets: ::prost::alloc::vec::Vec<u32>,
+    /// Why the walk of this page left part of its content unread, sorted and
+    /// without repeats. Empty for a page read to the end, which is nearly
+    /// every page. When it is not empty the page's `markdown` is what was
+    /// read before the walk stopped, and may be empty for a page that is not
+    /// blank; `needs_ocr` is set with `OCR_REASON_CONTENT_TRUNCATED`, and the
+    /// trailer carries `PARSE_WARNING_CODE_CONTENT_TRUNCATED`. Always empty on
+    /// the password fallback's whole-document event (`page_no` 0).
+    #[prost(enumeration="WalkTruncation", repeated, tag="12")]
+    pub truncations: ::prost::alloc::vec::Vec<i32>,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.
@@ -1124,6 +1133,11 @@ pub enum OcrReason {
     /// The page's text is drawn as vector outlines (path operators) rather
     /// than real text operators, so there are no characters to extract.
     VectorText = 4,
+    /// The walk of the page stopped before the end of its content; the page's
+    /// `truncations` say why. The text the page event carries is what was
+    /// read before the stop, so a renderer sees more of the page than this
+    /// service did.
+    ContentTruncated = 6,
 }
 impl OcrReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1137,6 +1151,7 @@ impl OcrReason {
             Self::Scanned => "OCR_REASON_SCANNED",
             Self::SuspectedGarbled => "OCR_REASON_SUSPECTED_GARBLED",
             Self::VectorText => "OCR_REASON_VECTOR_TEXT",
+            Self::ContentTruncated => "OCR_REASON_CONTENT_TRUNCATED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1147,6 +1162,7 @@ impl OcrReason {
             "OCR_REASON_SCANNED" => Some(Self::Scanned),
             "OCR_REASON_SUSPECTED_GARBLED" => Some(Self::SuspectedGarbled),
             "OCR_REASON_VECTOR_TEXT" => Some(Self::VectorText),
+            "OCR_REASON_CONTENT_TRUNCATED" => Some(Self::ContentTruncated),
             _ => None,
         }
     }
@@ -1200,6 +1216,62 @@ impl OcrRecommendationReason {
             "OCR_RECOMMENDATION_REASON_SCAN_OCR_LAYER" => Some(Self::ScanOcrLayer),
             "OCR_RECOMMENDATION_REASON_TEXT_OVER_PAGE_IMAGE" => Some(Self::TextOverPageImage),
             "OCR_RECOMMENDATION_REASON_DENSE_LAYOUT" => Some(Self::DenseLayout),
+            _ => None,
+        }
+    }
+}
+/// WalkTruncation names a limit or a fault that stopped the walk of a page
+/// before the end of its content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WalkTruncation {
+    /// Never sent. Present because proto3 requires a zero value.
+    Unspecified = 0,
+    /// The page's own content stream, or one Form XObject's, holds more
+    /// operators than the walk decodes (1,000,000). Such a stream is not
+    /// walked at all; for the page's own stream that means no text, no
+    /// images and no forms come from the page.
+    OperatorCap = 1,
+    /// A content stream, the page's own or a form's, stopped parsing at a
+    /// token the parser does not accept (a stray `]`, `)`, `>>`, `{`), with
+    /// operators after it. What came before the stop was walked.
+    UnparsedContent = 2,
+    /// The page's Form XObjects together asked for more than the walk spends
+    /// on one page (10,000 invocations, 1,000,000 operators); the forms past
+    /// that point were not walked.
+    FormBudget = 3,
+    /// Forms nested deeper than the walk follows (five levels below the
+    /// page), or a form that invokes itself; the deeper forms were not walked.
+    FormDepth = 4,
+    /// An XObject the page invokes, form or image, is missing or is not a
+    /// stream, or a form's content is refused outright by the parser; it was
+    /// not walked.
+    XobjectUnreadable = 5,
+}
+impl WalkTruncation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WALK_TRUNCATION_UNSPECIFIED",
+            Self::OperatorCap => "WALK_TRUNCATION_OPERATOR_CAP",
+            Self::UnparsedContent => "WALK_TRUNCATION_UNPARSED_CONTENT",
+            Self::FormBudget => "WALK_TRUNCATION_FORM_BUDGET",
+            Self::FormDepth => "WALK_TRUNCATION_FORM_DEPTH",
+            Self::XobjectUnreadable => "WALK_TRUNCATION_XOBJECT_UNREADABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WALK_TRUNCATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "WALK_TRUNCATION_OPERATOR_CAP" => Some(Self::OperatorCap),
+            "WALK_TRUNCATION_UNPARSED_CONTENT" => Some(Self::UnparsedContent),
+            "WALK_TRUNCATION_FORM_BUDGET" => Some(Self::FormBudget),
+            "WALK_TRUNCATION_FORM_DEPTH" => Some(Self::FormDepth),
+            "WALK_TRUNCATION_XOBJECT_UNREADABLE" => Some(Self::XobjectUnreadable),
             _ => None,
         }
     }
@@ -1495,6 +1567,10 @@ pub enum ParseWarningCode {
     /// Some pages listed in `PdfOptions.pages` are past the end of the
     /// document. They were left out; the pages that exist were processed.
     PagesOutOfRange = 3,
+    /// The walk of some pages stopped before the end of their content. Each
+    /// such page event names why in `truncations` and needs OCR; the message
+    /// lists the pages.
+    ContentTruncated = 4,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1507,6 +1583,7 @@ impl ParseWarningCode {
             Self::PasswordFallback => "PARSE_WARNING_CODE_PASSWORD_FALLBACK",
             Self::MetadataUnavailable => "PARSE_WARNING_CODE_METADATA_UNAVAILABLE",
             Self::PagesOutOfRange => "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE",
+            Self::ContentTruncated => "PARSE_WARNING_CODE_CONTENT_TRUNCATED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1516,6 +1593,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_PASSWORD_FALLBACK" => Some(Self::PasswordFallback),
             "PARSE_WARNING_CODE_METADATA_UNAVAILABLE" => Some(Self::MetadataUnavailable),
             "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE" => Some(Self::PagesOutOfRange),
+            "PARSE_WARNING_CODE_CONTENT_TRUNCATED" => Some(Self::ContentTruncated),
             _ => None,
         }
     }
