@@ -145,6 +145,13 @@ pub struct OcrLayerExtraction {
     /// content, so a caller can place the runs on the page a reader sees
     /// without opening the file again.
     pub page_boxes: std::collections::BTreeMap<u32, PageBox>,
+    /// 1-indexed pages that use a font whose `/Differences` name glyphs by
+    /// raw glyph id (`/gidNNNNN`) with no ToUnicode CMap mapping those
+    /// codes. Their runs are decoded through the base encoding, which says
+    /// nothing about which characters the glyphs are, so the text cannot
+    /// be trusted however it reads. The library's own pipeline sends these
+    /// pages to OCR.
+    pub gid_encoded_pages: std::collections::BTreeSet<u32>,
     /// 1-indexed pages the walk did not read to the end, each with every
     /// reason it stopped, sorted and without repeats. The runs of such a
     /// page are what was read before it stopped, and may be none at all.

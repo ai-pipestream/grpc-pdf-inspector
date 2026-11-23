@@ -222,6 +222,9 @@ pub(crate) struct ExtractedText {
     /// Where each Form XObject the walk entered was placed, this form
     /// first and any it invoked after it.
     pub(crate) forms: Vec<PdfForm>,
+    /// Whether this form, or one it invoked, showed text in a font that
+    /// names its glyphs by raw glyph id with no ToUnicode CMap for them.
+    pub(crate) shows_gid_glyphs: bool,
 }
 
 impl ExtractedText {
@@ -231,6 +234,7 @@ impl ExtractedText {
             rtl_visual_candidates: Vec::new(),
             rtl_logical_ops: 0,
             forms: Vec::new(),
+            shows_gid_glyphs: false,
         }
     }
 
@@ -244,7 +248,9 @@ impl ExtractedText {
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_ops: &mut u32,
         forms: &mut Vec<PdfForm>,
+        shows_gid_glyphs: &mut bool,
     ) {
+        *shows_gid_glyphs |= self.shows_gid_glyphs;
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         *rtl_logical_ops += self.rtl_logical_ops;
@@ -385,10 +391,11 @@ fn extract_form_xobject_text_inner(
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
     let forms = &mut extracted.forms;
+    let shows_gid_glyphs = &mut extracted.shows_gid_glyphs;
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
-    let (font_encodings, _has_gid_fonts) = build_font_encodings(doc, &form_fonts, font_cmaps);
+    let (font_encodings, gid_fonts) = build_font_encodings(doc, &form_fonts, font_cmaps);
 
     // Build font width info for the form
     let font_widths = build_font_widths(doc, &form_fonts);
@@ -509,7 +516,18 @@ fn extract_form_xobject_text_inner(
     }
     let mut ctm_stack: Vec<GraphicsState> = Vec::new();
 
+    // The item count when a show operator in a gid-named font began; a
+    // run added since is text set in glyph ids.
+    let mut gid_mark: Option<usize> = None;
     for op in &content.operations {
+        if let Some(mark) = gid_mark.take() {
+            *shows_gid_glyphs |= items.len() > mark;
+        }
+        if matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"")
+            && gid_fonts.contains(&current_font)
+        {
+            gid_mark = Some(items.len());
+        }
         if !budget.charge_operation() {
             break;
         }
@@ -581,6 +599,7 @@ fn extract_form_xobject_text_inner(
                                         rtl_visual_candidates,
                                         rtl_logical_ops,
                                         forms,
+                                        shows_gid_glyphs,
                                     );
                                 }
                             }
@@ -1110,6 +1129,9 @@ fn extract_form_xobject_text_inner(
         }
     }
 
+    if let Some(mark) = gid_mark {
+        *shows_gid_glyphs |= items.len() > mark;
+    }
     extracted
 }
 

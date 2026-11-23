@@ -524,6 +524,7 @@ fn parse(
                 rotated_pages,
                 downward_pages,
                 page_boxes,
+                gid_encoded_pages,
                 truncated_pages,
             } = guarded(guard, || {
                 pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
@@ -569,6 +570,16 @@ fn parse(
             for page in &ocr_layer_pages {
                 add_verdict(&mut verdicts, *page, pb::OcrReason::Scanned);
             }
+            // A page set in a font that names its glyphs by glyph id and
+            // has no ToUnicode CMap for them: the walk decoded the codes
+            // through the base encoding, which says nothing about what the
+            // glyphs are. However well the text reads, no reader saw it.
+            // The walk said so and this used to drop it.
+            for page in &gid_encoded_pages {
+                add_verdict(&mut verdicts, *page, pb::OcrReason::SuspectedGarbled);
+            }
+            has_encoding_issues |= !gid_encoded_pages.is_empty();
+
             // A page the walk stopped reading partway is not the page: what
             // a renderer draws of it is more than these runs hold. It used
             // to go out as an ordinary page, empty when the stop came
@@ -797,8 +808,9 @@ fn parse(
                 // The rendering is the last thing the encoding backstop can
                 // look at, and it catches a page whose runs were each
                 // individually unremarkable.
-                let encoding_issues = !ocr_layer_pages.contains(&page_no)
-                    && pdf_inspector::detect_encoding_issues(&markdown);
+                let encoding_issues = gid_encoded_pages.contains(&page_no)
+                    || (!ocr_layer_pages.contains(&page_no)
+                        && pdf_inspector::detect_encoding_issues(&markdown));
                 has_encoding_issues |= encoding_issues;
                 let page_invisible: Vec<pb::TextSpan> = invisible
                     .remove(&page_no)

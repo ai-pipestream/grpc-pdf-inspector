@@ -2556,6 +2556,116 @@ pub fn truncated_walk_pdf(overrun: Overrun, marker: &str) -> Vec<u8> {
     bytes
 }
 
+/// A page of plain English set in a subset font whose `/Differences` name
+/// every glyph by its raw glyph id (`/gid00036`), the way a subsetter
+/// writes them, with a ToUnicode CMap covering the codes only when
+/// `with_tounicode` is set.
+///
+/// The codes are ASCII, so the text decodes through the base encoding to
+/// readable words and no letter statistics can tell anything is wrong.
+/// What says it is unreadable is the font: a glyph id names a shape in a
+/// font program, not a character, and only a ToUnicode CMap says which
+/// character that shape is. With `in_form` the first page's text is drawn
+/// by a Form XObject the page invokes rather than by the page itself.
+///
+/// Page two is set in plain Helvetica. Both pages share one font resource
+/// dictionary, so page two lists the subset font without using it.
+#[must_use]
+pub fn gid_named_glyphs_pdf(with_tounicode: bool, in_form: bool) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let mut differences: Vec<Object> = vec![32.into()];
+    for code in 32u8..=126 {
+        differences.push(Object::Name(
+            format!("gid{:05}", u32::from(code) - 29).into_bytes(),
+        ));
+    }
+    let mut subset = dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "ABCDEF+Garamond",
+        "FirstChar" => 32,
+        "LastChar" => 126,
+        "Widths" => vec![Object::Integer(500); 95],
+        "Encoding" => dictionary! {
+            "Type" => "Encoding",
+            "Differences" => differences,
+        },
+    };
+    if with_tounicode {
+        let cmap = "/CIDInit /ProcSet findresource begin\n12 dict begin\nbegincmap\n\
+                    /CMapName /Adobe-Identity-UCS def\n/CMapType 2 def\n\
+                    1 begincodespacerange\n<00> <FF>\nendcodespacerange\n\
+                    1 beginbfrange\n<20> <7E> <0020>\nendbfrange\n\
+                    endcmap\nCMapName currentdict /CMap defineresource pop\nend\nend\n";
+        let cmap_id = doc.add_object(Stream::new(dictionary! {}, cmap.as_bytes().to_vec()));
+        subset.set("ToUnicode", cmap_id);
+    }
+    let subset_id = doc.add_object(subset);
+    let plain_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+
+    let prose = [
+        "The committee met on Tuesday to review the quarterly results",
+        "and agreed that the new warehouse would open in the spring.",
+        "Several members asked for a clearer account of the costs,",
+        "which the treasurer promised to circulate before the next meeting.",
+    ];
+    let mut kids = Vec::new();
+    for (page, font) in [(1, "F1"), (2, "F2")] {
+        let mut content = format!("BT /{font} 12 Tf 72 720 Td\n");
+        for line in prose {
+            content.push_str(&format!("({line}) Tj 0 -16 Td\n"));
+        }
+        content.push_str("ET");
+        let fonts = dictionary! { "F1" => subset_id, "F2" => plain_id };
+        let mut resources = dictionary! { "Font" => fonts.clone() };
+        if page == 1 && in_form {
+            let form_id = doc.add_object(Stream::new(
+                dictionary! {
+                    "Type" => "XObject",
+                    "Subtype" => "Form",
+                    "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                    "Resources" => dictionary! { "Font" => fonts },
+                },
+                content.into_bytes(),
+            ));
+            resources.set("XObject", dictionary! { "Fx" => form_id });
+            content = "/Fx Do".to_owned();
+        }
+        let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources,
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => 2,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// A PDF that opens and has no page in it: a catalog whose page tree is an
 /// empty `/Pages` node.
 ///
