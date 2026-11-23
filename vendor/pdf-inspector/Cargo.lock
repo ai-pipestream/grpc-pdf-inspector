@@ -1894,6 +1894,7 @@ dependencies = [
  "dirs",
  "env_logger",
  "firecrawl-pdfium",
+ "flate2",
  "fs2",
  "image",
  "include_dir",
