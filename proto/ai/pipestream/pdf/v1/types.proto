@@ -439,7 +439,10 @@ enum OcrReason {
   OCR_REASON_SCANNED = 2;
 
   // The page has a text layer, but it decodes to mojibake (broken font
-  // encodings), so extraction cannot be trusted.
+  // encodings), so extraction cannot be trusted. Also sent for a page set
+  // in a font that names its glyphs by raw glyph id (`/gid00036`) with no
+  // ToUnicode CMap for those codes: its text may read cleanly, but nothing
+  // in the file says which characters the glyphs are.
   OCR_REASON_SUSPECTED_GARBLED = 3;
 
   // The page's text is drawn as vector outlines (path operators) rather
@@ -454,6 +457,12 @@ enum OcrReason {
   // than this did. When it is the reason for every page, no `info` is
   // sent at all: the call fails with `INVALID_ARGUMENT`.
   OCR_REASON_UNREADABLE_CONTENT = 5;
+
+  // The walk of the page stopped before the end of its content; the page's
+  // `truncations` say why. The text the page event carries is what was
+  // read before the stop, so a renderer sees more of the page than this
+  // service did.
+  OCR_REASON_CONTENT_TRUNCATED = 6;
 }
 
 // OcrRecommendationReason names why detection recommends OCR for a
@@ -667,7 +676,8 @@ message PageMarkdown {
   // body content, with the boxes the page drew it at.
   //
   // Empty unless `PdfOptions.report_furniture` was set, and empty then too
-  // for a page whose every run reached the markdown. The markdown renderer
+  // for a page whose every run reached the markdown. They are counted in
+  // `runs_not_in_markdown` either way. The markdown renderer
   // reads a page's columns one after another and does not always emit
   // every run it read; what it leaves behind is text a reader saw, and it
   // belongs in the body rather than in `furniture`. A consumer folding
@@ -685,7 +695,9 @@ message PageMarkdown {
   // been rendered. The pass over the runs that sets the rest of that flag
   // also convicts its pages, and those already carry `needs_ocr`. An OCR
   // layer's misreadings never set it, for the same reason they never set
-  // the document's flag.
+  // the document's flag. It is also set, with `needs_ocr`, on a page set in
+  // a font that names its glyphs by raw glyph id with no ToUnicode CMap
+  // for them, whose rendering may read cleanly all the same.
   //
   // With this and `needs_ocr`, a consumer can judge each page's text layer
   // as the page arrives instead of waiting for the trailer.
@@ -710,6 +722,57 @@ message PageMarkdown {
   // on the password fallback's whole-document event (`page_no` 0), whose
   // rendering comes from a pipeline that does not report them.
   repeated uint32 literal_offsets = 11;
+
+  // Why the walk of this page left part of its content unread, sorted and
+  // without repeats. Empty for a page read to the end, which is nearly
+  // every page. When it is not empty the page's `markdown` is what was
+  // read before the walk stopped, and may be empty for a page that is not
+  // blank; `needs_ocr` is set with `OCR_REASON_CONTENT_TRUNCATED`, and the
+  // trailer carries `PARSE_WARNING_CODE_CONTENT_TRUNCATED`. Always empty on
+  // the password fallback's whole-document event (`page_no` 0).
+  repeated WalkTruncation truncations = 12;
+
+  // How many text runs this page drew that `markdown` does not carry, on
+  // every per-page FULL call whatever was asked: chrome the renderer or the
+  // chrome report took out (running heads, footers, page numbers, margin
+  // numbering) and runs the renderer left out. With
+  // `PdfOptions.report_furniture` set they are told apart and returned, on
+  // `furniture` and `dropped`; without it this count is the only sign of
+  // them. A run of one or two letters or digits is counted only when it is
+  // chrome: whether the renderer kept one cannot be told from its letters.
+  uint32 runs_not_in_markdown = 13;
+}
+
+// WalkTruncation names a limit or a fault that stopped the walk of a page
+// before the end of its content.
+enum WalkTruncation {
+  // Never sent. Present because proto3 requires a zero value.
+  WALK_TRUNCATION_UNSPECIFIED = 0;
+
+  // The page's own content stream, or one Form XObject's, holds more
+  // operators than the walk decodes (1,000,000). Such a stream is not
+  // walked at all; for the page's own stream that means no text, no
+  // images and no forms come from the page.
+  WALK_TRUNCATION_OPERATOR_CAP = 1;
+
+  // A content stream, the page's own or a form's, stopped parsing at a
+  // token the parser does not accept (a stray `]`, `)`, `>>`, `{`), with
+  // operators after it. What came before the stop was walked.
+  WALK_TRUNCATION_UNPARSED_CONTENT = 2;
+
+  // The page's Form XObjects together asked for more than the walk spends
+  // on one page (10,000 invocations, 1,000,000 operators); the forms past
+  // that point were not walked.
+  WALK_TRUNCATION_FORM_BUDGET = 3;
+
+  // Forms nested deeper than the walk follows (five levels below the
+  // page), or a form that invokes itself; the deeper forms were not walked.
+  WALK_TRUNCATION_FORM_DEPTH = 4;
+
+  // An XObject the page invokes, form or image, is missing or is not a
+  // stream, or a form's content is refused outright by the parser; it was
+  // not walked.
+  WALK_TRUNCATION_XOBJECT_UNREADABLE = 5;
 }
 
 // StructureRole is one standard structure type from a tagged PDF.
@@ -1170,17 +1233,41 @@ enum ParseWarningCode {
 
   // A password was supplied, so FULL mode used whole-document extraction:
   // the markdown arrived as one `page` event with `page_no` 0 instead of
-  // one event per page.
+  // one event per page, or, when the text was withheld, as no `page` event
+  // at all (see PARSE_WARNING_CODE_TEXT_WITHHELD).
   PARSE_WARNING_CODE_PASSWORD_FALLBACK = 1;
 
-  // `emit_metadata` was set but the document's dictionaries could not be
-  // read, so no `metadata` event was sent. The text extraction is
-  // unaffected: this reports a gap, not a failure.
+  // `emit_metadata` or `emit_document` was set but the document's
+  // dictionaries could not be read: no `metadata` event was sent, and the
+  // `document` event carries no source metadata, outline, attachments, page
+  // geometry or link targets. The text extraction is unaffected: this
+  // reports a gap, not a failure.
   PARSE_WARNING_CODE_METADATA_UNAVAILABLE = 2;
 
   // Some pages listed in `PdfOptions.pages` are past the end of the
   // document. They were left out; the pages that exist were processed.
   PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE = 3;
+
+  // The walk of some pages stopped before the end of their content. Each
+  // such page event names why in `truncations` and needs OCR; the message
+  // lists the pages.
+  PARSE_WARNING_CODE_CONTENT_TRUNCATED = 4;
+
+  // The metadata reader panicked on this document. Everything
+  // PARSE_WARNING_CODE_METADATA_UNAVAILABLE says is missing is missing,
+  // for a different reason: a bug in the reader rather than a document it
+  // cannot open. The text extraction is unaffected.
+  PARSE_WARNING_CODE_METADATA_READER_PANICKED = 5;
+
+  // The whole-document pipeline returned no text for a text-bearing
+  // document. `ParseStatus.text_withheld` says why.
+  PARSE_WARNING_CODE_TEXT_WITHHELD = 6;
+
+  // A table the markdown printed matched a grid the table detectors found,
+  // but the grid lacks some of its rows. The Document carries the grid as
+  // one TableItem and the rows only the markdown had as a second TableItem
+  // right after it, with no cell boxes. The message names the pages.
+  PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID = 7;
 }
 
 // ParseWarning is one non-fatal observation, carried on ParseStatus.
@@ -1251,6 +1338,51 @@ message ParseStatus {
   // about is the thing this field exists to prevent. Set the option to see
   // the runs themselves on `PageMarkdown.invisible`.
   bool has_invisible_text = 7;
+
+  // Why a text-bearing document produced no text, when the whole-document
+  // pipeline ran: in ANALYZE, and in FULL when a password was supplied.
+  // TEXT_WITHHELD_UNSPECIFIED when nothing was withheld. A withheld result
+  // also carries PARSE_WARNING_CODE_TEXT_WITHHELD, and no `page` event.
+  TextWithheld text_withheld = 8;
+
+  // The 1-indexed pages the whole-document pipeline says need OCR, when it
+  // ran (ANALYZE, and FULL with a password). A superset of the pages in
+  // `extraction_ocr_reasons`: it also names pages flagged without a
+  // reason code, such as every page of a document whose text is garbage,
+  // pages drawn with glyph-id fonts, and every page of a text document
+  // whose extraction came out too sparse to trust. Empty in per-page FULL,
+  // where each `page` event carries its own `needs_ocr`.
+  repeated uint32 pages_needing_ocr = 9;
+
+  // The sum of `PageMarkdown.runs_not_in_markdown` over the pages sent: how
+  // many runs the selected pages drew that their markdown does not carry.
+  // Zero outside per-page FULL.
+  uint32 runs_not_in_markdown = 10;
+}
+
+// TextWithheld says why the whole-document pipeline returned no text for a
+// document detection classified as having a text layer.
+enum TextWithheld {
+  // Nothing was withheld.
+  TEXT_WITHHELD_UNSPECIFIED = 0;
+
+  // Extraction failed on a MIXED document. It is not fatal, because a
+  // mixed document's text layer is partial anyway, but nothing came out.
+  // The warning's message carries the extraction's own error.
+  TEXT_WITHHELD_EXTRACTION_FAILED = 1;
+
+  // A MIXED document's text was mostly garbage, so the document was
+  // reclassified as scanned and its text dropped. `PdfInfo.pdf_type`,
+  // sent before extraction ran, still says MIXED.
+  TEXT_WITHHELD_RECLASSIFIED_SCANNED = 2;
+
+  // A TEXT_BASED document's text was mostly garbage: its fonts cannot be
+  // decoded. Every page is in `pages_needing_ocr`.
+  TEXT_WITHHELD_GARBAGE_TEXT = 3;
+
+  // Every page draws its text with glyph-id fonts that map to no
+  // characters, so the text was dropped.
+  TEXT_WITHHELD_ALL_PAGES_GID_ENCODED = 4;
 }
 
 // ServerLimits reports the ceilings a server actually enforces.

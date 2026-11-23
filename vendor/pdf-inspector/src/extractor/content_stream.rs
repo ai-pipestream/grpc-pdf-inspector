@@ -210,7 +210,14 @@ pub(crate) fn extract_page_text_items_with_forms(
     let fonts = doc.get_page_fonts(page_id).unwrap_or_default();
 
     // Build font encoding maps from Differences arrays
-    let (font_encodings, has_gid_fonts) = build_font_encodings(doc, &fonts, font_cmaps);
+    let (font_encodings, gid_fonts) = build_font_encodings(doc, &fonts, font_cmaps);
+    // Whether the page showed text in one of `gid_fonts`, its own or a
+    // form's: listing such a font in the resources decodes nothing, and a
+    // shared resource dictionary lists it on every page.
+    let mut has_gid_fonts = false;
+    // The item count when a show operator in a gid-named font began; a run
+    // added since is text set in glyph ids.
+    let mut gid_mark: Option<usize> = None;
 
     // Build font width info for accurate text positioning
     let font_widths = build_font_widths(doc, &fonts);
@@ -291,13 +298,21 @@ pub(crate) fn extract_page_text_items_with_forms(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
     )? {
-        Some(content) => content,
+        Some(decoded) => {
+            if decoded.stopped_early {
+                form_budget.record(crate::types::WalkTruncation::UnparsedContent);
+            }
+            decoded.content
+        }
         None => {
             log::warn!(
                 "page {}: skipping extraction — content stream exceeds {} operations",
                 page_num,
                 super::content_decode::MAX_PAGE_OPERATIONS
             );
+            // Said to the caller, not only to a logger: the page is not
+            // blank, it is unread.
+            form_budget.record(crate::types::WalkTruncation::OperatorCap);
             return Ok((
                 (Vec::new(), Vec::new(), Vec::new()),
                 Vec::new(),
@@ -366,6 +381,14 @@ pub(crate) fn extract_page_text_items_with_forms(
     }
 
     for op in &content.operations {
+        if let Some(mark) = gid_mark.take() {
+            has_gid_fonts |= items.len() > mark;
+        }
+        if matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"")
+            && gid_fonts.contains(&current_font)
+        {
+            gid_mark = Some(items.len());
+        }
         trace!("{} {:?}", op.operator, op.operands);
         match op.operator.as_str() {
             "q" => {
@@ -1075,6 +1098,11 @@ pub(crate) fn extract_page_text_items_with_forms(
 
                         if let Some(xobj_type) = xobjects.get(&xobj_name) {
                             match xobj_type {
+                                XObjectType::Unreadable => {
+                                    form_budget.record(
+                                        crate::types::WalkTruncation::XObjectUnreadable,
+                                    );
+                                }
                                 XObjectType::Image => {
                                     // Emit a positional placeholder for the image
                                     // so downstream consumers (layout-aware
@@ -1126,6 +1154,7 @@ pub(crate) fn extract_page_text_items_with_forms(
                                         &mut rtl_visual_candidates,
                                         &mut rtl_logical_ops,
                                         &mut forms,
+                                        &mut has_gid_fonts,
                                     );
                                 }
                             }
@@ -1499,6 +1528,10 @@ pub(crate) fn extract_page_text_items_with_forms(
         log::warn!(
             "page {page_num}: Form XObject expansion truncated (invocation or operation budget reached); nested form text may be incomplete"
         );
+    }
+
+    if let Some(mark) = gid_mark {
+        has_gid_fonts |= items.len() > mark;
     }
 
     // Underline detection reads only painted ink: `re` rects confirmed by

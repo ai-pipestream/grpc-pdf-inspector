@@ -145,6 +145,43 @@ pub struct OcrLayerExtraction {
     /// content, so a caller can place the runs on the page a reader sees
     /// without opening the file again.
     pub page_boxes: std::collections::BTreeMap<u32, PageBox>,
+    /// 1-indexed pages that use a font whose `/Differences` name glyphs by
+    /// raw glyph id (`/gidNNNNN`) with no ToUnicode CMap mapping those
+    /// codes. Their runs are decoded through the base encoding, which says
+    /// nothing about which characters the glyphs are, so the text cannot
+    /// be trusted however it reads. The library's own pipeline sends these
+    /// pages to OCR.
+    pub gid_encoded_pages: std::collections::BTreeSet<u32>,
+    /// 1-indexed pages the walk did not read to the end, each with every
+    /// reason it stopped, sorted and without repeats. The runs of such a
+    /// page are what was read before it stopped, and may be none at all.
+    pub truncated_pages: std::collections::BTreeMap<u32, Vec<WalkTruncation>>,
+}
+
+/// Why the walk of a page left part of its content unread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WalkTruncation {
+    /// The page's own content stream, or one Form XObject's, holds more
+    /// operators than the walk decodes (1,000,000). Such a stream is not
+    /// walked at all: a page stopped here has no runs, images or forms.
+    OperatorCap,
+    /// A content stream, the page's own or a form's, stopped parsing at a
+    /// token the parser does not accept (a stray `]`, `)`, `>>`, `{`), and
+    /// operators came after it. What came before was walked; nothing
+    /// after the stop was.
+    UnparsedContent,
+    /// The page's Form XObjects together asked for more than the walk
+    /// spends on one page (10,000 invocations, 1,000,000 operators); the
+    /// forms past that point were not walked.
+    FormBudget,
+    /// Forms nested deeper than the walk follows (five levels below the
+    /// page), or a form that invokes itself; the deeper forms were not
+    /// walked.
+    FormDepth,
+    /// An XObject the page invokes, form or image, is missing or is not a
+    /// stream, or a form's content is refused outright by the parser; it
+    /// was not walked.
+    XObjectUnreadable,
 }
 
 /// A page's media box, crop box and rotation, as `[x0, y0, x1, y1]` in

@@ -129,6 +129,13 @@ Some patches go further than visibility, because the service could not be
 made safe or correct from outside the crate. Each is written up with its
 reasons in `docs/capture-deferrals.md`.
 
+- **The whole-document pipeline says why it returned no text**
+  (`src/lib.rs`). `process_document` returned `markdown: None` and `Ok` when
+  extraction failed on a mixed document (`.ok()` dropped the error), when a
+  mixed document's garbage text reclassified it as scanned, when a text
+  document's text was garbage, and when every page used glyph-id fonts. The
+  result now carries `text_withheld: Option<TextWithheld>` naming which, with
+  the extraction error kept in `ExtractionFailed`.
 - **Symbol soup is garbled text** (`src/text_quality.rs`). A page whose
   characters are mostly rare ASCII symbols (glyph codes passed through by a
   font with no ToUnicode CMap) is SUSPECTED_GARBLED, which the letter
@@ -204,6 +211,32 @@ reasons in `docs/capture-deferrals.md`.
   that ends with more than a checksum's worth of bytes after it. A missing
   end marker or a wrong checksum alone is not reported: real writers
   produce both and every reader accepts them.
+
+- **A walk that stops short says so** (`src/types.rs`,
+  `src/extractor/xobjects.rs`, `src/extractor/content_stream.rs`,
+  `src/extractor/content_decode.rs`, `src/extractor/mod.rs`). A page
+  whose content stream passes the operator cap, a page whose forms pass
+  the per-page budget or the depth cap, a `Do` of an XObject entry that
+  names no readable stream, and a content stream lopdf stops parsing at a
+  stray token with operators after it were each walked partway or not at
+  all, with at most a `log::warn!`. The walk now records each as a
+  `WalkTruncation` in the page's `FormWalkBudget`, and
+  `OcrLayerExtraction.truncated_pages` carries them per page.
+  `decode_content_bounded` parses strictly first and, only when that
+  fails, leniently, counting operators to tell lost operators from
+  trailing junk.
+
+- **The gid-glyph verdict follows the fonts a page uses, and reaches the
+  OCR-layer entry point** (`src/extractor/fonts.rs`,
+  `src/extractor/content_stream.rs`, `src/extractor/xobjects.rs`,
+  `src/extractor/mod.rs`, `src/types.rs`). A page was "gid-encoded" when
+  any font in its resources named glyphs `/gidNNNNN` without a ToUnicode
+  CMap for them, so a resource dictionary shared across pages convicted
+  every page, and text such a font drew inside a Form XObject convicted
+  none. `build_font_encodings` now names the fonts, and the walk sets the
+  flag when a show operator in one of them adds a run, on the page or in
+  any form it invokes. `extract_text_with_positions_rects_and_forms_mem_with_ocr_layer`
+  dropped the verdict; `OcrLayerExtraction.gid_encoded_pages` carries it.
 
 ## How the patches are kept auditable
 
