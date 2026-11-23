@@ -259,6 +259,112 @@ pub(crate) fn inflate_or_raw(stream: &Stream) -> Vec<u8> {
     }
 }
 
+/// A stream's decoded content, and whether all of it decoded.
+pub(crate) struct Inflated {
+    /// What decoded. Empty for a stream whose filter failed outright: its
+    /// raw bytes are encoded data, not content.
+    pub(crate) data: Vec<u8>,
+    /// False when the filter failed on the stream's bytes, so `data` is
+    /// what came out before the damage, or nothing.
+    pub(crate) intact: bool,
+}
+
+/// [`inflate`], saying whether the stream decoded whole.
+///
+/// lopdf answers a corrupt Flate stream with whatever it inflated before
+/// the corruption, as if that were the content, and [`inflate_or_raw`]
+/// answers any other failed filter with the raw bytes. A caller that has to
+/// tell "nothing is drawn here" from "what is drawn here could not be read"
+/// can do it with neither. A refused stream is `intact` and empty: the
+/// interrupt it raised ends the run at the next checkpoint.
+pub(crate) fn inflate_checked(stream: &Stream) -> Inflated {
+    match inflate(stream) {
+        Ok(data) => Inflated {
+            intact: !flate_is_corrupt(stream),
+            data,
+        },
+        Err(error) => Inflated {
+            intact: is_limit_error(&error),
+            data: Vec::new(),
+        },
+    }
+}
+
+/// Whether a stream filtered with `FlateDecode` alone holds data that is
+/// not what its writer compressed.
+///
+/// A stream that inflates to its end with its checksum right is whole,
+/// unless more than a few bytes follow that end. For one that does not,
+/// the raw deflate data (what follows the two-byte
+/// zlib header, as lopdf's own fallback reads it) says which of three
+/// things happened. The decoder met bytes that are not deflate: corrupt.
+/// The data ended and more than a checksum's worth of bytes came after it:
+/// corrupt, because damaged bits read as an early end. Or the input simply
+/// ran out, or ended where it should with only the checksum wrong: not
+/// reported. Writers leave the end marker off and get the checksum wrong
+/// often enough that every reader accepts both, and from here neither can
+/// be told from damage. So damage that still decodes as well-formed
+/// deflate ending in place goes unreported; only the checksum sees it. Other filter chains are not examined; a failure
+/// there surfaces as lopdf's own error.
+fn flate_is_corrupt(stream: &Stream) -> bool {
+    /// The Adler-32 a zlib stream ends with, and an end-of-line or two a
+    /// loose `/Length` takes in with it.
+    const TRAILER: usize = 4 + 4;
+
+    let Ok(filters) = stream.filters() else {
+        return false;
+    };
+    if filters.len() != 1 || filters[0] != b"FlateDecode" || stream.content.len() <= 2 {
+        return false;
+    }
+    if let Drained::Ended { unused } = drain(flate2::Decompress::new(true), &stream.content) {
+        return unused > TRAILER;
+    }
+    match drain(flate2::Decompress::new(false), &stream.content[2..]) {
+        Drained::Invalid => true,
+        Drained::Ended { unused } => unused > TRAILER,
+        Drained::Starved => false,
+    }
+}
+
+/// How a run of an inflater over one input came out.
+enum Drained {
+    /// The data reached its end marker, with this much input after it.
+    Ended { unused: usize },
+    /// The input ran out before the end marker, or the output passed the
+    /// per-stream ceiling: nothing wrong was seen.
+    Starved,
+    /// The decoder met bytes it cannot decode, or a checksum that does not
+    /// match.
+    Invalid,
+}
+
+/// Run `inflater` over `input`, discarding what it produces.
+fn drain(mut inflater: flate2::Decompress, mut input: &[u8]) -> Drained {
+    let ceiling = max_stream_bytes() as u64;
+    let mut scratch = [0u8; 16 * 1024];
+    loop {
+        let (read, written) = (inflater.total_in(), inflater.total_out());
+        let status = inflater.decompress(input, &mut scratch, flate2::FlushDecompress::None);
+        let consumed = (inflater.total_in() - read) as usize;
+        input = &input[consumed..];
+        match status {
+            Ok(flate2::Status::StreamEnd) => {
+                return Drained::Ended {
+                    unused: input.len(),
+                }
+            }
+            Err(_) => return Drained::Invalid,
+            Ok(_) => {
+                let stalled = consumed == 0 && inflater.total_out() == written;
+                if stalled || inflater.total_out() > ceiling {
+                    return Drained::Starved;
+                }
+            }
+        }
+    }
+}
+
 /// A page's content streams, decoded and joined, within the guard's
 /// limits.
 ///
@@ -357,6 +463,90 @@ mod tests {
         let mut stream = Stream::new(dictionary! {}, vec![0; size]);
         stream.compress().expect("compress");
         stream
+    }
+
+    /// A Flate stream of forty distinct lines of page content.
+    fn page_stream() -> Stream {
+        let text: String = (0..40)
+            .map(|line| {
+                format!(
+                    "0 -14 Td (line {line} holds {} and {}) Tj\n",
+                    (line + 3) * 7919 % 1009,
+                    (line + 11) * 104_729 % 997
+                )
+            })
+            .collect();
+        let mut stream = Stream::new(dictionary! {}, text.into_bytes());
+        stream.compress().expect("compress");
+        stream
+    }
+
+    #[test]
+    fn a_whole_stream_is_intact() {
+        let inflated = inflate_checked(&page_stream());
+        assert!(inflated.intact);
+        assert!(String::from_utf8_lossy(&inflated.data).contains("line 39"));
+        // Unfiltered content is intact by definition.
+        let plain = Stream::new(dictionary! {}, b"BT ET".to_vec());
+        assert!(inflate_checked(&plain).intact);
+    }
+
+    #[test]
+    fn a_stream_without_its_checksum_is_intact() {
+        // Writers leave the Adler-32 off; every reader accepts it.
+        let mut stream = page_stream();
+        let cut = stream.content.len() - 4;
+        stream.content.truncate(cut);
+        let inflated = inflate_checked(&stream);
+        assert!(inflated.intact);
+        assert!(String::from_utf8_lossy(&inflated.data).contains("line 39"));
+    }
+
+    #[test]
+    fn a_stream_whose_data_ends_early_is_not_intact_and_keeps_its_first_part() {
+        // What damaged bits most often read as: the end of the data, with
+        // the rest of the stream still after it. Built here as a whole
+        // compressed first part followed by the second part's bytes.
+        let whole = page_stream();
+        let text = String::from_utf8(inflate(&whole).expect("whole")).expect("text");
+        let half = text.find("line 20 ").expect("line 20");
+        let mut first = Stream::new(dictionary! {}, text[..half].as_bytes().to_vec());
+        first.compress().expect("compress");
+        let mut content = first.content.clone();
+        content.extend_from_slice(&whole.content[whole.content.len() / 2..]);
+        let stream = Stream::new(dictionary! { "Filter" => "FlateDecode" }, content);
+
+        let inflated = inflate_checked(&stream);
+        assert!(!inflated.intact);
+        // lopdf hands back what decoded before the damage, as if it were
+        // the whole stream; `intact` is the only thing that says otherwise.
+        let decoded = String::from_utf8_lossy(&inflated.data);
+        assert!(decoded.contains("line 0 "), "{decoded}");
+        assert!(!decoded.contains("line 39"), "{decoded}");
+    }
+
+    #[test]
+    fn bytes_that_are_not_deflate_are_not_intact_and_yield_nothing() {
+        let stream = Stream::new(
+            dictionary! { "Filter" => "FlateDecode" },
+            b"\xde\xad\xbe\xef not deflate ".repeat(20),
+        );
+        let inflated = inflate_checked(&stream);
+        assert!(!inflated.intact);
+        // Not the raw bytes `inflate_or_raw` would hand on: they are
+        // encoded data, and a scan for operators in them finds noise.
+        assert!(inflated.data.is_empty() || !inflated.data.starts_with(b"\xde\xad"));
+    }
+
+    #[test]
+    fn a_filter_lopdf_does_not_know_is_not_intact() {
+        let stream = Stream::new(
+            dictionary! { "Filter" => "NoSuchDecode" },
+            b"BT ET".to_vec(),
+        );
+        let inflated = inflate_checked(&stream);
+        assert!(!inflated.intact);
+        assert!(inflated.data.is_empty());
     }
 
     #[test]
