@@ -109,6 +109,19 @@ The private APIs, and what each unblocks:
     `OcrRecommendationReason` list beside it, so a caller can tell a
     recommendation about the named pages from one about the whole
     document.
+14. **Which characters of the markdown are the page's own**
+    (`src/markdown/literal.rs`, `src/markdown/convert.rs`, `src/types.rs`,
+    `src/markdown/mod.rs`). The renderer copies page text into its output
+    unescaped, so an asterisk, a `#`, a backtick or a `<` that the page
+    drew is indistinguishable in the string from the markup the renderer
+    writes, and only the renderer knows which is which.
+    `to_marked_markdown_from_items_with_rects_and_page_count` returns the
+    same string as its unmarked sibling beside the byte offset of every
+    such character that is page text. Inside, those characters travel
+    through the cleanup passes as Unicode noncharacters and are put back
+    at the end; `MarkdownOptions.mark_literals` turns that on and no other
+    entry point sets it. The one pass that read a drawn `<` as text, the
+    URL matcher, treats its stand-in the same way.
 
 ## Patches that change what the crate does
 

@@ -11,6 +11,7 @@ mod classify;
 mod convert;
 mod furniture;
 mod heading;
+pub(crate) mod literal;
 mod postprocess;
 mod preprocess;
 
@@ -1291,6 +1292,14 @@ pub struct MarkdownOptions {
     pub include_page_numbers: bool,
     /// Strip repeated headers/footers that appear on many pages
     pub strip_headers_footers: bool,
+    /// Keep the page's own `*`, `#`, backtick and `<` characters apart from
+    /// the markup the renderer writes. Set only by
+    /// [`to_marked_markdown_from_items_with_rects_and_page_count`], which
+    /// is the one entry point that puts the characters back: with this set
+    /// the string every other entry point returns carries stand-in code
+    /// points where those characters belong.
+    #[doc(hidden)]
+    pub mark_literals: bool,
 }
 
 impl Default for MarkdownOptions {
@@ -1320,6 +1329,7 @@ impl Default for MarkdownOptions {
             include_links: true,
             include_page_numbers: false,
             strip_headers_footers: true,
+            mark_literals: false,
         }
     }
 }
@@ -1430,6 +1440,52 @@ pub fn to_markdown_from_items_with_rects_and_page_count(
             precomputed_chart_regions: None,
         },
     )
+}
+
+/// A page's markdown, and which of its characters are the page's own.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MarkedMarkdown {
+    /// The markdown, exactly as
+    /// [`to_markdown_from_items_with_rects_and_page_count`] writes it.
+    pub markdown: String,
+    /// The byte offset in `markdown` of every `*`, `#`, backtick and `<`
+    /// that is text the page drew rather than markup the renderer wrote,
+    /// in ascending order. A reader of `markdown` that honours these never
+    /// takes a character of the page for emphasis, a heading marker, a
+    /// fence or a tag.
+    pub literals: Vec<usize>,
+}
+
+/// [`to_markdown_from_items_with_rects_and_page_count`], also reporting
+/// which markup-looking characters of the result are page text.
+///
+/// The renderer does not escape what it copies from the page, so its
+/// output alone cannot say whether an asterisk opens emphasis or was drawn.
+/// This entry point asks the renderer, which knows at the moment it copies
+/// a run's text, and returns the answer beside the string (see the
+/// `literal` module). The string is the one the plain entry point returns.
+///
+/// A run whose text decodes to one of the four Unicode noncharacters the
+/// renderer uses as stand-ins (U+FDD0 to U+FDD3) has it replaced with
+/// U+FFFD first; a noncharacter is not text.
+pub fn to_marked_markdown_from_items_with_rects_and_page_count(
+    mut items: Vec<TextItem>,
+    options: MarkdownOptions,
+    rects: &[crate::types::PdfRect],
+    document_page_count: u32,
+) -> MarkedMarkdown {
+    literal::scrub(&mut items);
+    let marked = to_markdown_from_items_with_rects_and_page_count(
+        items,
+        MarkdownOptions {
+            mark_literals: true,
+            ..options
+        },
+        rects,
+        document_page_count,
+    );
+    let (markdown, literals) = literal::unshield(&marked);
+    MarkedMarkdown { markdown, literals }
 }
 
 pub(crate) struct MarkdownDocumentContext<'a> {

@@ -253,8 +253,25 @@ impl TextLine {
         format_italic: bool,
         format_decorations: bool,
     ) -> String {
+        self.text_with_formatting_marked(format_bold, format_italic, format_decorations, false)
+    }
+
+    /// [`text_with_formatting`](Self::text_with_formatting), with the
+    /// line's own asterisks, `#`s, backticks and `<`s written as stand-ins
+    /// when `mark_literals`, so that every such character left in the
+    /// result is one this function wrote as markup. See
+    /// `markdown::literal`.
+    pub(crate) fn text_with_formatting_marked(
+        &self,
+        format_bold: bool,
+        format_italic: bool,
+        format_decorations: bool,
+        mark_literals: bool,
+    ) -> String {
+        use crate::markdown::literal::shield_if;
+
         if !format_bold && !format_italic && !format_decorations {
-            return self.text_plain();
+            return shield_if(mark_literals, &self.text_plain()).into_owned();
         }
 
         let single_char_threshold = self.adaptive_threshold;
@@ -341,7 +358,7 @@ impl TextLine {
                 current_italic = true;
             }
 
-            result.push_str(text_trimmed);
+            result.push_str(&shield_if(mark_literals, text_trimmed));
         }
 
         // Close any remaining open styles

@@ -399,8 +399,11 @@ fn format_urls(text: &str) -> String {
     use once_cell::sync::Lazy;
 
     // Match URLs - we'll check context manually to avoid formatting already-linked URLs
-    static URL_RE: Lazy<Regex> =
-        Lazy::new(|| Regex::new(r"https?://[^\s<>\)\]]+[^\s<>\)\]\.\,;]").unwrap());
+    // U+FDD3 is the stand-in for a `<` the page drew (see `literal`). It
+    // ends a URL exactly as the `<` it stands for does.
+    static URL_RE: Lazy<Regex> = Lazy::new(|| {
+        Regex::new(r"https?://[^\s<>\)\]\x{FDD3}]+[^\s<>\)\]\.\,;\x{FDD3}]").unwrap()
+    });
 
     let mut result = String::with_capacity(text.len());
     let mut last_end = 0;
