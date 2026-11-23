@@ -179,6 +179,22 @@ reasons in `docs/capture-deferrals.md`.
   ZWNJ, ZWJ and the word joiner are source characters and pass through
   `expand_ligatures`, and a kerning gap next to one does not become a word
   space. The soft hyphen and the byte-order mark are still removed.
+- **A page nobody could read is not a scan** (`src/detector.rs`,
+  `src/guard.rs`, `src/lib.rs`, a direct `flate2` dependency). Detection
+  counted a page whose `/Contents` was missing, not a stream, or would not
+  decode exactly like a page with nothing drawn on it, and zero text
+  operators fell through to `Scanned` at 0.9. A document whose page tree
+  reaches no page is now `PdfError::Parse`, and so is one none of whose
+  pages could be read (the sample is widened to every page before giving
+  up). A page with missing or damaged content is left out of the
+  classification counts, always lands in `pages_needing_ocr`, and carries
+  the new reason `OCR_REASON_UNREADABLE_CONTENT` ahead of any other. To see
+  damage lopdf hides (it returns whatever inflated before a corrupt Flate
+  stream as if it were the whole), `guard::inflate_checked` re-runs a
+  `FlateDecode` stream through `flate2` and reports invalid data, or data
+  that ends with more than a checksum's worth of bytes after it. A missing
+  end marker or a wrong checksum alone is not reported: real writers
+  produce both and every reader accepts them.
 
 ## How the patches are kept auditable
 
