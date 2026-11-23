@@ -2278,6 +2278,157 @@ pub fn inflating_pdf(pages: u32, inflated_bytes: usize) -> Vec<u8> {
     bytes
 }
 
+/// How the page in [`truncated_walk_pdf`] runs past what the walk reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overrun {
+    /// One million and one path operators after the page's text, in the
+    /// page's own content stream.
+    PageOperators,
+    /// A stray `]` in the page's own content stream, before the label.
+    PageStopsParsing,
+    /// The page invokes a small labelled form ten thousand and one times;
+    /// the label of the last invocation is drawn at its own place.
+    FormInvocations,
+    /// The label sits in a form nested seven deep below the page.
+    FormDepth,
+    /// The page invokes a form whose content has a stray `]` before the
+    /// label.
+    FormStopsParsing,
+    /// The page invokes a form that is not a stream.
+    FormNotAStream,
+}
+
+/// A page of ordinary text and a label the walk can only reach by going
+/// past one of its limits, the way `overrun` says.
+///
+/// The page's own text (`marker`, and the words "body text") is drawn
+/// before anything else, so a walk that stops short still has it. The
+/// label, `marker` followed by "label", is what a stopped walk loses. Page
+/// two is a plain text page, so the document is text-based however the
+/// first page reads.
+#[must_use]
+pub fn truncated_walk_pdf(overrun: Overrun, marker: &str) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let fonts = || dictionary! { "Font" => dictionary! { "F1" => font_id } };
+    let text = |page: u32| {
+        let mut content =
+            format!("BT /F1 12 Tf 72 720 Td ({marker} body text on page {page}) Tj\n");
+        for line in 0..10 {
+            content.push_str(&format!(
+                "0 -14 Td (line {line} of the body of page {page}) Tj\n"
+            ));
+        }
+        content.push_str("ET\n");
+        content
+    };
+    let label = format!("BT /F1 12 Tf 72 400 Td ({marker} label) Tj ET");
+    let form = |doc: &mut Document, content: Vec<u8>, xobjects: Option<lopdf::Dictionary>| {
+        let mut resources = fonts();
+        if let Some(xobjects) = xobjects {
+            resources.set("XObject", xobjects);
+        }
+        doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => resources,
+            },
+            content,
+        ))
+    };
+
+    let mut first = text(1);
+    let mut xobjects = None;
+    match overrun {
+        Overrun::PageOperators => {
+            first.push_str(&"n\n".repeat(1_000_001));
+            first.push_str(&label);
+        }
+        Overrun::FormInvocations => {
+            let quiet = form(&mut doc, b"q Q".to_vec(), None);
+            let labelled = form(&mut doc, label.clone().into_bytes(), None);
+            first.push_str(&"/Fq Do\n".repeat(10_000));
+            first.push_str("/Fl Do\n");
+            xobjects = Some(dictionary! { "Fq" => quiet, "Fl" => labelled });
+        }
+        Overrun::FormDepth => {
+            let mut inner = form(&mut doc, label.clone().into_bytes(), None);
+            for _ in 0..7 {
+                inner = form(
+                    &mut doc,
+                    b"/Fn Do".to_vec(),
+                    Some(dictionary! { "Fn" => inner }),
+                );
+            }
+            first.push_str("/Fn Do\n");
+            xobjects = Some(dictionary! { "Fn" => inner });
+        }
+        Overrun::PageStopsParsing => {
+            first.push_str(
+                "]
+",
+            );
+            first.push_str(&label);
+        }
+        Overrun::FormStopsParsing => {
+            let broken = form(&mut doc, format!("q Q ] {label}").into_bytes(), None);
+            first.push_str("/Fb Do\n");
+            xobjects = Some(dictionary! { "Fb" => broken });
+        }
+        Overrun::FormNotAStream => {
+            let not_a_stream = doc.add_object(dictionary! { "Type" => "XObject" });
+            first.push_str("/Fb Do\n");
+            xobjects = Some(dictionary! { "Fb" => not_a_stream });
+        }
+    }
+
+    let mut kids = Vec::new();
+    for (page, content) in [(1, first), (2, text(2))] {
+        let mut stream = Stream::new(dictionary! {}, content.into_bytes());
+        stream.compress().expect("compress the content stream");
+        let content_id = doc.add_object(stream);
+        let mut resources = fonts();
+        if page == 1
+            && let Some(xobjects) = xobjects.clone()
+        {
+            resources.set("XObject", xobjects);
+        }
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources,
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => 2,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// A PDF that opens and has no page in it: a catalog whose page tree is an
 /// empty `/Pages` node.
 ///
