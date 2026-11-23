@@ -557,10 +557,14 @@ impl DocumentFold {
         let mut pictures = self.pictures_of(page.page_no);
         let mut deferred: Vec<(String, Located)> = Vec::new();
 
-        // The page's chrome, by its letters, so a block of markdown the
-        // renderer kept and the chrome report claimed is not folded into
-        // the body as well. Nothing is in both layers.
-        let claimed: Vec<String> = page.furniture.iter().map(|line| letters(line)).collect();
+        // No block of the rendering is the page's chrome: the chrome runs
+        // were taken out of the page before the renderer saw it, which is
+        // what keeps anything from being in both layers. So no block is
+        // skipped for looking like a furniture line. One that does is a
+        // different run with the same letters, a section heading spelled
+        // like the running head, or, for a furniture line with no letters
+        // at all, any block with none; matching by text dropped those from
+        // the body without a word.
 
         // The runs the rendering left out, in the order the page drew
         // them. They are content, so they go into the body, and they go in
@@ -596,9 +600,6 @@ impl DocumentFold {
                 located.spans.extend(lifted.spans);
             }
             let block = block.with_text(lifted.text);
-            if claimed.contains(&letters(block.text())) {
-                continue;
-            }
             self.place_pictures_above(&mut pictures, located.bbox.as_ref(), page.page_no);
             self.place_deferred_above(&mut deferred, located.bbox.as_ref(), page.page_no);
             while dropped
@@ -3005,30 +3006,38 @@ mod tests {
     }
 
     #[test]
-    fn a_block_the_chrome_report_claimed_is_not_folded_into_the_body_as_well() {
+    fn a_block_spelled_like_a_furniture_line_is_still_body() {
         let mut fold = DocumentFold::new();
         fold.consume(&info(1, "", 1.0));
         fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
             page_no: 1,
-            // The renderer is shown one page at a time and one page
-            // repeats nothing, so the head it could not prove is chrome
-            // stays in the markdown. The report proved it over the whole
-            // document.
-            markdown: "A Running Head\n\nthe body of the page\n".to_owned(),
-            furniture: vec!["A Running Head".to_owned()],
+            // The chrome run "Results" was taken out of the page before
+            // it was rendered, so the "Results" the markdown carries is
+            // the page's own heading, a different run with the same
+            // letters.
+            markdown: "## Results\n\nthe body of the page\n".to_owned(),
+            furniture: vec!["Results".to_owned()],
             ..pb::PageMarkdown::default()
         }));
         let document = fold.take();
 
-        let head = base_of(&document.texts[0]);
-        assert_eq!(head.text, "A Running Head");
-        assert_eq!(head.content_layer, doc::ContentLayer::Furniture as i32);
+        let texts: Vec<(&str, i32)> = document
+            .texts
+            .iter()
+            .map(|item| {
+                let base = base_of(item);
+                (base.text.as_str(), base.content_layer)
+            })
+            .collect();
         assert_eq!(
-            document.texts.len(),
-            2,
-            "the head is one item, not one per layer"
+            texts,
+            [
+                ("Results", doc::ContentLayer::Furniture as i32),
+                ("Results", doc::ContentLayer::Body as i32),
+                ("the body of the page", doc::ContentLayer::Body as i32),
+            ],
+            "one item per layer, because they are two runs"
         );
-        assert_eq!(base_of(&document.texts[1]).text, "the body of the page");
         assert_sound(&document);
     }
 

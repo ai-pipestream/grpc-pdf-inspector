@@ -30,6 +30,7 @@ pub mod frame;
 pub mod furniture;
 pub mod limits;
 pub mod literal;
+pub mod logging;
 pub mod metadata;
 pub mod metrics;
 pub mod page_runs;

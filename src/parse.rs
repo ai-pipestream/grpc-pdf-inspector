@@ -476,6 +476,8 @@ fn parse(
                     // library and does not say which characters are the
                     // page's own.
                     literal_offsets: Vec::new(),
+                    // The whole-document API does not report its walk.
+                    truncations: Vec::new(),
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -511,6 +513,7 @@ fn parse(
                 rotated_pages,
                 downward_pages,
                 page_boxes,
+                truncated_pages,
             } = guarded(guard, || {
                 pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
                     bytes,
@@ -554,6 +557,33 @@ fn parse(
             // should read the page again.
             for page in &ocr_layer_pages {
                 add_verdict(&mut verdicts, *page, pb::OcrReason::Scanned);
+            }
+            // A page the walk stopped reading partway is not the page: what
+            // a renderer draws of it is more than these runs hold. It used
+            // to go out as an ordinary page, empty when the stop came
+            // first, and an empty page with no verdict reads as blank.
+            for page in truncated_pages.keys() {
+                add_verdict(&mut verdicts, *page, pb::OcrReason::ContentTruncated);
+            }
+            if !truncated_pages.is_empty() {
+                let pages: Vec<String> = truncated_pages
+                    .iter()
+                    .map(|(page, why)| {
+                        let why: Vec<&str> = why
+                            .iter()
+                            .map(|why| walk_truncation(*why).as_str_name())
+                            .collect();
+                        format!("{page} ({})", why.join(", "))
+                    })
+                    .collect();
+                warnings.push(pb::ParseWarning {
+                    code: pb::ParseWarningCode::ContentTruncated.into(),
+                    message: format!(
+                        "the walk stopped before the end of the content of page(s) {}; \
+                         each page event names why and needs OCR",
+                        pages.join(", ")
+                    ),
+                });
             }
 
             // The invisible layer's own runs, which need the walk run again
@@ -777,6 +807,10 @@ fn parse(
                     dropped,
                     encoding_issues,
                     literal_offsets,
+                    truncations: truncated_pages
+                        .get(&page_no)
+                        .map(|why| why.iter().map(|why| walk_truncation(*why).into()).collect())
+                        .unwrap_or_default(),
                 })?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -1251,6 +1285,18 @@ fn map_error(error: pdf_inspector::PdfError) -> Status {
             Status::resource_exhausted("the document inflates past its decompression limits")
         }
         PdfError::Interrupted(Interrupt::Cancelled) => Status::cancelled("the call was cancelled"),
+    }
+}
+
+/// Map one reason the walk stopped short onto the wire enum.
+fn walk_truncation(why: pdf_inspector::types::WalkTruncation) -> pb::WalkTruncation {
+    use pdf_inspector::types::WalkTruncation;
+    match why {
+        WalkTruncation::OperatorCap => pb::WalkTruncation::OperatorCap,
+        WalkTruncation::UnparsedContent => pb::WalkTruncation::UnparsedContent,
+        WalkTruncation::FormBudget => pb::WalkTruncation::FormBudget,
+        WalkTruncation::FormDepth => pb::WalkTruncation::FormDepth,
+        WalkTruncation::XObjectUnreadable => pb::WalkTruncation::XobjectUnreadable,
     }
 }
 

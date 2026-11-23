@@ -291,13 +291,21 @@ pub(crate) fn extract_page_text_items_with_forms(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
     )? {
-        Some(content) => content,
+        Some(decoded) => {
+            if decoded.stopped_early {
+                form_budget.record(crate::types::WalkTruncation::UnparsedContent);
+            }
+            decoded.content
+        }
         None => {
             log::warn!(
                 "page {}: skipping extraction — content stream exceeds {} operations",
                 page_num,
                 super::content_decode::MAX_PAGE_OPERATIONS
             );
+            // Said to the caller, not only to a logger: the page is not
+            // blank, it is unread.
+            form_budget.record(crate::types::WalkTruncation::OperatorCap);
             return Ok((
                 (Vec::new(), Vec::new(), Vec::new()),
                 Vec::new(),
@@ -1075,6 +1083,11 @@ pub(crate) fn extract_page_text_items_with_forms(
 
                         if let Some(xobj_type) = xobjects.get(&xobj_name) {
                             match xobj_type {
+                                XObjectType::Unreadable => {
+                                    form_budget.record(
+                                        crate::types::WalkTruncation::XObjectUnreadable,
+                                    );
+                                }
                                 XObjectType::Image => {
                                     // Emit a positional placeholder for the image
                                     // so downstream consumers (layout-aware

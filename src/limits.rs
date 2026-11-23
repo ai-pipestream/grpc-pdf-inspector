@@ -130,24 +130,57 @@ impl std::fmt::Display for InvalidLimit {
 
 impl std::error::Error for InvalidLimit {}
 
-/// Read a `u64` environment variable, falling back to `default`.
+/// Read a whole number that must be positive if it is set, falling back to
+/// `default` only when the variable is not set at all.
 ///
-/// A value that does not parse is ignored rather than fatal, and a zero is
-/// treated as "not set": no limit here has a meaningful zero, and silently
-/// running with an unbounded cap because of a typo is the failure mode worth
-/// designing out.
-fn env_u64(var: &impl Fn(&str) -> Option<String>, name: &str, default: u64) -> u64 {
-    match var(name).and_then(|v| v.parse::<u64>().ok()) {
-        Some(0) | None => default,
-        Some(value) => value,
+/// A value that does not parse, or a zero, stops the server. No limit here
+/// has a meaningful zero, and `512M` or `10m` quietly meaning the default
+/// left an operator believing a limit was in force that was not.
+///
+/// # Errors
+///
+/// [`InvalidLimit`] naming the variable and what it was set to.
+pub fn env_positive(
+    var: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u64,
+) -> Result<u64, InvalidLimit> {
+    let Some(value) = var(name) else {
+        return Ok(default);
+    };
+    match value.trim().parse::<u64>() {
+        Ok(0) => Err(InvalidLimit {
+            name,
+            value,
+            reason: "must be at least 1",
+        }),
+        Ok(number) => Ok(number),
+        Err(_) => Err(InvalidLimit {
+            name,
+            value,
+            reason: "is not a whole number (write sizes in bytes and times in seconds)",
+        }),
     }
 }
 
-/// Read a whole number of seconds that must be positive if it is set.
+/// [`env_positive`], for a setting where zero means "off".
 ///
-/// Stricter than [`env_u64`], because it is newer: no deployment depends on
-/// a typo here quietly meaning the default, so a value that does not parse,
-/// or a zero, stops the server instead.
+/// # Errors
+///
+/// [`InvalidLimit`] when the value does not parse.
+pub fn env_whole(
+    var: &impl Fn(&str) -> Option<String>,
+    name: &'static str,
+    default: u64,
+) -> Result<u64, InvalidLimit> {
+    match var(name) {
+        Some(value) if value.trim() == "0" => Ok(0),
+        _ => env_positive(var, name, default),
+    }
+}
+
+/// Read a whole number of seconds that must be positive if it is set, and
+/// no longer than a day.
 fn env_seconds(
     var: &impl Fn(&str) -> Option<String>,
     name: &'static str,
@@ -207,27 +240,36 @@ impl Limits {
     pub fn from_vars(var: impl Fn(&str) -> Option<String>) -> Result<Self, InvalidLimit> {
         let defaults = Self::default();
         Ok(Self {
-            max_document_bytes: env_u64(&var, "GRPC_PDF_MAX_BYTES", DEFAULT_MAX_DOCUMENT_BYTES),
-            max_chunk_bytes: env_u64(&var, "GRPC_PDF_MAX_CHUNK_BYTES", DEFAULT_MAX_CHUNK_BYTES),
-            max_concurrent_parses: usize::try_from(env_u64(
+            max_document_bytes: env_positive(
+                &var,
+                "GRPC_PDF_MAX_BYTES",
+                DEFAULT_MAX_DOCUMENT_BYTES,
+            )?,
+            max_chunk_bytes: env_positive(
+                &var,
+                "GRPC_PDF_MAX_CHUNK_BYTES",
+                DEFAULT_MAX_CHUNK_BYTES,
+            )?,
+            max_concurrent_parses: usize::try_from(env_positive(
                 &var,
                 "GRPC_PDF_MAX_CONCURRENT_PARSES",
                 defaults.max_concurrent_parses as u64,
-            ))
-            .unwrap_or(defaults.max_concurrent_parses),
-            max_stream_bytes: env_u64(&var, "GRPC_PDF_MAX_STREAM_BYTES", DEFAULT_MAX_STREAM_BYTES),
-            max_decompressed_bytes: env_u64(
+            )?)
+            .unwrap_or(usize::MAX),
+            max_stream_bytes: env_positive(
+                &var,
+                "GRPC_PDF_MAX_STREAM_BYTES",
+                DEFAULT_MAX_STREAM_BYTES,
+            )?,
+            max_decompressed_bytes: env_positive(
                 &var,
                 "GRPC_PDF_MAX_DECOMPRESSED_BYTES",
                 DEFAULT_MAX_DECOMPRESSED_BYTES,
-            ),
-            max_parse_time: Duration::from_secs(at_most_a_day(
+            )?,
+            max_parse_time: Duration::from_secs(env_seconds(
+                &var,
                 "GRPC_PDF_MAX_PARSE_SECONDS",
-                env_u64(
-                    &var,
-                    "GRPC_PDF_MAX_PARSE_SECONDS",
-                    DEFAULT_MAX_PARSE_SECONDS,
-                ),
+                DEFAULT_MAX_PARSE_SECONDS,
             )?),
             max_upload_time: Duration::from_secs(env_seconds(
                 &var,
@@ -259,6 +301,59 @@ impl Limits {
             max_decompressed_bytes: self.max_decompressed_bytes,
             max_parse_seconds: self.max_parse_time.as_secs(),
         }
+    }
+}
+
+/// The server's sizing knobs: not safety limits, but read and refused the
+/// same way, so a typo in one does not quietly mean its default either.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ServerSettings {
+    /// Tokio worker threads (`GRPC_PDF_WORKERS`). At least one.
+    pub workers: usize,
+    /// HTTP/2 initial window for the stream and the connection
+    /// (`GRPC_PDF_WINDOW_BYTES`). At least one byte and at most 2^31 - 1,
+    /// the largest window HTTP/2 allows.
+    pub window_bytes: u32,
+    /// Seconds between metrics lines (`GRPC_PDF_METRICS_INTERVAL_SECS`);
+    /// zero turns them off.
+    pub metrics_interval: Duration,
+}
+
+/// The largest HTTP/2 flow-control window, 2^31 - 1 bytes.
+const MAX_WINDOW_BYTES: u64 = (1 << 31) - 1;
+
+impl ServerSettings {
+    /// Read the settings through `var`, with `workers` as the default
+    /// worker count and the given defaults for the rest.
+    ///
+    /// # Errors
+    ///
+    /// [`InvalidLimit`] when a variable is set to a value the server must
+    /// not start with.
+    pub fn from_vars(
+        var: impl Fn(&str) -> Option<String>,
+        workers: usize,
+        window_bytes: u32,
+        metrics_interval_secs: u64,
+    ) -> Result<Self, InvalidLimit> {
+        let window = env_positive(&var, "GRPC_PDF_WINDOW_BYTES", u64::from(window_bytes))?;
+        if window > MAX_WINDOW_BYTES {
+            return Err(InvalidLimit {
+                name: "GRPC_PDF_WINDOW_BYTES",
+                value: window.to_string(),
+                reason: "is larger than the 2147483647 byte HTTP/2 window ceiling",
+            });
+        }
+        Ok(Self {
+            workers: usize::try_from(env_positive(&var, "GRPC_PDF_WORKERS", workers as u64)?)
+                .unwrap_or(usize::MAX),
+            window_bytes: u32::try_from(window).unwrap_or(u32::MAX),
+            metrics_interval: Duration::from_secs(env_whole(
+                &var,
+                "GRPC_PDF_METRICS_INTERVAL_SECS",
+                metrics_interval_secs,
+            )?),
+        })
     }
 }
 
@@ -306,6 +401,92 @@ mod tests {
             assert_eq!(error.name, "GRPC_PDF_MAX_UPLOAD_SECONDS", "{value:?}");
             assert_eq!(error.value, value);
         }
+    }
+
+    /// Every limit read as a byte size, a count or seconds.
+    const NUMERIC_LIMITS: [&str; 6] = [
+        "GRPC_PDF_MAX_BYTES",
+        "GRPC_PDF_MAX_CHUNK_BYTES",
+        "GRPC_PDF_MAX_CONCURRENT_PARSES",
+        "GRPC_PDF_MAX_STREAM_BYTES",
+        "GRPC_PDF_MAX_DECOMPRESSED_BYTES",
+        "GRPC_PDF_MAX_PARSE_SECONDS",
+    ];
+
+    #[test]
+    fn a_limit_that_does_not_parse_or_is_zero_stops_startup() {
+        // "512M" and "10m" are how operators write sizes and durations
+        // elsewhere; here they used to mean the default, silently.
+        for name in NUMERIC_LIMITS {
+            for value in ["512M", "10m", "0", "", "-1", "1.5", "eight"] {
+                let error = read(&[(name, value)])
+                    .expect_err("the server must not start with a limit nobody chose");
+                assert_eq!(error.name, name, "{value:?}");
+                assert_eq!(error.value, value, "{name}");
+            }
+        }
+    }
+
+    #[test]
+    fn every_limit_is_read_from_the_environment() {
+        for name in NUMERIC_LIMITS {
+            let limits = read(&[(name, " 42 ")]).expect("a valid limit");
+            let read_back = match name {
+                "GRPC_PDF_MAX_BYTES" => limits.max_document_bytes,
+                "GRPC_PDF_MAX_CHUNK_BYTES" => limits.max_chunk_bytes,
+                "GRPC_PDF_MAX_CONCURRENT_PARSES" => limits.max_concurrent_parses as u64,
+                "GRPC_PDF_MAX_STREAM_BYTES" => limits.max_stream_bytes,
+                "GRPC_PDF_MAX_DECOMPRESSED_BYTES" => limits.max_decompressed_bytes,
+                _ => limits.max_parse_time.as_secs(),
+            };
+            assert_eq!(read_back, 42, "{name}");
+        }
+    }
+
+    /// Server settings read from `vars` alone.
+    fn settings(vars: &[(&str, &str)]) -> Result<ServerSettings, InvalidLimit> {
+        ServerSettings::from_vars(
+            |name| {
+                vars.iter()
+                    .find(|(key, _)| *key == name)
+                    .map(|(_, value)| (*value).to_owned())
+            },
+            4,
+            4 * 1024 * 1024,
+            60,
+        )
+    }
+
+    #[test]
+    fn the_server_settings_refuse_what_they_cannot_use() {
+        assert_eq!(
+            settings(&[]),
+            Ok(ServerSettings {
+                workers: 4,
+                window_bytes: 4 * 1024 * 1024,
+                metrics_interval: Duration::from_secs(60),
+            })
+        );
+        for (name, value) in [
+            ("GRPC_PDF_WORKERS", "0"),
+            ("GRPC_PDF_WORKERS", "all"),
+            ("GRPC_PDF_WINDOW_BYTES", "4M"),
+            ("GRPC_PDF_WINDOW_BYTES", "0"),
+            ("GRPC_PDF_WINDOW_BYTES", "2147483648"),
+            ("GRPC_PDF_METRICS_INTERVAL_SECS", "1m"),
+            ("GRPC_PDF_METRICS_INTERVAL_SECS", "-1"),
+        ] {
+            let error = settings(&[(name, value)]).expect_err("refused");
+            assert_eq!(error.name, name, "{value:?}");
+        }
+        let off = settings(&[("GRPC_PDF_METRICS_INTERVAL_SECS", "0")]).expect("zero is off");
+        assert_eq!(off.metrics_interval, Duration::ZERO);
+        let set = settings(&[
+            ("GRPC_PDF_WORKERS", "16"),
+            ("GRPC_PDF_WINDOW_BYTES", "65535"),
+        ])
+        .expect("valid");
+        assert_eq!((set.workers, set.window_bytes), (16, 65_535));
     }
 
     #[test]
