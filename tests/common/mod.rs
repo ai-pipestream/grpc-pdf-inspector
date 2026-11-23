@@ -76,6 +76,118 @@ pub fn text_pdf(pages: u32, body_words: usize, marker: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page text PDF titled `title`, encrypted with an owner
+/// password and an empty user password.
+///
+/// That is the everyday "protected" file: any reader opens it without
+/// asking, and the owner password only guards the permission bits. A caller
+/// who sends some other password has sent the wrong one, and the parser
+/// falls back to the empty password the file accepts.
+#[must_use]
+pub fn owner_protected_pdf(title: &str, marker: &str) -> Vec<u8> {
+    let mut doc = Document::load_mem(&text_pdf(1, 40, marker)).expect("reload the fixture");
+    let info_id = doc.add_object(dictionary! {
+        "Title" => Object::string_literal(title),
+    });
+    doc.trailer.set("Info", info_id);
+    // An encrypted file must carry an /ID; the key is derived from it.
+    doc.trailer.set(
+        "ID",
+        vec![
+            Object::string_literal("0123456789abcdef"),
+            Object::string_literal("0123456789abcdef"),
+        ],
+    );
+    let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+        document: &doc,
+        owner_password: "owner",
+        user_password: "",
+        key_length: 128,
+        permissions: lopdf::Permissions::all(),
+    })
+    .expect("an RC4 encryption state");
+    doc.encrypt(&state).expect("encrypt the fixture");
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a one-page text PDF titled `title` that also carries an object
+/// stream inflating to `inflated_bytes`, referenced by nothing.
+///
+/// The page, its font and its information dictionary are plain objects, so
+/// a reader that steps over the object stream reads the document whole. The
+/// extractor's PDF library does exactly that; the metadata reader's newer
+/// one refuses the whole load once a stream passes the inflation limit. That
+/// is the shape of the case where the text arrives and the file's own facts
+/// cannot be read.
+#[must_use]
+pub fn oversized_object_stream_pdf(title: &str, marker: &str, inflated_bytes: usize) -> Vec<u8> {
+    // Written by hand: lopdf's own writer repacks object streams on save,
+    // and this one has to reach the reader exactly as it is.
+    let header = "8 0 ";
+    let mut packed = header.as_bytes().to_vec();
+    packed.extend_from_slice(b"<< /Padding true >>");
+    packed.resize(packed.len() + inflated_bytes, b' ');
+    let mut object_stream = Stream::new(dictionary! {}, packed);
+    object_stream
+        .compress()
+        .expect("compress the object stream");
+
+    let content = format!("BT /F1 12 Tf 50 750 Td ({marker} page 1) Tj ET");
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        [
+            format!("<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+            content.into_bytes(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        format!("<< /Title ({title}) >>").into_bytes(),
+        [
+            format!(
+                "<< /Type /ObjStm /N 1 /First {} /Filter /FlateDecode /Length {} >>\nstream\n",
+                header.len(),
+                object_stream.content.len()
+            )
+            .into_bytes(),
+            object_stream.content,
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+    ];
+
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
 /// Build a scanned-style PDF: `pages` pages, each a full-page raster with no
 /// text operators at all.
 ///
@@ -760,6 +872,16 @@ fn ruled_table_page(with_borderless: bool) -> Vec<u8> {
 /// by default and used to strip silently.
 #[must_use]
 pub fn furniture_pdf(pages: u32, head: &str) -> Vec<u8> {
+    furniture_pdf_with(pages, head, None)
+}
+
+/// [`furniture_pdf`], with one more line of body text, `line.1`, drawn in a
+/// larger size above the paragraph of page `line.0`.
+///
+/// The line is the page's own content wherever its letters happen to match
+/// the running head's.
+#[must_use]
+pub fn furniture_pdf_with(pages: u32, head: &str, line: Option<(u32, &str)>) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -772,6 +894,9 @@ pub fn furniture_pdf(pages: u32, head: &str) -> Vec<u8> {
     for page in 1..=pages {
         let mut content = String::new();
         content.push_str(&format!("BT /F1 9 Tf 72 760 Td ({head}) Tj ET\n"));
+        if let Some((_, text)) = line.filter(|(on, _)| *on == page) {
+            content.push_str(&format!("BT /F1 16 Tf 72 725 Td ({text}) Tj ET\n"));
+        }
         for line in 0..8 {
             let y = 700 - 16 * line;
             content.push_str(&format!(
@@ -2267,6 +2392,157 @@ pub fn inflating_pdf(pages: u32, inflated_bytes: usize) -> Vec<u8> {
             "Type" => "Pages",
             "Kids" => kids,
             "Count" => pages,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// How the page in [`truncated_walk_pdf`] runs past what the walk reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overrun {
+    /// One million and one path operators after the page's text, in the
+    /// page's own content stream.
+    PageOperators,
+    /// A stray `]` in the page's own content stream, before the label.
+    PageStopsParsing,
+    /// The page invokes a small labelled form ten thousand and one times;
+    /// the label of the last invocation is drawn at its own place.
+    FormInvocations,
+    /// The label sits in a form nested seven deep below the page.
+    FormDepth,
+    /// The page invokes a form whose content has a stray `]` before the
+    /// label.
+    FormStopsParsing,
+    /// The page invokes a form that is not a stream.
+    FormNotAStream,
+}
+
+/// A page of ordinary text and a label the walk can only reach by going
+/// past one of its limits, the way `overrun` says.
+///
+/// The page's own text (`marker`, and the words "body text") is drawn
+/// before anything else, so a walk that stops short still has it. The
+/// label, `marker` followed by "label", is what a stopped walk loses. Page
+/// two is a plain text page, so the document is text-based however the
+/// first page reads.
+#[must_use]
+pub fn truncated_walk_pdf(overrun: Overrun, marker: &str) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let font_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+    });
+    let fonts = || dictionary! { "Font" => dictionary! { "F1" => font_id } };
+    let text = |page: u32| {
+        let mut content =
+            format!("BT /F1 12 Tf 72 720 Td ({marker} body text on page {page}) Tj\n");
+        for line in 0..10 {
+            content.push_str(&format!(
+                "0 -14 Td (line {line} of the body of page {page}) Tj\n"
+            ));
+        }
+        content.push_str("ET\n");
+        content
+    };
+    let label = format!("BT /F1 12 Tf 72 400 Td ({marker} label) Tj ET");
+    let form = |doc: &mut Document, content: Vec<u8>, xobjects: Option<lopdf::Dictionary>| {
+        let mut resources = fonts();
+        if let Some(xobjects) = xobjects {
+            resources.set("XObject", xobjects);
+        }
+        doc.add_object(Stream::new(
+            dictionary! {
+                "Type" => "XObject",
+                "Subtype" => "Form",
+                "BBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+                "Resources" => resources,
+            },
+            content,
+        ))
+    };
+
+    let mut first = text(1);
+    let mut xobjects = None;
+    match overrun {
+        Overrun::PageOperators => {
+            first.push_str(&"n\n".repeat(1_000_001));
+            first.push_str(&label);
+        }
+        Overrun::FormInvocations => {
+            let quiet = form(&mut doc, b"q Q".to_vec(), None);
+            let labelled = form(&mut doc, label.clone().into_bytes(), None);
+            first.push_str(&"/Fq Do\n".repeat(10_000));
+            first.push_str("/Fl Do\n");
+            xobjects = Some(dictionary! { "Fq" => quiet, "Fl" => labelled });
+        }
+        Overrun::FormDepth => {
+            let mut inner = form(&mut doc, label.clone().into_bytes(), None);
+            for _ in 0..7 {
+                inner = form(
+                    &mut doc,
+                    b"/Fn Do".to_vec(),
+                    Some(dictionary! { "Fn" => inner }),
+                );
+            }
+            first.push_str("/Fn Do\n");
+            xobjects = Some(dictionary! { "Fn" => inner });
+        }
+        Overrun::PageStopsParsing => {
+            first.push_str(
+                "]
+",
+            );
+            first.push_str(&label);
+        }
+        Overrun::FormStopsParsing => {
+            let broken = form(&mut doc, format!("q Q ] {label}").into_bytes(), None);
+            first.push_str("/Fb Do\n");
+            xobjects = Some(dictionary! { "Fb" => broken });
+        }
+        Overrun::FormNotAStream => {
+            let not_a_stream = doc.add_object(dictionary! { "Type" => "XObject" });
+            first.push_str("/Fb Do\n");
+            xobjects = Some(dictionary! { "Fb" => not_a_stream });
+        }
+    }
+
+    let mut kids = Vec::new();
+    for (page, content) in [(1, first), (2, text(2))] {
+        let mut stream = Stream::new(dictionary! {}, content.into_bytes());
+        stream.compress().expect("compress the content stream");
+        let content_id = doc.add_object(stream);
+        let mut resources = fonts();
+        if page == 1
+            && let Some(xobjects) = xobjects.clone()
+        {
+            resources.set("XObject", xobjects);
+        }
+        let page_id = doc.add_object(dictionary! {
+            "Type" => "Page",
+            "Parent" => pages_id,
+            "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+            "Resources" => resources,
+            "Contents" => content_id,
+        });
+        kids.push(Object::Reference(page_id));
+    }
+
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => kids,
+            "Count" => 2,
         }),
     );
     let catalog_id = doc.add_object(dictionary! {

@@ -454,6 +454,12 @@ enum OcrReason {
   // than this did. When it is the reason for every page, no `info` is
   // sent at all: the call fails with `INVALID_ARGUMENT`.
   OCR_REASON_UNREADABLE_CONTENT = 5;
+
+  // The walk of the page stopped before the end of its content; the page's
+  // `truncations` say why. The text the page event carries is what was
+  // read before the stop, so a renderer sees more of the page than this
+  // service did.
+  OCR_REASON_CONTENT_TRUNCATED = 6;
 }
 
 // OcrRecommendationReason names why detection recommends OCR for a
@@ -696,6 +702,47 @@ message PageMarkdown {
   // on the password fallback's whole-document event (`page_no` 0), whose
   // rendering comes from a pipeline that does not report them.
   repeated uint32 literal_offsets = 11;
+
+  // Why the walk of this page left part of its content unread, sorted and
+  // without repeats. Empty for a page read to the end, which is nearly
+  // every page. When it is not empty the page's `markdown` is what was
+  // read before the walk stopped, and may be empty for a page that is not
+  // blank; `needs_ocr` is set with `OCR_REASON_CONTENT_TRUNCATED`, and the
+  // trailer carries `PARSE_WARNING_CODE_CONTENT_TRUNCATED`. Always empty on
+  // the password fallback's whole-document event (`page_no` 0).
+  repeated WalkTruncation truncations = 12;
+}
+
+// WalkTruncation names a limit or a fault that stopped the walk of a page
+// before the end of its content.
+enum WalkTruncation {
+  // Never sent. Present because proto3 requires a zero value.
+  WALK_TRUNCATION_UNSPECIFIED = 0;
+
+  // The page's own content stream, or one Form XObject's, holds more
+  // operators than the walk decodes (1,000,000). Such a stream is not
+  // walked at all; for the page's own stream that means no text, no
+  // images and no forms come from the page.
+  WALK_TRUNCATION_OPERATOR_CAP = 1;
+
+  // A content stream, the page's own or a form's, stopped parsing at a
+  // token the parser does not accept (a stray `]`, `)`, `>>`, `{`), with
+  // operators after it. What came before the stop was walked.
+  WALK_TRUNCATION_UNPARSED_CONTENT = 2;
+
+  // The page's Form XObjects together asked for more than the walk spends
+  // on one page (10,000 invocations, 1,000,000 operators); the forms past
+  // that point were not walked.
+  WALK_TRUNCATION_FORM_BUDGET = 3;
+
+  // Forms nested deeper than the walk follows (five levels below the
+  // page), or a form that invokes itself; the deeper forms were not walked.
+  WALK_TRUNCATION_FORM_DEPTH = 4;
+
+  // An XObject the page invokes, form or image, is missing or is not a
+  // stream, or a form's content is refused outright by the parser; it was
+  // not walked.
+  WALK_TRUNCATION_XOBJECT_UNREADABLE = 5;
 }
 
 // StructureRole is one standard structure type from a tagged PDF.
@@ -1160,14 +1207,27 @@ enum ParseWarningCode {
   // at all (see PARSE_WARNING_CODE_TEXT_WITHHELD).
   PARSE_WARNING_CODE_PASSWORD_FALLBACK = 1;
 
-  // `emit_metadata` was set but the document's dictionaries could not be
-  // read, so no `metadata` event was sent. The text extraction is
-  // unaffected: this reports a gap, not a failure.
+  // `emit_metadata` or `emit_document` was set but the document's
+  // dictionaries could not be read: no `metadata` event was sent, and the
+  // `document` event carries no source metadata, outline, attachments, page
+  // geometry or link targets. The text extraction is unaffected: this
+  // reports a gap, not a failure.
   PARSE_WARNING_CODE_METADATA_UNAVAILABLE = 2;
 
   // Some pages listed in `PdfOptions.pages` are past the end of the
   // document. They were left out; the pages that exist were processed.
   PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE = 3;
+
+  // The walk of some pages stopped before the end of their content. Each
+  // such page event names why in `truncations` and needs OCR; the message
+  // lists the pages.
+  PARSE_WARNING_CODE_CONTENT_TRUNCATED = 4;
+
+  // The metadata reader panicked on this document. Everything
+  // PARSE_WARNING_CODE_METADATA_UNAVAILABLE says is missing is missing,
+  // for a different reason: a bug in the reader rather than a document it
+  // cannot open. The text extraction is unaffected.
+  PARSE_WARNING_CODE_METADATA_READER_PANICKED = 5;
 
   // The whole-document pipeline returned no text for a text-bearing
   // document. `ParseStatus.text_withheld` says why.

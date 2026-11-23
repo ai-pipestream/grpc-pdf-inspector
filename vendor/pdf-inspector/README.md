@@ -203,6 +203,20 @@ reasons in `docs/capture-deferrals.md`.
   end marker or a wrong checksum alone is not reported: real writers
   produce both and every reader accepts them.
 
+- **A walk that stops short says so** (`src/types.rs`,
+  `src/extractor/xobjects.rs`, `src/extractor/content_stream.rs`,
+  `src/extractor/content_decode.rs`, `src/extractor/mod.rs`). A page
+  whose content stream passes the operator cap, a page whose forms pass
+  the per-page budget or the depth cap, a `Do` of an XObject entry that
+  names no readable stream, and a content stream lopdf stops parsing at a
+  stray token with operators after it were each walked partway or not at
+  all, with at most a `log::warn!`. The walk now records each as a
+  `WalkTruncation` in the page's `FormWalkBudget`, and
+  `OcrLayerExtraction.truncated_pages` carries them per page.
+  `decode_content_bounded` parses strictly first and, only when that
+  fails, leniently, counting operators to tell lost operators from
+  trailing junk.
+
 ## How the patches are kept auditable
 
 The copy landed in its own commit, with the tree building and testing
