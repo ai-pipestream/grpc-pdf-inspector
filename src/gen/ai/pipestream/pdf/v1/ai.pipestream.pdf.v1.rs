@@ -1488,13 +1488,20 @@ pub enum ParseWarningCode {
     /// the markdown arrived as one `page` event with `page_no` 0 instead of
     /// one event per page.
     PasswordFallback = 1,
-    /// `emit_metadata` was set but the document's dictionaries could not be
-    /// read, so no `metadata` event was sent. The text extraction is
-    /// unaffected: this reports a gap, not a failure.
+    /// `emit_metadata` or `emit_document` was set but the document's
+    /// dictionaries could not be read: no `metadata` event was sent, and the
+    /// `document` event carries no source metadata, outline, attachments, page
+    /// geometry or link targets. The text extraction is unaffected: this
+    /// reports a gap, not a failure.
     MetadataUnavailable = 2,
     /// Some pages listed in `PdfOptions.pages` are past the end of the
     /// document. They were left out; the pages that exist were processed.
     PagesOutOfRange = 3,
+    /// The metadata reader panicked on this document. Everything
+    /// PARSE_WARNING_CODE_METADATA_UNAVAILABLE says is missing is missing,
+    /// for a different reason: a bug in the reader rather than a document it
+    /// cannot open. The text extraction is unaffected.
+    MetadataReaderPanicked = 5,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1507,6 +1514,7 @@ impl ParseWarningCode {
             Self::PasswordFallback => "PARSE_WARNING_CODE_PASSWORD_FALLBACK",
             Self::MetadataUnavailable => "PARSE_WARNING_CODE_METADATA_UNAVAILABLE",
             Self::PagesOutOfRange => "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE",
+            Self::MetadataReaderPanicked => "PARSE_WARNING_CODE_METADATA_READER_PANICKED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1516,6 +1524,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_PASSWORD_FALLBACK" => Some(Self::PasswordFallback),
             "PARSE_WARNING_CODE_METADATA_UNAVAILABLE" => Some(Self::MetadataUnavailable),
             "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE" => Some(Self::PagesOutOfRange),
+            "PARSE_WARNING_CODE_METADATA_READER_PANICKED" => Some(Self::MetadataReaderPanicked),
             _ => None,
         }
     }

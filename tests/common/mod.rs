@@ -76,6 +76,118 @@ pub fn text_pdf(pages: u32, body_words: usize, marker: &str) -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page text PDF titled `title`, encrypted with an owner
+/// password and an empty user password.
+///
+/// That is the everyday "protected" file: any reader opens it without
+/// asking, and the owner password only guards the permission bits. A caller
+/// who sends some other password has sent the wrong one, and the parser
+/// falls back to the empty password the file accepts.
+#[must_use]
+pub fn owner_protected_pdf(title: &str, marker: &str) -> Vec<u8> {
+    let mut doc = Document::load_mem(&text_pdf(1, 40, marker)).expect("reload the fixture");
+    let info_id = doc.add_object(dictionary! {
+        "Title" => Object::string_literal(title),
+    });
+    doc.trailer.set("Info", info_id);
+    // An encrypted file must carry an /ID; the key is derived from it.
+    doc.trailer.set(
+        "ID",
+        vec![
+            Object::string_literal("0123456789abcdef"),
+            Object::string_literal("0123456789abcdef"),
+        ],
+    );
+    let state = lopdf::EncryptionState::try_from(lopdf::EncryptionVersion::V2 {
+        document: &doc,
+        owner_password: "owner",
+        user_password: "",
+        key_length: 128,
+        permissions: lopdf::Permissions::all(),
+    })
+    .expect("an RC4 encryption state");
+    doc.encrypt(&state).expect("encrypt the fixture");
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
+/// Build a one-page text PDF titled `title` that also carries an object
+/// stream inflating to `inflated_bytes`, referenced by nothing.
+///
+/// The page, its font and its information dictionary are plain objects, so
+/// a reader that steps over the object stream reads the document whole. The
+/// extractor's PDF library does exactly that; the metadata reader's newer
+/// one refuses the whole load once a stream passes the inflation limit. That
+/// is the shape of the case where the text arrives and the file's own facts
+/// cannot be read.
+#[must_use]
+pub fn oversized_object_stream_pdf(title: &str, marker: &str, inflated_bytes: usize) -> Vec<u8> {
+    // Written by hand: lopdf's own writer repacks object streams on save,
+    // and this one has to reach the reader exactly as it is.
+    let header = "8 0 ";
+    let mut packed = header.as_bytes().to_vec();
+    packed.extend_from_slice(b"<< /Padding true >>");
+    packed.resize(packed.len() + inflated_bytes, b' ');
+    let mut object_stream = Stream::new(dictionary! {}, packed);
+    object_stream
+        .compress()
+        .expect("compress the object stream");
+
+    let content = format!("BT /F1 12 Tf 50 750 Td ({marker} page 1) Tj ET");
+    let objects: Vec<Vec<u8>> = vec![
+        b"<< /Type /Catalog /Pages 2 0 R >>".to_vec(),
+        b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec(),
+        b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+          /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+            .to_vec(),
+        [
+            format!("<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+            content.into_bytes(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>".to_vec(),
+        format!("<< /Title ({title}) >>").into_bytes(),
+        [
+            format!(
+                "<< /Type /ObjStm /N 1 /First {} /Filter /FlateDecode /Length {} >>\nstream\n",
+                header.len(),
+                object_stream.content.len()
+            )
+            .into_bytes(),
+            object_stream.content,
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+    ];
+
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = Vec::new();
+    for (index, body) in objects.iter().enumerate() {
+        offsets.push(bytes.len());
+        bytes.extend_from_slice(format!("{} 0 obj\n", index + 1).as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref = bytes.len();
+    bytes.extend_from_slice(
+        format!("xref\n0 {}\n0000000000 65535 f \n", objects.len() + 1).as_bytes(),
+    );
+    for offset in offsets {
+        bytes.extend_from_slice(format!("{offset:010} 00000 n \n").as_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "trailer\n<< /Size {} /Root 1 0 R /Info 6 0 R >>\nstartxref\n{xref}\n%%EOF\n",
+            objects.len() + 1
+        )
+        .as_bytes(),
+    );
+    bytes
+}
+
 /// Build a scanned-style PDF: `pages` pages, each a full-page raster with no
 /// text operators at all.
 ///
