@@ -415,6 +415,84 @@ pub(crate) fn font_encoding<'a>(
     result
 }
 
+/// A lopdf load filter that keeps every object stream as a plain stream.
+///
+/// lopdf decodes an object stream while it loads and, in 0.44, drops the
+/// stream and every object in it when that fails; the error goes nowhere.
+/// Renamed, the stream is loaded like any other, still compressed, so the
+/// caller can decode it itself and see why. The filter holds no state
+/// because lopdf may call it from its own worker threads.
+fn keep_object_streams(
+    id: (u32, u16),
+    object: &mut Object,
+) -> Option<((u32, u16), Object)> {
+    if let Ok(stream) = object.as_stream_mut() {
+        if stream.dict.has_type(b"ObjStm") {
+            stream.dict.set("Type", Object::Name(b"HeldObjStm".to_vec()));
+        }
+    }
+    Some((id, object.clone()))
+}
+
+/// Refuse a loaded document that lost objects to an object stream past the
+/// per-stream ceiling.
+///
+/// A cross-reference entry that places an object inside an object stream,
+/// with that object missing from `doc`, means the stream was not decoded.
+/// Only then is the file loaded again with every object stream kept
+/// undecoded, and each stream that lost objects is decoded here under the
+/// same ceiling, so an ordinary load costs one pass over the
+/// cross-reference table. A stream past the ceiling interrupts the run with
+/// [`Interrupt::DecompressionLimit`], as a content stream past it does; one
+/// that fails for another reason is left to lopdf's repair, as before. An
+/// object stream no cross-reference entry points into loses nothing the
+/// document uses and is not reported.
+pub(crate) fn refuse_lost_object_streams(
+    doc: &Document,
+    buf: &[u8],
+    password: Option<&str>,
+) -> Result<(), PdfError> {
+    let containers: std::collections::BTreeSet<u32> = doc
+        .reference_table
+        .entries
+        .iter()
+        .filter_map(|(number, entry)| match entry {
+            lopdf::xref::XrefEntry::Compressed { container, .. }
+                if !doc.objects.contains_key(&(*number, 0)) =>
+            {
+                Some(*container)
+            }
+            _ => None,
+        })
+        .collect();
+    if containers.is_empty() {
+        return Ok(());
+    }
+    let options = lopdf::LoadOptions {
+        filter: Some(keep_object_streams),
+        ..load_options(password)
+    };
+    // The first load succeeded, so this one is only for the streams; if it
+    // fails there is nothing more to learn.
+    let Ok(held) = Document::load_mem_with_options(buf, options) else {
+        return Ok(());
+    };
+    let limit = max_stream_bytes();
+    for container in containers {
+        let Some(Ok(stream)) = held.objects.get(&(container, 0)).map(Object::as_stream) else {
+            continue;
+        };
+        if stream
+            .decompressed_content_with_limit(limit)
+            .is_err_and(|error| is_limit_error(&error))
+        {
+            interrupt(Interrupt::DecompressionLimit);
+            return Err(PdfError::Interrupted(Interrupt::DecompressionLimit));
+        }
+    }
+    Ok(())
+}
+
 /// lopdf load options carrying the per-stream ceiling as
 /// `max_decompressed_size`, which bounds the object and cross-reference
 /// streams lopdf decodes while it loads.
