@@ -30,6 +30,9 @@ pdf-inspector = { path = "vendor/pdf-inspector" }
 # buffer again here. That is what `emit_metadata` costs, and why it is
 # opt-in.
 lopdf = "0.47"
+# The facade the vendored parser logs through; `src/logging.rs` is the
+# backend that writes its records to standard error.
+log = "0.4"
 prost = "0.14.4"
 # `google.protobuf.Value`, which the vendored document schema uses for the
 # `BaseMeta.custom_fields` escape hatch the Document fold writes into.
