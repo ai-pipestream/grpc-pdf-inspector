@@ -455,6 +455,10 @@ fn parse(
                     // The whole-document verdict rides the trailer's
                     // `has_encoding_issues`; this event is not a page.
                     encoding_issues: false,
+                    // The whole-document pipeline renders inside the
+                    // library and does not say which characters are the
+                    // page's own.
+                    literal_offsets: Vec::new(),
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -711,13 +715,18 @@ fn parse(
                     Vec::new()
                 };
 
-                let markdown = pdf_inspector::to_markdown_from_items_with_rects_and_page_count(
-                    page_items,
-                    MarkdownOptions::default(),
-                    &[],
-                    detected.page_count,
-                );
-                let markdown = markdown.trim().to_owned();
+                // Rendered with the page's own `*`, `#`, backtick and `<`
+                // characters told apart from the markup written around
+                // them. The renderer is the only place that knows which is
+                // which, and the fold reads structure out of this string.
+                let rendered =
+                    pdf_inspector::to_marked_markdown_from_items_with_rects_and_page_count(
+                        page_items,
+                        MarkdownOptions::default(),
+                        &[],
+                        detected.page_count,
+                    );
+                let (markdown, literal_offsets) = trimmed(rendered);
                 let dropped = absent_from(content, &markdown);
                 let markdown_bytes = markdown.len() as u64;
                 let reasons = verdicts.get(&page_no);
@@ -750,6 +759,7 @@ fn parse(
                     garble_score: garble_score(&quality, page_no),
                     dropped,
                     encoding_issues,
+                    literal_offsets,
                 })?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -798,6 +808,22 @@ fn parse(
         has_invisible_text,
     }))?;
     Ok(())
+}
+
+/// A rendering with the whitespace around it removed, and the offsets of
+/// its page-text characters moved to match.
+///
+/// None of the characters the offsets name is whitespace, so trimming
+/// removes none of them; only what precedes them changes.
+fn trimmed(rendered: pdf_inspector::MarkedMarkdown) -> (String, Vec<u32>) {
+    let leading = rendered.markdown.len() - rendered.markdown.trim_start().len();
+    let markdown = rendered.markdown.trim().to_owned();
+    let literal_offsets = rendered
+        .literals
+        .into_iter()
+        .filter_map(|offset| u32::try_from(offset.checked_sub(leading)?).ok())
+        .collect();
+    (markdown, literal_offsets)
 }
 
 /// The content runs the rendering left out.

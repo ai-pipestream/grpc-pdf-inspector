@@ -1036,6 +1036,78 @@ pub fn styled_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page PDF whose prose contains the characters markdown uses
+/// for markup, drawn as ordinary text in a regular face.
+///
+/// Nothing on the page is emphasised and nothing but its first line is a
+/// heading. `heading` is one line of 20 pt Helvetica-Bold; each entry of
+/// `paragraphs` is the lines of one paragraph of 11 pt Helvetica, set at a
+/// 14 pt leading with a wide gap before the next paragraph. Both fonts use
+/// WinAnsiEncoding, in which byte 0x60 is the backtick.
+#[must_use]
+pub fn literal_markup_pdf(heading: &str, paragraphs: &[&[&str]]) -> Vec<u8> {
+    let mut doc = Document::with_version("1.5");
+    let pages_id = doc.new_object_id();
+    let regular_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica",
+        "Encoding" => "WinAnsiEncoding",
+    });
+    let bold_id = doc.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "Type1",
+        "BaseFont" => "Helvetica-Bold",
+        "Encoding" => "WinAnsiEncoding",
+    });
+
+    let literal = |text: &str| {
+        text.replace('\\', "\\\\")
+            .replace('(', "\\(")
+            .replace(')', "\\)")
+    };
+    let mut content = format!("BT /F2 20 Tf 72 730 Td ({}) Tj ET\n", literal(heading));
+    let mut y = 690;
+    for paragraph in paragraphs {
+        for line in *paragraph {
+            content.push_str(&format!(
+                "BT /F1 11 Tf 72 {y} Td ({}) Tj ET\n",
+                literal(line)
+            ));
+            y -= 14;
+        }
+        y -= 34;
+    }
+    let content_id = doc.add_object(Stream::new(dictionary! {}, content.into_bytes()));
+
+    let page_id = doc.add_object(dictionary! {
+        "Type" => "Page",
+        "Parent" => pages_id,
+        "MediaBox" => vec![0.into(), 0.into(), 612.into(), 792.into()],
+        "Resources" => dictionary! {
+            "Font" => dictionary! { "F1" => regular_id, "F2" => bold_id },
+        },
+        "Contents" => content_id,
+    });
+    doc.objects.insert(
+        pages_id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Pages",
+            "Kids" => vec![Object::Reference(page_id)],
+            "Count" => 1,
+        }),
+    );
+    let catalog_id = doc.add_object(dictionary! {
+        "Type" => "Catalog",
+        "Pages" => pages_id,
+    });
+    doc.trailer.set("Root", catalog_id);
+
+    let mut bytes = Vec::new();
+    doc.save_to(&mut bytes).expect("serialize fixture");
+    bytes
+}
+
 /// Build a one-page PDF whose figure is drawn as vector art through a
 /// Form XObject, placed between two paragraphs, with a caption under it.
 ///

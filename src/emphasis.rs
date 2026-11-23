@@ -17,12 +17,21 @@
 //! what was printed.
 //!
 //! The renderer never escapes a literal asterisk, so `*2000` in a card
-//! number and `*T*` in a formula look the same to a scanner. What tells
-//! them apart is what an asterisk touches: a marker that opens emphasis
-//! is followed by the text it emphasizes and one that closes it follows
-//! that text, the way the renderer prints them, whereas `*2000` at the
-//! end of a block opens nothing that ever closes. A marker that opens
-//! and never closes, or closes nothing, is a character of the text.
+//! number and `*T*` in a formula look the same to a scanner. It does say
+//! which characters it copied from the page, on
+//! `PageMarkdown.literal_offsets`, and the fold keeps those out of this
+//! scanner's sight ([`Shielded`](crate::literal::Shielded)): on a page
+//! that reports them, every marker met here is one the renderer wrote.
+//!
+//! A page that reports none is scanned by what an asterisk touches, which
+//! is a guess and is kept only for that case (the password fallback's
+//! whole-document event, an event from an older server): a marker that
+//! opens emphasis is followed by the text it emphasizes and one that
+//! closes it follows that text, the way the renderer prints them, whereas
+//! `*2000` at the end of a block opens nothing that ever closes. A marker
+//! that opens and never closes, or closes nothing, is a character of the
+//! text. Two drawn asterisks in one block still pair under that rule,
+//! which is why the offsets exist.
 
 use crate::proto::ai::pipestream::document::v1 as doc;
 

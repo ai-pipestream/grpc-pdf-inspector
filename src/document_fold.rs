@@ -23,7 +23,10 @@
 //!   same table. Emphasis comes off the text onto `InlineSpan.formatting`.
 //!   Beyond that the extraction markdown has already flattened the layout,
 //!   and parsing deeper would pretend to structure the source does not
-//!   have.
+//!   have. What is read as markup is only what the renderer wrote as
+//!   markup: the page event names every `*`, `#`, backtick and `<` the
+//!   page itself drew (`PageMarkdown.literal_offsets`), and those stay in
+//!   the text they belong to ([`Shielded`]).
 //! - **Pages are measured when the file was asked about itself.** `pages`
 //!   carries one `PageItem` per page the `info` event reported, with
 //!   `page_no` and `unit` always set and `size` set from the page's own
@@ -80,6 +83,7 @@
 use std::collections::HashMap;
 
 use crate::emphasis;
+use crate::literal::Shielded;
 use crate::page_runs::{Located, PageRuns, Picture, page_ref};
 use crate::proto::ai::pipestream::document::v1 as doc;
 use crate::proto::v1 as pb;
@@ -569,13 +573,19 @@ impl DocumentFold {
         dropped.sort_by_key(|(index, _)| *index);
         let mut dropped = dropped.into_iter().peekable();
 
-        for block in blocks(&page.markdown) {
+        // The page's own asterisks, hashes, backticks and `<`s are kept
+        // out of the reader's sight, on the renderer's word for which they
+        // are, so that what it reads as markup is markup the renderer
+        // wrote. They go back into each block's text as it is lifted.
+        let shielded = Shielded::new(&page.markdown, &page.literal_offsets);
+
+        for block in blocks(shielded.text()) {
             // The renderer's emphasis markers come off the text here, before
             // anything measures it: the runs are located by the plain
             // characters, so the ranges they report index the text the item
             // carries, and the markers' own report of the emphasis is the
             // fallback for a block no run could be found for.
-            let lifted = block.lift();
+            let lifted = block.lift(&shielded);
             let mut located = self.locate(&lifted.text, page.page_no);
             // The runs' own account of the emphasis, when they were found
             // and they give one, is the richer report: it carries the face
@@ -615,6 +625,7 @@ impl DocumentFold {
                 }
                 Block::Code { language, text } => {
                     self.close_list();
+                    let language = language.map(|language| shielded.restore(language));
                     self.push_code(&text, page.page_no, language.as_deref(), located);
                 }
                 Block::Paragraph(text) => {
@@ -850,13 +861,13 @@ impl DocumentFold {
     /// into it; they go here, which is what `CONTENT_LAYER_FURNITURE` and
     /// the furniture group are for and why both existed empty.
     fn push_furniture(&mut self, text: &str, page_no: u32, bbox: Option<doc::BoundingBox>) {
-        // The stripper reports the line as the renderer printed it,
-        // markers included; a running head set in an underlined face is
-        // still the words it shows.
-        let lifted = emphasis::lift(text);
+        // A furniture line is a chrome run's own text, taken off the page
+        // before the renderer saw it. Nothing in it is markup, so nothing
+        // is lifted off it: a running head that prints `*Draft*` is those
+        // seven characters.
         self.push_off_body(
-            &lifted.text,
-            lifted.spans,
+            text,
+            Vec::new(),
             doc::ContentLayer::Furniture,
             // Which of header, footer or folio this was is not reported by
             // the stripper, so it is not claimed here; where it sat is,
@@ -1429,13 +1440,22 @@ impl Block {
     ///
     /// Code is the exception: inside a fence the renderer prints the
     /// source verbatim, and an asterisk there is an operator.
-    fn lift(&self) -> emphasis::Lifted {
-        match self {
+    ///
+    /// The text comes back with the page's own markup characters in it:
+    /// the block was read from `shielded`, where stand-ins held their
+    /// places, and a stand-in is one character like the one it stands for,
+    /// so the spans' character ranges hold for the restored text.
+    fn lift(&self, shielded: &Shielded) -> emphasis::Lifted {
+        let lifted = match self {
             Self::Code { text, .. } | Self::Table(text) => emphasis::Lifted {
                 text: text.clone(),
                 spans: Vec::new(),
             },
             block => emphasis::lift(block.text()),
+        };
+        emphasis::Lifted {
+            text: shielded.restore(lifted.text),
+            spans: lifted.spans,
         }
     }
 
@@ -2030,29 +2050,150 @@ mod tests {
         );
     }
 
-    /// A running head the stripper reports with the renderer's underline
-    /// tags is the words it shows, in the furniture layer.
+    /// A furniture line is a run's own text and never passed through the
+    /// renderer, so what looks like markup in it was drawn.
     #[test]
-    fn furniture_lines_lift_their_markers_too() {
+    fn furniture_lines_are_page_text_and_keep_every_character() {
         let mut fold = DocumentFold::new();
         fold.consume(&info(1, "", 0.9));
         fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
             page_no: 1,
             markdown: "body text".to_owned(),
-            furniture: vec!["<u>A Running Head</u>".to_owned()],
+            furniture: vec![
+                "*Draft* of <u>A Running Head</u>".to_owned(),
+                "Page 3 of the C# guide".to_owned(),
+            ],
             ..pb::PageMarkdown::default()
         }));
         let document = fold.take();
-        let head = document
+        let lines: Vec<(&str, &[doc::InlineSpan])> = document
             .texts
             .iter()
             .map(text_of)
-            .find(|(text, _)| *text == "A Running Head")
-            .expect("the head is in the document as its words");
+            .filter(|(text, _)| *text != "body text")
+            .collect();
         assert_eq!(
-            formatted(head.1, head.0),
-            vec![("A Running Head".to_owned(), false, false, true)]
+            lines.iter().map(|(text, _)| *text).collect::<Vec<_>>(),
+            ["*Draft* of <u>A Running Head</u>", "Page 3 of the C# guide"]
         );
+        assert!(lines.iter().all(|(_, spans)| spans.is_empty()), "{lines:?}");
+    }
+
+    /// The page event's offsets, for the first occurrence of each needle.
+    fn offsets_of(markdown: &str, needles: &[&str]) -> Vec<u32> {
+        needles
+            .iter()
+            .map(|needle| {
+                u32::try_from(
+                    markdown
+                        .find(needle)
+                        .expect("the needle is in the markdown"),
+                )
+                .expect("a small offset")
+            })
+            .collect()
+    }
+
+    /// A page event that names which of its characters the page drew.
+    fn marked_page(markdown: &str, literal_offsets: Vec<u32>) -> pb::parse_pdf_response::Event {
+        pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
+            page_no: 1,
+            markdown: markdown.to_owned(),
+            literal_offsets,
+            ..pb::PageMarkdown::default()
+        })
+    }
+
+    /// Emphasis the renderer wrote and asterisks the page drew, in one
+    /// block: the first becomes a span and the second stay where they are.
+    #[test]
+    fn drawn_asterisks_beside_real_emphasis_are_told_apart() {
+        let markdown = "The *area* is x*y and the **volume** is z*w here.";
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        fold.consume(&marked_page(markdown, offsets_of(markdown, &["*y", "*w"])));
+        let document = fold.take();
+        let (text, spans) = text_of(&document.texts[0]);
+        assert_eq!(text, "The area is x*y and the volume is z*w here.");
+        assert_eq!(
+            formatted(spans, text),
+            vec![
+                ("area".to_owned(), false, true, false),
+                ("volume".to_owned(), true, false, false),
+            ]
+        );
+    }
+
+    /// Without the offsets the same string is a guess, and the guess pairs
+    /// the two drawn asterisks. This is the loss the offsets close.
+    #[test]
+    fn the_same_block_without_offsets_loses_the_drawn_asterisks() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        fold.consume(&page(1, "The area is x*y and the volume is z*w here."));
+        let document = fold.take();
+        let (text, spans) = text_of(&document.texts[0]);
+        assert_eq!(text, "The area is xy and the volume is zw here.");
+        assert!(!spans.is_empty());
+    }
+
+    /// Line-level markup is read on the same word: a drawn hash does not
+    /// open a heading or close one, a drawn fence opens no code block, and
+    /// a drawn tag formats nothing.
+    #[test]
+    fn drawn_hashes_fences_and_tags_are_text() {
+        let markdown = "## Programming in C#\n\n# of units sold was five.\n\n``` is a fence.\n\n\
+                        Press <u>enter</u> now.\n\n```\nlet a = b<c;\n```\n\nLast words.";
+        let c_sharp = u32::try_from(markdown.find("C#").expect("C#") + 1).expect("small");
+        let mut literal_offsets = vec![c_sharp];
+        literal_offsets.extend(offsets_of(markdown, &["# of units"]));
+        let drawn_fence = markdown.find("``` is").expect("the drawn fence");
+        literal_offsets
+            .extend((drawn_fence..drawn_fence + 3).map(|o| u32::try_from(o).expect("small")));
+        literal_offsets.extend(offsets_of(markdown, &["<u>", "</u>", "<c"]));
+
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 0.9));
+        fold.consume(&marked_page(markdown, literal_offsets));
+        let document = fold.take();
+        assert_sound(&document);
+
+        let read: Vec<(&str, bool)> = document
+            .texts
+            .iter()
+            .map(|item| match item.item.as_ref().expect("a variant") {
+                doc::base_text_item::Item::Code(code) => (code.text.as_str(), true),
+                _ => (text_of(item).0, false),
+            })
+            .collect();
+        assert_eq!(
+            read,
+            [
+                ("Programming in C#", false),
+                ("# of units sold was five.", false),
+                ("``` is a fence.", false),
+                ("Press <u>enter</u> now.", false),
+                ("let a = b<c;", true),
+                ("Last words.", false),
+            ]
+        );
+        assert!(
+            matches!(
+                document.texts[0].item,
+                Some(doc::base_text_item::Item::SectionHeader(_))
+            ),
+            "the renderer's own `##` still makes a heading"
+        );
+        assert!(
+            matches!(
+                document.texts[1].item,
+                Some(doc::base_text_item::Item::Text(_))
+            ),
+            "and the page's `#` does not"
+        );
+        for item in &document.texts[..4] {
+            assert!(text_of(item).1.is_empty(), "{:?}", text_of(item));
+        }
     }
 
     /// The merge contract as a check: every ref dense, at its arena

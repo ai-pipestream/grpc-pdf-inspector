@@ -61,7 +61,9 @@ pub use extractor::{
 };
 pub use markdown::{
     to_markdown, to_markdown_from_items, to_markdown_from_items_with_rects,
-    to_markdown_from_items_with_rects_and_page_count, MarkdownOptions, MarkdownProfile,
+    to_marked_markdown_from_items_with_rects_and_page_count,
+    to_markdown_from_items_with_rects_and_page_count, MarkedMarkdown, MarkdownOptions,
+    MarkdownProfile,
 };
 pub use guard::{Interrupt, ParseGuard};
 pub use process_mode::ProcessMode;
