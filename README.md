@@ -259,7 +259,11 @@ docker run --rm --read-only --cap-drop ALL --security-opt no-new-privileges \
   -p 50067:50067 grpc-pdf-inspector
 ```
 
-Configuration is environment-only:
+Configuration is environment-only. Every number is a plain whole number
+(bytes, seconds or a count, never `512M` or `10m`), and a value that does
+not parse, a zero where zero means nothing, or a value past its ceiling
+stops the server at startup with exit code 2 and the variable named, rather
+than running on a default nobody chose:
 
 | Variable | Default | Meaning |
 |---|---|---|
@@ -269,11 +273,12 @@ Configuration is environment-only:
 | `GRPC_PDF_MAX_CONCURRENT_PARSES` | `8` | Concurrent calls, uploading or parsing; further calls wait, before their upload is read. |
 | `GRPC_PDF_MAX_STREAM_BYTES` | `268435456` (256 MiB) | Largest size any one stream of a document may decompress to. |
 | `GRPC_PDF_MAX_DECOMPRESSED_BYTES` | `4294967296` (4 GiB) | Largest total one read of a document may decompress to. |
-| `GRPC_PDF_MAX_PARSE_SECONDS` | `300` | Longest a call may hold its parse slot, upload included. At most `86400` (a day), or the server refuses to start. |
-| `GRPC_PDF_MAX_UPLOAD_SECONDS` | `60` | Longest a call's upload may take once it holds its slot; it also spends the parse budget. Must be a whole number of seconds from 1 to `86400`, or the server refuses to start. |
+| `GRPC_PDF_MAX_PARSE_SECONDS` | `300` | Longest a call may hold its parse slot, upload included. From 1 to `86400` (a day). |
+| `GRPC_PDF_MAX_UPLOAD_SECONDS` | `60` | Longest a call's upload may take once it holds its slot; it also spends the parse budget. From 1 to `86400`. |
 | `GRPC_PDF_WORKERS` | CPU count | Tokio worker threads. |
-| `GRPC_PDF_WINDOW_BYTES` | `4194304` | HTTP/2 initial window (stream and connection). |
+| `GRPC_PDF_WINDOW_BYTES` | `4194304` | HTTP/2 initial window (stream and connection), at most `2147483647`. |
 | `GRPC_PDF_METRICS_INTERVAL_SECS` | `60` | Seconds between metrics lines; 0 disables. |
+| `GRPC_PDF_LOG` | `warn` | Level of the parser's own diagnostics written to standard error: `off`, `error`, `warn`, `info`, `debug` or `trace`. |
 
 The server also registers `grpc.health.v1.Health` and v1 server reflection
 (with the health descriptor included, so `grpcurl` can probe it):
