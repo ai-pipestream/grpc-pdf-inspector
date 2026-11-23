@@ -41,9 +41,10 @@ const OUTBOUND_BUFFER: usize = 4;
 
 /// How long the parser waits on a full outbound channel before giving up.
 ///
-/// A client that has read nothing for this long has abandoned the call, and
-/// waiting without a bound would pin a blocking-pool thread until the process
-/// restarted.
+/// Waiting without a bound would pin a blocking-pool thread until the process
+/// restarted. A reader that has taken nothing for this long loses the rest of
+/// the document, and is told so: the call ends `ABORTED` rather than with a
+/// clean end of stream that would pass for a complete one.
 const CONSUMER_STALL: Duration = Duration::from_secs(30);
 
 /// How long an admitted call may go without sending any upload bytes.
@@ -174,6 +175,9 @@ pub struct PdfGrpc {
     /// How long an upload may go without a byte; [`UPLOAD_STALL`] unless a
     /// test shortened it.
     upload_stall: Duration,
+    /// How long the parser waits for a reader that is taking nothing;
+    /// [`CONSUMER_STALL`] unless a test shortened it.
+    consumer_stall: Duration,
 }
 
 impl PdfGrpc {
@@ -196,6 +200,7 @@ impl PdfGrpc {
             metrics,
             parse_slots: Arc::new(tokio::sync::Semaphore::new(limits.max_concurrent_parses)),
             upload_stall: UPLOAD_STALL,
+            consumer_stall: CONSUMER_STALL,
         }
     }
 
@@ -207,6 +212,17 @@ impl PdfGrpc {
     #[must_use]
     pub fn with_upload_stall(mut self, stall: Duration) -> Self {
         self.upload_stall = stall;
+        self
+    }
+
+    /// Give up on a reader that takes no event for `stall`, instead of
+    /// [`CONSUMER_STALL`].
+    ///
+    /// Not a deployment setting: it exists so a test can watch a stalled
+    /// reader's call end without waiting half a minute for it.
+    #[must_use]
+    pub fn with_consumer_stall(mut self, stall: Duration) -> Self {
+        self.consumer_stall = stall;
         self
     }
 
@@ -302,8 +318,9 @@ impl pb::pdf_parse_service_server::PdfParseService for PdfGrpc {
         let (tx, rx) = mpsc::channel(OUTBOUND_BUFFER);
         let supervisor = tx.clone();
 
+        let consumer_stall = self.consumer_stall;
         let mut handle = tokio::task::spawn_blocking(move || {
-            let sink = Sink::new(tx, CONSUMER_STALL);
+            let sink = Sink::new(tx, consumer_stall);
             parse::run_guarded(&bytes, &options, &metrics, &sink, &guard)
         });
 
@@ -342,10 +359,16 @@ impl pb::pdf_parse_service_server::PdfParseService for PdfGrpc {
                     Some(Status::internal(panic_detail(join)))
                 }
             };
+            // The slot goes back before the status is sent, not after. The
+            // parser thread has returned and its buffers are gone, so nothing
+            // the slot bounds is still held; and a reader that stalled the
+            // parse is by definition not draining the channel, so a send that
+            // came first would keep the slot for as long as that reader kept
+            // its connection open.
+            drop(permit);
             if let Some(status) = status {
                 let _ = supervisor.send(Err(status)).await;
             }
-            drop(permit);
         });
 
         Ok(Response::new(Batched::new(ReceiverStream::new(rx))))
