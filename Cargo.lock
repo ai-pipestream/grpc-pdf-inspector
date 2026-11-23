@@ -1054,6 +1054,7 @@ name = "pdf-inspector"
 version = "1.17.0"
 dependencies = [
  "env_logger",
+ "flate2",
  "include_dir",
  "log",
  "lopdf 0.44.0",

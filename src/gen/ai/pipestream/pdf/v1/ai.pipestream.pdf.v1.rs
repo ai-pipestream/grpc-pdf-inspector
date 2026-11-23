@@ -1115,7 +1115,8 @@ pub enum OcrReason {
     /// Never sent. Present because proto3 requires a zero value.
     Unspecified = 0,
     /// The page has no extractable text and no image to OCR: blank, or
-    /// content the parser cannot reach.
+    /// content the parser cannot reach. The page's content was read; a page
+    /// whose content could not be read is `OCR_REASON_UNREADABLE_CONTENT`.
     NoText = 1,
     /// The page is a scanned image (a full-page raster) with no usable text
     /// layer.
@@ -1129,6 +1130,14 @@ pub enum OcrReason {
     /// The page's text is drawn as vector outlines (path operators) rather
     /// than real text operators, so there are no characters to extract.
     VectorText = 4,
+    /// Part or all of the page's content could not be read: the object its
+    /// `/Contents` names is missing from the file or is not a stream, or a
+    /// content stream's filter fails on its bytes. The file is damaged at
+    /// this page. Whatever the page's `markdown` holds is what was read
+    /// before the damage, and a renderer may recover no more of the page
+    /// than this did. When it is the reason for every page, no `info` is
+    /// sent at all: the call fails with `INVALID_ARGUMENT`.
+    UnreadableContent = 5,
 }
 impl OcrReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1142,6 +1151,7 @@ impl OcrReason {
             Self::Scanned => "OCR_REASON_SCANNED",
             Self::SuspectedGarbled => "OCR_REASON_SUSPECTED_GARBLED",
             Self::VectorText => "OCR_REASON_VECTOR_TEXT",
+            Self::UnreadableContent => "OCR_REASON_UNREADABLE_CONTENT",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1152,6 +1162,7 @@ impl OcrReason {
             "OCR_REASON_SCANNED" => Some(Self::Scanned),
             "OCR_REASON_SUSPECTED_GARBLED" => Some(Self::SuspectedGarbled),
             "OCR_REASON_VECTOR_TEXT" => Some(Self::VectorText),
+            "OCR_REASON_UNREADABLE_CONTENT" => Some(Self::UnreadableContent),
             _ => None,
         }
     }

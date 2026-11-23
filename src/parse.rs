@@ -1281,6 +1281,7 @@ fn ocr_reason(reason: &str) -> pb::OcrReason {
         pdf_inspector::OCR_REASON_SCANNED => pb::OcrReason::Scanned,
         pdf_inspector::OCR_REASON_SUSPECTED_GARBLED_TEXT => pb::OcrReason::SuspectedGarbled,
         pdf_inspector::OCR_REASON_VECTOR_TEXT => pb::OcrReason::VectorText,
+        pdf_inspector::OCR_REASON_UNREADABLE_CONTENT => pb::OcrReason::UnreadableContent,
         _ => pb::OcrReason::Unspecified,
     }
 }
