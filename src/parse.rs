@@ -396,6 +396,7 @@ fn parse(
     let mut has_encoding_issues = false;
     let mut extraction_ocr_reasons = Vec::new();
     let mut has_invisible_text = false;
+    let mut runs_not_in_markdown = 0u32;
 
     // What happens after `info` depends on the mode and on what detection
     // found. Scanned and image-based documents have no text layer at all, so
@@ -459,6 +460,9 @@ fn parse(
                     // library and does not say which characters are the
                     // page's own.
                     literal_offsets: Vec::new(),
+                    // Nor which runs it read, so there is nothing to count
+                    // its rendering against.
+                    runs_not_in_markdown: 0,
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -697,23 +701,23 @@ fn parse(
                     .iter()
                     .map(|item| item.text.trim().to_owned())
                     .collect();
+                let chrome_runs_count = chrome_runs.len();
                 // What is left is content, and what the rendering does with
-                // it is what `dropped` answers for.
-                let content: Vec<pb::TextSpan> = if events.wanted(options.report_furniture) {
-                    page_items
-                        .iter()
-                        .filter(|item| {
-                            matches!(
-                                item.item_type,
-                                pdf_inspector::types::ItemType::Text
-                                    | pdf_inspector::types::ItemType::FormField
-                            )
-                        })
-                        .map(|item| spans::span(item, frame))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                // it is what `dropped` answers for. It is measured on every
+                // call, because a plain call's renderer strips running
+                // heads and page numbers itself and leaves out runs it could
+                // not place, and the count is all such a call is told.
+                let content: Vec<pb::TextSpan> = page_items
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item.item_type,
+                            pdf_inspector::types::ItemType::Text
+                                | pdf_inspector::types::ItemType::FormField
+                        )
+                    })
+                    .map(|item| spans::span(item, frame))
+                    .collect();
 
                 // Rendered with the page's own `*`, `#`, backtick and `<`
                 // characters told apart from the markup written around
@@ -728,6 +732,17 @@ fn parse(
                     );
                 let (markdown, literal_offsets) = trimmed(rendered);
                 let dropped = absent_from(content, &markdown);
+                let page_runs_not_in_markdown =
+                    u32::try_from(chrome_runs_count + dropped.len()).unwrap_or(u32::MAX);
+                runs_not_in_markdown =
+                    runs_not_in_markdown.saturating_add(page_runs_not_in_markdown);
+                // The runs themselves go out only to a caller that asked
+                // for the report, as before; everyone gets the count.
+                let dropped = if events.wanted(options.report_furniture) {
+                    dropped
+                } else {
+                    Vec::new()
+                };
                 let markdown_bytes = markdown.len() as u64;
                 let reasons = verdicts.get(&page_no);
                 let needs_ocr = reasons.is_some();
@@ -760,6 +775,7 @@ fn parse(
                     dropped,
                     encoding_issues,
                     literal_offsets,
+                    runs_not_in_markdown: page_runs_not_in_markdown,
                 })?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -806,6 +822,7 @@ fn parse(
         processing_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         extraction_ocr_reasons,
         has_invisible_text,
+        runs_not_in_markdown,
     }))?;
     Ok(())
 }
