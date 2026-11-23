@@ -487,7 +487,8 @@ pub struct PageMarkdown {
     /// body content, with the boxes the page drew it at.
     ///
     /// Empty unless `PdfOptions.report_furniture` was set, and empty then too
-    /// for a page whose every run reached the markdown. The markdown renderer
+    /// for a page whose every run reached the markdown. They are counted in
+    /// `runs_not_in_markdown` either way. The markdown renderer
     /// reads a page's columns one after another and does not always emit
     /// every run it read; what it leaves behind is text a reader saw, and it
     /// belongs in the body rather than in `furniture`. A consumer folding
@@ -505,7 +506,9 @@ pub struct PageMarkdown {
     /// been rendered. The pass over the runs that sets the rest of that flag
     /// also convicts its pages, and those already carry `needs_ocr`. An OCR
     /// layer's misreadings never set it, for the same reason they never set
-    /// the document's flag.
+    /// the document's flag. It is also set, with `needs_ocr`, on a page set in
+    /// a font that names its glyphs by raw glyph id with no ToUnicode CMap
+    /// for them, whose rendering may read cleanly all the same.
     ///
     /// With this and `needs_ocr`, a consumer can judge each page's text layer
     /// as the page arrives instead of waiting for the trailer.
@@ -531,6 +534,25 @@ pub struct PageMarkdown {
     /// rendering comes from a pipeline that does not report them.
     #[prost(uint32, repeated, tag="11")]
     pub literal_offsets: ::prost::alloc::vec::Vec<u32>,
+    /// Why the walk of this page left part of its content unread, sorted and
+    /// without repeats. Empty for a page read to the end, which is nearly
+    /// every page. When it is not empty the page's `markdown` is what was
+    /// read before the walk stopped, and may be empty for a page that is not
+    /// blank; `needs_ocr` is set with `OCR_REASON_CONTENT_TRUNCATED`, and the
+    /// trailer carries `PARSE_WARNING_CODE_CONTENT_TRUNCATED`. Always empty on
+    /// the password fallback's whole-document event (`page_no` 0).
+    #[prost(enumeration="WalkTruncation", repeated, tag="12")]
+    pub truncations: ::prost::alloc::vec::Vec<i32>,
+    /// How many text runs this page drew that `markdown` does not carry, on
+    /// every per-page FULL call whatever was asked: chrome the renderer or the
+    /// chrome report took out (running heads, footers, page numbers, margin
+    /// numbering) and runs the renderer left out. With
+    /// `PdfOptions.report_furniture` set they are told apart and returned, on
+    /// `furniture` and `dropped`; without it this count is the only sign of
+    /// them. A run of one or two letters or digits is counted only when it is
+    /// chrome: whether the renderer kept one cannot be told from its letters.
+    #[prost(uint32, tag="13")]
+    pub runs_not_in_markdown: u32,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.
@@ -880,6 +902,26 @@ pub struct ParseStatus {
     /// the runs themselves on `PageMarkdown.invisible`.
     #[prost(bool, tag="7")]
     pub has_invisible_text: bool,
+    /// Why a text-bearing document produced no text, when the whole-document
+    /// pipeline ran: in ANALYZE, and in FULL when a password was supplied.
+    /// TEXT_WITHHELD_UNSPECIFIED when nothing was withheld. A withheld result
+    /// also carries PARSE_WARNING_CODE_TEXT_WITHHELD, and no `page` event.
+    #[prost(enumeration="TextWithheld", tag="8")]
+    pub text_withheld: i32,
+    /// The 1-indexed pages the whole-document pipeline says need OCR, when it
+    /// ran (ANALYZE, and FULL with a password). A superset of the pages in
+    /// `extraction_ocr_reasons`: it also names pages flagged without a
+    /// reason code, such as every page of a document whose text is garbage,
+    /// pages drawn with glyph-id fonts, and every page of a text document
+    /// whose extraction came out too sparse to trust. Empty in per-page FULL,
+    /// where each `page` event carries its own `needs_ocr`.
+    #[prost(uint32, repeated, tag="9")]
+    pub pages_needing_ocr: ::prost::alloc::vec::Vec<u32>,
+    /// The sum of `PageMarkdown.runs_not_in_markdown` over the pages sent: how
+    /// many runs the selected pages drew that their markdown does not carry.
+    /// Zero outside per-page FULL.
+    #[prost(uint32, tag="10")]
+    pub runs_not_in_markdown: u32,
 }
 /// ServerLimits reports the ceilings a server actually enforces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
@@ -1120,7 +1162,10 @@ pub enum OcrReason {
     /// layer.
     Scanned = 2,
     /// The page has a text layer, but it decodes to mojibake (broken font
-    /// encodings), so extraction cannot be trusted.
+    /// encodings), so extraction cannot be trusted. Also sent for a page set
+    /// in a font that names its glyphs by raw glyph id (`/gid00036`) with no
+    /// ToUnicode CMap for those codes: its text may read cleanly, but nothing
+    /// in the file says which characters the glyphs are.
     SuspectedGarbled = 3,
     /// The page's text is drawn as vector outlines (path operators) rather
     /// than real text operators, so there are no characters to extract.
@@ -1133,6 +1178,11 @@ pub enum OcrReason {
     /// than this did. When it is the reason for every page, no `info` is
     /// sent at all: the call fails with `INVALID_ARGUMENT`.
     UnreadableContent = 5,
+    /// The walk of the page stopped before the end of its content; the page's
+    /// `truncations` say why. The text the page event carries is what was
+    /// read before the stop, so a renderer sees more of the page than this
+    /// service did.
+    ContentTruncated = 6,
 }
 impl OcrReason {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1147,6 +1197,7 @@ impl OcrReason {
             Self::SuspectedGarbled => "OCR_REASON_SUSPECTED_GARBLED",
             Self::VectorText => "OCR_REASON_VECTOR_TEXT",
             Self::UnreadableContent => "OCR_REASON_UNREADABLE_CONTENT",
+            Self::ContentTruncated => "OCR_REASON_CONTENT_TRUNCATED",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1158,6 +1209,7 @@ impl OcrReason {
             "OCR_REASON_SUSPECTED_GARBLED" => Some(Self::SuspectedGarbled),
             "OCR_REASON_VECTOR_TEXT" => Some(Self::VectorText),
             "OCR_REASON_UNREADABLE_CONTENT" => Some(Self::UnreadableContent),
+            "OCR_REASON_CONTENT_TRUNCATED" => Some(Self::ContentTruncated),
             _ => None,
         }
     }
@@ -1211,6 +1263,62 @@ impl OcrRecommendationReason {
             "OCR_RECOMMENDATION_REASON_SCAN_OCR_LAYER" => Some(Self::ScanOcrLayer),
             "OCR_RECOMMENDATION_REASON_TEXT_OVER_PAGE_IMAGE" => Some(Self::TextOverPageImage),
             "OCR_RECOMMENDATION_REASON_DENSE_LAYOUT" => Some(Self::DenseLayout),
+            _ => None,
+        }
+    }
+}
+/// WalkTruncation names a limit or a fault that stopped the walk of a page
+/// before the end of its content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum WalkTruncation {
+    /// Never sent. Present because proto3 requires a zero value.
+    Unspecified = 0,
+    /// The page's own content stream, or one Form XObject's, holds more
+    /// operators than the walk decodes (1,000,000). Such a stream is not
+    /// walked at all; for the page's own stream that means no text, no
+    /// images and no forms come from the page.
+    OperatorCap = 1,
+    /// A content stream, the page's own or a form's, stopped parsing at a
+    /// token the parser does not accept (a stray `]`, `)`, `>>`, `{`), with
+    /// operators after it. What came before the stop was walked.
+    UnparsedContent = 2,
+    /// The page's Form XObjects together asked for more than the walk spends
+    /// on one page (10,000 invocations, 1,000,000 operators); the forms past
+    /// that point were not walked.
+    FormBudget = 3,
+    /// Forms nested deeper than the walk follows (five levels below the
+    /// page), or a form that invokes itself; the deeper forms were not walked.
+    FormDepth = 4,
+    /// An XObject the page invokes, form or image, is missing or is not a
+    /// stream, or a form's content is refused outright by the parser; it was
+    /// not walked.
+    XobjectUnreadable = 5,
+}
+impl WalkTruncation {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "WALK_TRUNCATION_UNSPECIFIED",
+            Self::OperatorCap => "WALK_TRUNCATION_OPERATOR_CAP",
+            Self::UnparsedContent => "WALK_TRUNCATION_UNPARSED_CONTENT",
+            Self::FormBudget => "WALK_TRUNCATION_FORM_BUDGET",
+            Self::FormDepth => "WALK_TRUNCATION_FORM_DEPTH",
+            Self::XobjectUnreadable => "WALK_TRUNCATION_XOBJECT_UNREADABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "WALK_TRUNCATION_UNSPECIFIED" => Some(Self::Unspecified),
+            "WALK_TRUNCATION_OPERATOR_CAP" => Some(Self::OperatorCap),
+            "WALK_TRUNCATION_UNPARSED_CONTENT" => Some(Self::UnparsedContent),
+            "WALK_TRUNCATION_FORM_BUDGET" => Some(Self::FormBudget),
+            "WALK_TRUNCATION_FORM_DEPTH" => Some(Self::FormDepth),
+            "WALK_TRUNCATION_XOBJECT_UNREADABLE" => Some(Self::XobjectUnreadable),
             _ => None,
         }
     }
@@ -1497,15 +1605,30 @@ pub enum ParseWarningCode {
     Unspecified = 0,
     /// A password was supplied, so FULL mode used whole-document extraction:
     /// the markdown arrived as one `page` event with `page_no` 0 instead of
-    /// one event per page.
+    /// one event per page, or, when the text was withheld, as no `page` event
+    /// at all (see PARSE_WARNING_CODE_TEXT_WITHHELD).
     PasswordFallback = 1,
-    /// `emit_metadata` was set but the document's dictionaries could not be
-    /// read, so no `metadata` event was sent. The text extraction is
-    /// unaffected: this reports a gap, not a failure.
+    /// `emit_metadata` or `emit_document` was set but the document's
+    /// dictionaries could not be read: no `metadata` event was sent, and the
+    /// `document` event carries no source metadata, outline, attachments, page
+    /// geometry or link targets. The text extraction is unaffected: this
+    /// reports a gap, not a failure.
     MetadataUnavailable = 2,
     /// Some pages listed in `PdfOptions.pages` are past the end of the
     /// document. They were left out; the pages that exist were processed.
     PagesOutOfRange = 3,
+    /// The walk of some pages stopped before the end of their content. Each
+    /// such page event names why in `truncations` and needs OCR; the message
+    /// lists the pages.
+    ContentTruncated = 4,
+    /// The metadata reader panicked on this document. Everything
+    /// PARSE_WARNING_CODE_METADATA_UNAVAILABLE says is missing is missing,
+    /// for a different reason: a bug in the reader rather than a document it
+    /// cannot open. The text extraction is unaffected.
+    MetadataReaderPanicked = 5,
+    /// The whole-document pipeline returned no text for a text-bearing
+    /// document. `ParseStatus.text_withheld` says why.
+    TextWithheld = 6,
     /// A table the markdown printed matched a grid the table detectors found,
     /// but the grid lacks some of its rows. The Document carries the grid as
     /// one TableItem and the rows only the markdown had as a second TableItem
@@ -1523,6 +1646,9 @@ impl ParseWarningCode {
             Self::PasswordFallback => "PARSE_WARNING_CODE_PASSWORD_FALLBACK",
             Self::MetadataUnavailable => "PARSE_WARNING_CODE_METADATA_UNAVAILABLE",
             Self::PagesOutOfRange => "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE",
+            Self::ContentTruncated => "PARSE_WARNING_CODE_CONTENT_TRUNCATED",
+            Self::MetadataReaderPanicked => "PARSE_WARNING_CODE_METADATA_READER_PANICKED",
+            Self::TextWithheld => "PARSE_WARNING_CODE_TEXT_WITHHELD",
             Self::TableRowsOutsideGrid => "PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID",
         }
     }
@@ -1533,7 +1659,58 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_PASSWORD_FALLBACK" => Some(Self::PasswordFallback),
             "PARSE_WARNING_CODE_METADATA_UNAVAILABLE" => Some(Self::MetadataUnavailable),
             "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE" => Some(Self::PagesOutOfRange),
+            "PARSE_WARNING_CODE_CONTENT_TRUNCATED" => Some(Self::ContentTruncated),
+            "PARSE_WARNING_CODE_METADATA_READER_PANICKED" => Some(Self::MetadataReaderPanicked),
+            "PARSE_WARNING_CODE_TEXT_WITHHELD" => Some(Self::TextWithheld),
             "PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID" => Some(Self::TableRowsOutsideGrid),
+            _ => None,
+        }
+    }
+}
+/// TextWithheld says why the whole-document pipeline returned no text for a
+/// document detection classified as having a text layer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TextWithheld {
+    /// Nothing was withheld.
+    Unspecified = 0,
+    /// Extraction failed on a MIXED document. It is not fatal, because a
+    /// mixed document's text layer is partial anyway, but nothing came out.
+    /// The warning's message carries the extraction's own error.
+    ExtractionFailed = 1,
+    /// A MIXED document's text was mostly garbage, so the document was
+    /// reclassified as scanned and its text dropped. `PdfInfo.pdf_type`,
+    /// sent before extraction ran, still says MIXED.
+    ReclassifiedScanned = 2,
+    /// A TEXT_BASED document's text was mostly garbage: its fonts cannot be
+    /// decoded. Every page is in `pages_needing_ocr`.
+    GarbageText = 3,
+    /// Every page draws its text with glyph-id fonts that map to no
+    /// characters, so the text was dropped.
+    AllPagesGidEncoded = 4,
+}
+impl TextWithheld {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TEXT_WITHHELD_UNSPECIFIED",
+            Self::ExtractionFailed => "TEXT_WITHHELD_EXTRACTION_FAILED",
+            Self::ReclassifiedScanned => "TEXT_WITHHELD_RECLASSIFIED_SCANNED",
+            Self::GarbageText => "TEXT_WITHHELD_GARBAGE_TEXT",
+            Self::AllPagesGidEncoded => "TEXT_WITHHELD_ALL_PAGES_GID_ENCODED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TEXT_WITHHELD_UNSPECIFIED" => Some(Self::Unspecified),
+            "TEXT_WITHHELD_EXTRACTION_FAILED" => Some(Self::ExtractionFailed),
+            "TEXT_WITHHELD_RECLASSIFIED_SCANNED" => Some(Self::ReclassifiedScanned),
+            "TEXT_WITHHELD_GARBAGE_TEXT" => Some(Self::GarbageText),
+            "TEXT_WITHHELD_ALL_PAGES_GID_ENCODED" => Some(Self::AllPagesGidEncoded),
             _ => None,
         }
     }

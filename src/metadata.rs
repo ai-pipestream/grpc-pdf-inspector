@@ -46,26 +46,45 @@ const MAX_NODES: usize = 100_000;
 /// No stream is decoded past `max_stream_bytes`: not the object and
 /// cross-reference streams the load decodes, and not the XMP packet.
 ///
-/// Returns `None` when the buffer cannot be loaded at all — which is not a
-/// parse failure, because the text extraction runs off its own reader and
-/// is unaffected. The caller reports the gap as a warning.
-#[must_use]
+/// # Errors
+///
+/// The load's own error when the buffer cannot be opened by this reader.
+/// That is not a parse failure, because the text extraction runs off its
+/// own reader and may well have opened the same bytes; the caller reports
+/// the gap as a warning whenever anything asked for what this returns.
 pub fn read(
     bytes: &[u8],
     password: Option<&str>,
     max_stream_bytes: usize,
-) -> Option<pb::PdfMetadata> {
-    let options = lopdf::LoadOptions {
-        password: password.map(ToOwned::to_owned),
-        // Object and cross-reference streams are decompressed eagerly while
-        // the document loads, so an unbounded limit here is a decompression
-        // bomb waiting for a hostile upload — and hostile uploads are the
-        // normal case for this service.
-        max_decompressed_size: Some(max_stream_bytes),
-        ..lopdf::LoadOptions::default()
+) -> Result<pb::PdfMetadata, lopdf::Error> {
+    let load = |password: Option<&str>| {
+        let options = lopdf::LoadOptions {
+            password: password.map(ToOwned::to_owned),
+            // Object and cross-reference streams are decompressed eagerly
+            // while the document loads, so an unbounded limit here is a
+            // decompression bomb waiting for a hostile upload — and hostile
+            // uploads are the normal case for this service.
+            max_decompressed_size: Some(max_stream_bytes),
+            ..lopdf::LoadOptions::default()
+        };
+        Document::load_mem_with_options(bytes, options)
     };
-    let document = Document::load_mem_with_options(bytes, options).ok()?;
-    Some(Reader::new(&document, max_stream_bytes).read())
+
+    // The library tries the empty password before any other, so a load
+    // with none opens every file that needs none, and says plainly which
+    // files those were. A file that needs a real password comes back still
+    // locked, and only then is the caller's password tried. That is also
+    // the extractor's order: it falls back to the empty password when the
+    // caller's is rejected, so the two readers open the same files.
+    let document = load(None)?;
+    if !document.is_encrypted() {
+        return Ok(Reader::new(&document, max_stream_bytes, true).read());
+    }
+    let Some(password) = password else {
+        return Err(lopdf::Error::InvalidPassword);
+    };
+    let document = load(Some(password))?;
+    Ok(Reader::new(&document, max_stream_bytes, false).read())
 }
 
 /// One loaded document, plus the page lookup every destination needs.
@@ -78,15 +97,19 @@ struct Reader<'a> {
     page_numbers: HashMap<ObjectId, u32>,
     /// Page objects in page order, 1-indexed.
     page_ids: Vec<(u32, ObjectId)>,
+    /// Whether the document opened without the caller's password: true for
+    /// a file that is not encrypted, or whose user password is empty.
+    opened_with_empty_password: bool,
 }
 
 impl<'a> Reader<'a> {
     /// Index a document's pages so destinations can be resolved.
-    fn new(doc: &'a Document, max_stream_bytes: usize) -> Self {
+    fn new(doc: &'a Document, max_stream_bytes: usize, opened_with_empty_password: bool) -> Self {
         let pages = doc.get_pages();
         Self {
             doc,
             max_stream_bytes,
+            opened_with_empty_password,
             page_numbers: pages.iter().map(|(number, id)| (*id, *number)).collect(),
             page_ids: pages.into_iter().collect(),
         }
@@ -224,7 +247,24 @@ impl<'a> Reader<'a> {
     /// decrypted with the empty password, so this describes the file's
     /// declared posture whether or not that posture stopped anything.
     fn encryption(&self) -> pb::EncryptionInfo {
-        let Ok(encrypt) = self.doc.get_encrypted() else {
+        // Decrypting a file takes `/Encrypt` out of its trailer: the library
+        // keeps what it learned from that dictionary as the encryption
+        // state instead. Reading only the trailer reported every encrypted
+        // file that opened as not encrypted at all.
+        let encrypt = match &self.doc.encryption_state {
+            Some(state) => state.encode().ok(),
+            None => self.doc.get_encrypted().ok().cloned(),
+        };
+        let Some(encrypt) = encrypt else {
+            if self.doc.was_encrypted() {
+                // Encrypted, but the parameters cannot be stated. Say what
+                // is known and claim no permission that is not.
+                return pb::EncryptionInfo {
+                    encrypted: true,
+                    opened_with_empty_password: self.opened_with_empty_password,
+                    ..pb::EncryptionInfo::default()
+                };
+            }
             // No `/Encrypt` dictionary is not "permits nothing"; it is a
             // file with no permission bits at all, which permits
             // everything. Reporting the zero value here would read as a
@@ -237,6 +277,7 @@ impl<'a> Reader<'a> {
                 ..pb::EncryptionInfo::default()
             };
         };
+        let encrypt = &encrypt;
         let permissions = encrypt
             .get(b"P")
             .ok()
@@ -258,7 +299,7 @@ impl<'a> Reader<'a> {
             revision: number(encrypt, b"R").unwrap_or(0),
             // A file that omits /Length is using the original 40-bit key.
             key_bits: number(encrypt, b"Length").unwrap_or(40),
-            opened_with_empty_password: !self.doc.is_encrypted(),
+            opened_with_empty_password: self.opened_with_empty_password,
             allows_extraction: permissions.contains(Permissions::COPYABLE),
             allows_printing: permissions.contains(Permissions::PRINTABLE),
         }

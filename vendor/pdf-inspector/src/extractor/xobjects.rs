@@ -6,7 +6,7 @@ use crate::text_utils::{
     push_shown_text,
 };
 use crate::tounicode::FontCMaps;
-use crate::types::{ItemType, PdfForm, TextItem};
+use crate::types::{ItemType, PdfForm, TextItem, WalkTruncation};
 use lopdf::{Document, Encoding, Object, ObjectId};
 use std::collections::HashMap;
 
@@ -38,6 +38,9 @@ pub(crate) struct FormWalkBudget {
     max_invocations: usize,
     max_operations: usize,
     truncated: bool,
+    /// Every reason the page's walk left content unread, the form caps and
+    /// the page's own operator cap alike, in the order first met.
+    truncations: Vec<WalkTruncation>,
 }
 
 impl FormWalkBudget {
@@ -52,12 +55,30 @@ impl FormWalkBudget {
             max_invocations,
             max_operations,
             truncated: false,
+            truncations: Vec::new(),
         }
+    }
+
+    /// Note that the walk left part of the page unread, and why.
+    pub(crate) fn record(&mut self, why: WalkTruncation) {
+        if why == WalkTruncation::FormBudget {
+            self.truncated = true;
+        }
+        if !self.truncations.contains(&why) {
+            self.truncations.push(why);
+        }
+    }
+
+    /// Every reason recorded so far, sorted.
+    pub(crate) fn truncations(&self) -> Vec<WalkTruncation> {
+        let mut truncations = self.truncations.clone();
+        truncations.sort();
+        truncations
     }
 
     fn exhausted(&mut self) -> bool {
         if self.invocations >= self.max_invocations || self.operations >= self.max_operations {
-            self.truncated = true;
+            self.record(WalkTruncation::FormBudget);
             true
         } else {
             false
@@ -77,7 +98,7 @@ impl FormWalkBudget {
     /// stream (up to the operation cap).
     fn charge_operation(&mut self) -> bool {
         if self.operations >= self.max_operations {
-            self.truncated = true;
+            self.record(WalkTruncation::FormBudget);
             return false;
         }
         self.operations += 1;
@@ -92,6 +113,11 @@ impl FormWalkBudget {
 pub(crate) enum XObjectType {
     Image,
     Form(ObjectId),
+    /// An entry of `/XObject` that names no readable stream: a reference to
+    /// an object the file does not hold or one that is not a stream, or a
+    /// value that is not a reference at all. A `Do` of it draws something
+    /// this walk cannot see.
+    Unreadable,
 }
 
 /// Get XObjects from page resources, categorized by type
@@ -163,16 +189,20 @@ fn collect_xobjects_from_dict(
             for (name, value) in xobjects.iter() {
                 let name_str = String::from_utf8_lossy(name).to_string();
 
-                if let Ok(obj_ref) = value.as_reference() {
-                    if let Ok(Object::Stream(stream)) = doc.get_object(obj_ref) {
-                        if let Ok(subtype) = stream.dict.get(b"Subtype") {
-                            if let Ok(subtype_name) = subtype.as_name() {
-                                if subtype_name == b"Image" {
-                                    xobject_types.insert(name_str, XObjectType::Image);
-                                } else if subtype_name == b"Form" {
-                                    xobject_types.insert(name_str, XObjectType::Form(obj_ref));
-                                }
-                            }
+                let Ok(obj_ref) = value.as_reference() else {
+                    xobject_types.insert(name_str, XObjectType::Unreadable);
+                    continue;
+                };
+                let Ok(Object::Stream(stream)) = doc.get_object(obj_ref) else {
+                    xobject_types.insert(name_str, XObjectType::Unreadable);
+                    continue;
+                };
+                if let Ok(subtype) = stream.dict.get(b"Subtype") {
+                    if let Ok(subtype_name) = subtype.as_name() {
+                        if subtype_name == b"Image" {
+                            xobject_types.insert(name_str, XObjectType::Image);
+                        } else if subtype_name == b"Form" {
+                            xobject_types.insert(name_str, XObjectType::Form(obj_ref));
                         }
                     }
                 }
@@ -192,6 +222,9 @@ pub(crate) struct ExtractedText {
     /// Where each Form XObject the walk entered was placed, this form
     /// first and any it invoked after it.
     pub(crate) forms: Vec<PdfForm>,
+    /// Whether this form, or one it invoked, showed text in a font that
+    /// names its glyphs by raw glyph id with no ToUnicode CMap for them.
+    pub(crate) shows_gid_glyphs: bool,
 }
 
 impl ExtractedText {
@@ -201,6 +234,7 @@ impl ExtractedText {
             rtl_visual_candidates: Vec::new(),
             rtl_logical_ops: 0,
             forms: Vec::new(),
+            shows_gid_glyphs: false,
         }
     }
 
@@ -214,7 +248,9 @@ impl ExtractedText {
         rtl_visual_candidates: &mut Vec<usize>,
         rtl_logical_ops: &mut u32,
         forms: &mut Vec<PdfForm>,
+        shows_gid_glyphs: &mut bool,
     ) {
+        *shows_gid_glyphs |= self.shows_gid_glyphs;
         let base = items.len();
         rtl_visual_candidates.extend(self.rtl_visual_candidates.into_iter().map(|c| c + base));
         *rtl_logical_ops += self.rtl_logical_ops;
@@ -323,6 +359,7 @@ fn extract_form_xobject_text_inner(
 
     // Get the Form XObject stream
     let Ok(Object::Stream(stream)) = doc.get_object(form_id) else {
+        budget.record(WalkTruncation::XObjectUnreadable);
         return extracted;
     };
 
@@ -331,20 +368,34 @@ fn extract_form_xobject_text_inner(
 
     // Decode the content stream. Cap before lopdf materializes the operator
     // vector — the walk budget cannot help if decode itself allocates first.
-    let Ok(Some(content)) = super::content_decode::decode_content_bounded(
+    let content = match super::content_decode::decode_content_bounded(
         &content_data,
         super::content_decode::MAX_PAGE_OPERATIONS,
-    ) else {
-        return extracted;
+    ) {
+        Ok(Some(decoded)) => {
+            if decoded.stopped_early {
+                budget.record(WalkTruncation::UnparsedContent);
+            }
+            decoded.content
+        }
+        Ok(None) => {
+            budget.record(WalkTruncation::OperatorCap);
+            return extracted;
+        }
+        Err(_) => {
+            budget.record(WalkTruncation::XObjectUnreadable);
+            return extracted;
+        }
     };
     let items = &mut extracted.items;
     let rtl_visual_candidates = &mut extracted.rtl_visual_candidates;
     let rtl_logical_ops = &mut extracted.rtl_logical_ops;
     let forms = &mut extracted.forms;
+    let shows_gid_glyphs = &mut extracted.shows_gid_glyphs;
 
     // Get fonts from the Form's Resources
     let form_fonts = get_form_fonts(doc, &stream.dict);
-    let (font_encodings, _has_gid_fonts) = build_font_encodings(doc, &form_fonts, font_cmaps);
+    let (font_encodings, gid_fonts) = build_font_encodings(doc, &form_fonts, font_cmaps);
 
     // Build font width info for the form
     let font_widths = build_font_widths(doc, &form_fonts);
@@ -465,7 +516,18 @@ fn extract_form_xobject_text_inner(
     }
     let mut ctm_stack: Vec<GraphicsState> = Vec::new();
 
+    // The item count when a show operator in a gid-named font began; a
+    // run added since is text set in glyph ids.
+    let mut gid_mark: Option<usize> = None;
     for op in &content.operations {
+        if let Some(mark) = gid_mark.take() {
+            *shows_gid_glyphs |= items.len() > mark;
+        }
+        if matches!(op.operator.as_str(), "Tj" | "TJ" | "'" | "\"")
+            && gid_fonts.contains(&current_font)
+        {
+            gid_mark = Some(items.len());
+        }
         if !budget.charge_operation() {
             break;
         }
@@ -508,8 +570,13 @@ fn extract_form_xobject_text_inner(
                     if let Ok(name) = op.operands[0].as_name() {
                         let xobj_name = String::from_utf8_lossy(name).to_string();
                         match form_xobjects.get(&xobj_name) {
+                            Some(XObjectType::Unreadable) => {
+                                budget.record(WalkTruncation::XObjectUnreadable);
+                            }
                             Some(XObjectType::Form(nested_id)) => {
-                                if depth < MAX_FORM_XOBJECT_DEPTH && !budget.exhausted() {
+                                if depth >= MAX_FORM_XOBJECT_DEPTH {
+                                    budget.record(WalkTruncation::FormDepth);
+                                } else if !budget.exhausted() {
                                     extract_form_xobject_text_inner(
                                         doc,
                                         *nested_id,
@@ -532,6 +599,7 @@ fn extract_form_xobject_text_inner(
                                         rtl_visual_candidates,
                                         rtl_logical_ops,
                                         forms,
+                                        shows_gid_glyphs,
                                     );
                                 }
                             }
@@ -1061,6 +1129,9 @@ fn extract_form_xobject_text_inner(
         }
     }
 
+    if let Some(mark) = gid_mark {
+        *shows_gid_glyphs |= items.len() > mark;
+    }
     extracted
 }
 
@@ -1256,6 +1327,7 @@ mod tests {
             items.len()
         );
         assert!(budget.was_truncated());
+        assert_eq!(budget.truncations(), [WalkTruncation::FormBudget]);
     }
 
     #[test]
@@ -1289,6 +1361,7 @@ mod tests {
             "operation budget must stop before the trailing text show"
         );
         assert!(budget.was_truncated());
+        assert_eq!(budget.truncations(), [WalkTruncation::FormBudget]);
     }
 
     #[test]
@@ -1358,6 +1431,7 @@ mod tests {
             "second pass must not get a fresh invocation budget"
         );
         assert!(budget.was_truncated());
+        assert_eq!(budget.truncations(), [WalkTruncation::FormBudget]);
     }
 
     /// Build a document whose page draws *all* of its content through a single

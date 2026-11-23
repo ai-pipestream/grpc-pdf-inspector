@@ -12,20 +12,45 @@ use lopdf::content::Content;
 /// XObject. Matches the previous post-decode skip threshold.
 pub(crate) const MAX_PAGE_OPERATIONS: usize = 1_000_000;
 
+/// A decoded content stream, and whether the parse reached its end.
+pub(crate) struct Decoded {
+    pub(crate) content: Content,
+    /// True when lopdf's parser stopped at a token it does not accept (a
+    /// stray `]`, `)`, `>>` or `{`, say) and operators followed it. lopdf
+    /// returns what it parsed up to there as if it were the whole stream;
+    /// the operators after the stop are not in `content`.
+    pub(crate) stopped_early: bool,
+}
+
 /// Decode `data` unless it contains more than `max_operations` operators.
 ///
 /// Returns `Ok(None)` when the stream exceeds the cap, so callers can skip
 /// extraction without first allocating the operation vector.
+///
+/// The stream is parsed strictly first, which succeeds for a well-formed
+/// stream in one pass. Only when that fails is it parsed again the lenient
+/// way, which keeps everything before the bad token, and the operators are
+/// counted to tell a stream that only trails junk from one that lost
+/// operators after the stop.
 pub(crate) fn decode_content_bounded(
     data: &[u8],
     max_operations: usize,
-) -> Result<Option<Content>, PdfError> {
+) -> Result<Option<Decoded>, PdfError> {
     if content_exceeds_operation_limit(data, max_operations) {
         return Ok(None);
     }
-    Content::decode(data)
-        .map(Some)
-        .map_err(|e| PdfError::Parse(e.to_string()))
+    if let Ok(content) = Content::decode_strict(data) {
+        return Ok(Some(Decoded {
+            content,
+            stopped_early: false,
+        }));
+    }
+    let content = Content::decode(data).map_err(|e| PdfError::Parse(e.to_string()))?;
+    let stopped_early = count_content_operators(data, usize::MAX) > content.operations.len();
+    Ok(Some(Decoded {
+        content,
+        stopped_early,
+    }))
 }
 
 fn content_exceeds_operation_limit(data: &[u8], max_operations: usize) -> bool {
@@ -279,7 +304,8 @@ mod tests {
         }
         assert!(decode_content_bounded(&data, 10).unwrap().is_none());
         let decoded = decode_content_bounded(&data, 50).unwrap().unwrap();
-        assert_eq!(decoded.operations.len(), 40);
+        assert_eq!(decoded.content.operations.len(), 40);
+        assert!(!decoded.stopped_early);
     }
 
     #[test]
@@ -311,6 +337,34 @@ mod tests {
         ];
         for data in samples {
             assert_count_does_not_undercount(data);
+        }
+    }
+
+    #[test]
+    fn a_parse_that_stops_before_operators_says_so() {
+        // lopdf stops at the stray token and hands back what came before
+        // it as if it were the whole stream.
+        for stray in ["]", ")", ">>", "{"] {
+            let data = format!("BT (kept) Tj ET {stray} BT (lost) Tj ET");
+            let decoded = decode_content_bounded(data.as_bytes(), MAX_PAGE_OPERATIONS)
+                .unwrap()
+                .unwrap();
+            assert_eq!(decoded.content.operations.len(), 3, "{stray}");
+            assert!(decoded.stopped_early, "{stray}");
+        }
+    }
+
+    #[test]
+    fn a_whole_stream_or_one_trailing_only_junk_did_not_stop_early() {
+        for data in [
+            &b"BT (kept) Tj ET"[..],
+            b"q 1 0 0 1 0 0 cm BT /F1 12 Tf (a) Tj ET Q % trailing comment\n",
+            b"BT (kept) Tj ET ]",
+        ] {
+            let decoded = decode_content_bounded(data, MAX_PAGE_OPERATIONS)
+                .unwrap()
+                .unwrap();
+            assert!(!decoded.stopped_early, "{}", String::from_utf8_lossy(data));
         }
     }
 
