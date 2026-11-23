@@ -180,6 +180,18 @@ reasons in `docs/capture-deferrals.md`.
   `expand_ligatures`, and a kerning gap next to one does not become a word
   space. The soft hyphen and the byte-order mark are still removed.
 
+- **The gid-glyph verdict follows the fonts a page uses, and reaches the
+  OCR-layer entry point** (`src/extractor/fonts.rs`,
+  `src/extractor/content_stream.rs`, `src/extractor/xobjects.rs`,
+  `src/extractor/mod.rs`, `src/types.rs`). A page was "gid-encoded" when
+  any font in its resources named glyphs `/gidNNNNN` without a ToUnicode
+  CMap for them, so a resource dictionary shared across pages convicted
+  every page, and text such a font drew inside a Form XObject convicted
+  none. `build_font_encodings` now names the fonts, and the walk sets the
+  flag when a show operator in one of them adds a run, on the page or in
+  any form it invokes. `extract_text_with_positions_rects_and_forms_mem_with_ocr_layer`
+  dropped the verdict; `OcrLayerExtraction.gid_encoded_pages` carries it.
+
 ## How the patches are kept auditable
 
 The copy landed in its own commit, with the tree building and testing

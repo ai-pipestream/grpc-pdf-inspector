@@ -505,7 +505,9 @@ pub struct PageMarkdown {
     /// been rendered. The pass over the runs that sets the rest of that flag
     /// also convicts its pages, and those already carry `needs_ocr`. An OCR
     /// layer's misreadings never set it, for the same reason they never set
-    /// the document's flag.
+    /// the document's flag. It is also set, with `needs_ocr`, on a page set in
+    /// a font that names its glyphs by raw glyph id with no ToUnicode CMap
+    /// for them, whose rendering may read cleanly all the same.
     ///
     /// With this and `needs_ocr`, a consumer can judge each page's text layer
     /// as the page arrives instead of waiting for the trailer.
@@ -1119,7 +1121,10 @@ pub enum OcrReason {
     /// layer.
     Scanned = 2,
     /// The page has a text layer, but it decodes to mojibake (broken font
-    /// encodings), so extraction cannot be trusted.
+    /// encodings), so extraction cannot be trusted. Also sent for a page set
+    /// in a font that names its glyphs by raw glyph id (`/gid00036`) with no
+    /// ToUnicode CMap for those codes: its text may read cleanly, but nothing
+    /// in the file says which characters the glyphs are.
     SuspectedGarbled = 3,
     /// The page's text is drawn as vector outlines (path operators) rather
     /// than real text operators, so there are no characters to extract.
