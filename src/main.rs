@@ -15,7 +15,8 @@ use std::time::Duration;
 
 use tonic::transport::Server;
 
-use grpc_pdf_inspector::limits::Limits;
+use grpc_pdf_inspector::limits::{InvalidLimit, Limits, ServerSettings};
+use grpc_pdf_inspector::logging;
 use grpc_pdf_inspector::metrics::{self, Metrics};
 use grpc_pdf_inspector::proto::{self, v1 as pb};
 use grpc_pdf_inspector::service::PdfGrpc;
@@ -33,53 +34,44 @@ const DEFAULT_WINDOW_BYTES: u32 = 4 * 1024 * 1024;
 /// Default seconds between metrics lines. Zero disables them.
 const DEFAULT_METRICS_INTERVAL_SECS: u64 = 60;
 
-/// Read a `usize` environment variable, falling back to `default`.
-fn env_usize(name: &str, default: usize) -> usize {
-    std::env::var(name)
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(default)
-}
-
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Before anything is bound: a limit set to something unusable stops the
     // process here, naming the variable, rather than serving under a limit
     // nobody chose.
-    let limits = Limits::from_env().unwrap_or_else(|error| {
+    let refuse = |error: InvalidLimit| -> ! {
         eprintln!("grpc-pdf-inspector: refusing to start: {error}");
         std::process::exit(2);
-    });
-
-    let workers = env_usize(
-        "GRPC_PDF_WORKERS",
+    };
+    let limits = Limits::from_env().unwrap_or_else(|error| refuse(error));
+    let settings = ServerSettings::from_vars(
+        |name| std::env::var(name).ok(),
         std::thread::available_parallelism().map_or(4, usize::from),
-    );
+        DEFAULT_WINDOW_BYTES,
+        DEFAULT_METRICS_INTERVAL_SECS,
+    )
+    .unwrap_or_else(|error| refuse(error));
+    // The vendored parser reports some per-document trouble only through
+    // the `log` facade; with no logger those reports went nowhere.
+    let level = logging::level_from_vars(|name| std::env::var(name).ok())
+        .unwrap_or_else(|error| refuse(error));
+    logging::install(level)?;
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .worker_threads(workers)
+        .worker_threads(settings.workers)
         .build()?;
 
-    runtime.block_on(serve(limits))
+    runtime.block_on(serve(limits, settings))
 }
 
 /// Bind the listener and serve until a shutdown signal arrives.
-async fn serve(limits: Limits) -> Result<(), Box<dyn std::error::Error>> {
+async fn serve(limits: Limits, settings: ServerSettings) -> Result<(), Box<dyn std::error::Error>> {
     let addr = std::env::var("GRPC_PDF_ADDR")
         .unwrap_or_else(|_| DEFAULT_ADDR.to_owned())
         .parse()?;
 
     let counters: Arc<Metrics> = Metrics::new();
-    metrics::spawn_reporter(
-        &counters,
-        Duration::from_secs(
-            u64::try_from(env_usize(
-                "GRPC_PDF_METRICS_INTERVAL_SECS",
-                usize::try_from(DEFAULT_METRICS_INTERVAL_SECS).unwrap_or(60),
-            ))
-            .unwrap_or(DEFAULT_METRICS_INTERVAL_SECS),
-        ),
-    );
+    metrics::spawn_reporter(&counters, settings.metrics_interval);
 
     let pdf = PdfGrpc::with_metrics(limits, Arc::clone(&counters)).into_service();
 
@@ -105,11 +97,7 @@ async fn serve(limits: Limits) -> Result<(), Box<dyn std::error::Error>> {
         .register_encoded_file_descriptor_set(tonic_health::pb::FILE_DESCRIPTOR_SET)
         .build_v1()?;
 
-    let window = u32::try_from(env_usize(
-        "GRPC_PDF_WINDOW_BYTES",
-        DEFAULT_WINDOW_BYTES as usize,
-    ))
-    .unwrap_or(DEFAULT_WINDOW_BYTES);
+    let window = settings.window_bytes;
 
     eprintln!(
         "grpc-pdf-inspector listening on {addr} (http2 window {window} bytes, \

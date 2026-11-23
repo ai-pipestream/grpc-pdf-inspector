@@ -557,6 +557,7 @@ dependencies = [
 name = "grpc-pdf-inspector"
 version = "0.2.0"
 dependencies = [
+ "log",
  "lopdf 0.47.0",
  "pdf-inspector",
  "prost",
