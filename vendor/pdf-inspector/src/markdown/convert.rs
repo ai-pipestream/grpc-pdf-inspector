@@ -945,16 +945,21 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
         prev_x = line_x;
 
         // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(
+        let text = line.text_with_formatting_marked(
             options.detect_bold,
             options.detect_italic,
             options.detect_underline,
+            options.mark_literals,
         );
         let trimmed = text.trim();
 
         // Also get plain text for pattern matching (list detection, captions, etc.)
         let plain_text = line.text();
         let plain_trimmed = plain_text.trim();
+        // The same text as it is written into the output. Classification
+        // reads the page's characters; the output keeps them apart from
+        // markup when asked to (see `literal`).
+        let emitted_plain = super::literal::shield_if(options.mark_literals, plain_trimmed);
 
         if trimmed.is_empty() {
             continue;
@@ -1113,9 +1118,9 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
             // Plain text for headers (no redundant bold/italic inside `#`),
             // but underline is preserved: `<u>` carries meaning `#` doesn't.
             let heading_text = if options.detect_underline {
-                line.text_with_formatting(false, false, true)
+                line.text_with_formatting_marked(false, false, true, options.mark_literals)
             } else {
-                plain_text.clone()
+                emitted_plain.to_string()
             };
             output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
             if is_toc_marker_heading(plain_trimmed) {
@@ -1214,7 +1219,7 @@ pub(super) fn to_markdown_from_lines_with_tables_and_images(
                 paragraph_in_wrapped_bold_run = false;
             }
             in_code_block = true;
-            pending_code.push_str(plain_trimmed);
+            pending_code.push_str(&emitted_plain);
             pending_code.push('\n');
             continue;
         }
@@ -1366,16 +1371,19 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         prev_y = line.y;
 
         // Get text with optional bold/italic formatting
-        let text = line.text_with_formatting(
+        let text = line.text_with_formatting_marked(
             options.detect_bold,
             options.detect_italic,
             options.detect_underline,
+            options.mark_literals,
         );
         let trimmed = text.trim();
 
         // Also get plain text for pattern matching
         let plain_text = line.text();
         let plain_trimmed = plain_text.trim();
+        // The same text as it is written into the output (see `literal`).
+        let emitted_plain = super::literal::shield_if(options.mark_literals, plain_trimmed);
 
         if trimmed.is_empty() {
             continue;
@@ -1447,9 +1455,9 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
                 let prefix = "#".repeat(header_level);
                 // Plain text for headers, except underline (see above).
                 let heading_text = if options.detect_underline {
-                    line.text_with_formatting(false, false, true)
+                    line.text_with_formatting_marked(false, false, true, options.mark_literals)
                 } else {
-                    plain_text.clone()
+                    emitted_plain.to_string()
                 };
                 output.push_str(&format!("{} {}\n\n", prefix, heading_text.trim()));
                 if is_toc_marker_heading(plain_trimmed) {
@@ -1508,7 +1516,7 @@ pub fn to_markdown_from_lines(lines: Vec<TextLine>, options: MarkdownOptions) ->
         // code literal's style smeared across a wrapped line, not code.
         if options.detect_code && !in_paragraph && super::classify::line_is_monospace(line) {
             // Use plain text for code blocks
-            output.push_str(&format!("```\n{}\n```\n", plain_trimmed));
+            output.push_str(&format!("```\n{}\n```\n", emitted_plain));
             continue;
         }
 

@@ -511,6 +511,26 @@ pub struct PageMarkdown {
     /// as the page arrives instead of waiting for the trailer.
     #[prost(bool, tag="10")]
     pub encoding_issues: bool,
+    /// Where `markdown` holds a character of the page that markdown would
+    /// read as markup: the UTF-8 byte offset of every `*`, `#`, backtick and
+    /// `<` that the page drew, in ascending order. Every other one of those
+    /// characters in `markdown` was written by the renderer: `**` and `*`
+    /// around bold and italic runs, `<u>` and `<s>` around underlined and
+    /// struck ones, `#` in front of a heading, a fence around code.
+    ///
+    /// The renderer copies page text into `markdown` without escaping it, so
+    /// the string alone cannot say whether the asterisks in `x*y and z*w`
+    /// were drawn or open and close an italic run, or whether `# of units`
+    /// is a heading. The renderer knows, and this is its answer. A consumer
+    /// that renders `markdown` escapes the characters at these offsets; one
+    /// that reads structure out of it, as the Document fold does, never takes
+    /// them for markup.
+    ///
+    /// Empty for a page that drew none of those characters, and always empty
+    /// on the password fallback's whole-document event (`page_no` 0), whose
+    /// rendering comes from a pipeline that does not report them.
+    #[prost(uint32, repeated, tag="11")]
+    pub literal_offsets: ::prost::alloc::vec::Vec<u32>,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.
