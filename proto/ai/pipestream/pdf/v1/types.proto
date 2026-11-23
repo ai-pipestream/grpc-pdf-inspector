@@ -711,6 +711,16 @@ message PageMarkdown {
   // trailer carries `PARSE_WARNING_CODE_CONTENT_TRUNCATED`. Always empty on
   // the password fallback's whole-document event (`page_no` 0).
   repeated WalkTruncation truncations = 12;
+
+  // Text runs and images on this page drawn wholly outside the visible
+  // page box (the crop box, cut to the media box), which the walk leaves
+  // out: no reader sees them, so they are in neither `markdown` nor any
+  // other field, but the page carries them. A wrong or deliberately small
+  // crop box, the facing page of an imposed spread and a producer's tag
+  // below the sheet all land here. A run that continues an on-box line is
+  // kept and not counted, and a scan's adopted OCR layer is never cut.
+  // Always 0 on the password fallback's whole-document event (`page_no` 0).
+  uint32 runs_off_page = 14;
 }
 
 // WalkTruncation names a limit or a fault that stopped the walk of a page
@@ -1289,6 +1299,12 @@ message ParseStatus {
   // about is the thing this field exists to prevent. Set the option to see
   // the runs themselves on `PageMarkdown.invisible`.
   bool has_invisible_text = 7;
+
+  // `PageMarkdown.runs_off_page` summed over the extracted pages: text
+  // runs and images drawn outside the visible box, which no page's
+  // markdown carries. Reported in FULL for text-bearing documents; 0 on
+  // the password fallback, whose pipeline does not report its walk.
+  uint32 runs_off_page = 11;
 }
 
 // ServerLimits reports the ceilings a server actually enforces.

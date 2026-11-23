@@ -149,6 +149,12 @@ pub struct OcrLayerExtraction {
     /// reason it stopped, sorted and without repeats. The runs of such a
     /// page are what was read before it stopped, and may be none at all.
     pub truncated_pages: std::collections::BTreeMap<u32, Vec<WalkTruncation>>,
+    /// 1-indexed pages with text runs or images drawn wholly outside the
+    /// visible page box, each with how many the walk dropped for it. No
+    /// reader sees them and they are not in `extraction`, but the page
+    /// carries them: a wrong or deliberately small crop box, the facing
+    /// page of an imposed spread, a tag below the sheet.
+    pub off_page_runs: std::collections::BTreeMap<u32, u32>,
 }
 
 /// Why the walk of a page left part of its content unread.

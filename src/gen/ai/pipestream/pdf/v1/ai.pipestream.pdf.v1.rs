@@ -540,6 +540,16 @@ pub struct PageMarkdown {
     /// the password fallback's whole-document event (`page_no` 0).
     #[prost(enumeration="WalkTruncation", repeated, tag="12")]
     pub truncations: ::prost::alloc::vec::Vec<i32>,
+    /// Text runs and images on this page drawn wholly outside the visible
+    /// page box (the crop box, cut to the media box), which the walk leaves
+    /// out: no reader sees them, so they are in neither `markdown` nor any
+    /// other field, but the page carries them. A wrong or deliberately small
+    /// crop box, the facing page of an imposed spread and a producer's tag
+    /// below the sheet all land here. A run that continues an on-box line is
+    /// kept and not counted, and a scan's adopted OCR layer is never cut.
+    /// Always 0 on the password fallback's whole-document event (`page_no` 0).
+    #[prost(uint32, tag="14")]
+    pub runs_off_page: u32,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.
@@ -889,6 +899,12 @@ pub struct ParseStatus {
     /// the runs themselves on `PageMarkdown.invisible`.
     #[prost(bool, tag="7")]
     pub has_invisible_text: bool,
+    /// `PageMarkdown.runs_off_page` summed over the extracted pages: text
+    /// runs and images drawn outside the visible box, which no page's
+    /// markdown carries. Reported in FULL for text-bearing documents; 0 on
+    /// the password fallback, whose pipeline does not report its walk.
+    #[prost(uint32, tag="11")]
+    pub runs_off_page: u32,
 }
 /// ServerLimits reports the ceilings a server actually enforces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]

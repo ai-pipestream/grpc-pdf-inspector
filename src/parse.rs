@@ -396,6 +396,7 @@ fn parse(
     let mut has_encoding_issues = false;
     let mut extraction_ocr_reasons = Vec::new();
     let mut has_invisible_text = false;
+    let mut runs_off_page = 0u32;
 
     // What happens after `info` depends on the mode and on what detection
     // found. Scanned and image-based documents have no text layer at all, so
@@ -461,6 +462,7 @@ fn parse(
                     literal_offsets: Vec::new(),
                     // The whole-document API does not report its walk.
                     truncations: Vec::new(),
+                    runs_off_page: 0,
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -497,6 +499,7 @@ fn parse(
                 downward_pages,
                 page_boxes,
                 truncated_pages,
+                off_page_runs,
             } = guarded(guard, || {
                 pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
                     bytes,
@@ -521,6 +524,9 @@ fn parse(
             // out, and the OCR layers it adopted as a scan's text. A text
             // layer nobody is told about is what this reports.
             has_invisible_text = skipped_invisible || !ocr_layer_pages.is_empty();
+            // And the runs no reader sees for lying outside the visible
+            // box, which the walk left out of `items`.
+            runs_off_page = off_page_runs.values().sum();
 
             // The text-quality verdicts, from the runs this call already
             // holds rather than from a second read of the file.
@@ -794,6 +800,7 @@ fn parse(
                         .get(&page_no)
                         .map(|why| why.iter().map(|why| walk_truncation(*why).into()).collect())
                         .unwrap_or_default(),
+                    runs_off_page: off_page_runs.get(&page_no).copied().unwrap_or(0),
                 })?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -840,6 +847,7 @@ fn parse(
         processing_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         extraction_ocr_reasons,
         has_invisible_text,
+        runs_off_page,
     }))?;
     Ok(())
 }

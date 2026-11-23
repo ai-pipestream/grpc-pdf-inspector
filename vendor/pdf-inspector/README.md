@@ -159,6 +159,9 @@ reasons in `docs/capture-deferrals.md`.
   rendered. A run with no hull is never dropped, nor is one continuing an
   on-page line pen to pen on the same baseline. A page whose runs are an
   adopted OCR layer is left alone.
+  Every text run and image either clip drops is counted per page on
+  `OcrLayerExtraction.off_page_runs`, so a caller can say the page carried
+  more than came back; it used to be a debug log.
 - **Horizontal scaling is applied** (`src/extractor/content_stream.rs`,
   `src/extractor/xobjects.rs`). `Tz` was never read, so a run set at 50 Tz
   advanced twice as far as drawn and every TJ offset after it landed twice
