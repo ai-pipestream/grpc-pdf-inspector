@@ -185,6 +185,17 @@ reasons in `docs/capture-deferrals.md`.
   verdict, so a text page anywhere makes the document `Mixed`.
   `PdfProcessResult` carries detection's `pages_sampled` and
   `pages_with_text`.
+- **An object stream past the limit is refused, not skipped**
+  (`src/guard.rs`, `src/lib.rs`). lopdf 0.44 steps over an object stream
+  that would inflate past `max_decompressed_size` and drops every object
+  packed in it, with no error, while a content stream past the same
+  ceiling interrupts the run. After a load, a cross-reference entry that
+  places an object in an object stream with that object missing sends the
+  file through a second load that keeps object streams undecoded; a stream
+  that lost objects and decodes past the ceiling then fails the load with
+  `Interrupt::DecompressionLimit`. One that fails to decode for another
+  reason is left to lopdf's repair, and one no entry points into loses
+  nothing and is not reported.
 - **Decoding is bounded** (`src/guard.rs`, and every decoding call site).
   Every stream the crate decodes goes through the guard module, which holds
   it to a per-stream ceiling and a per-run budget, loads documents with the

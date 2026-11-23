@@ -188,6 +188,97 @@ pub fn oversized_object_stream_pdf(title: &str, marker: &str, inflated_bytes: us
     bytes
 }
 
+/// Build a one-page text PDF whose font lives in an object stream that
+/// inflates to `inflated_bytes`, indexed by a cross-reference stream.
+///
+/// Unlike [`oversized_object_stream_pdf`], the object stream holds an
+/// object the page needs: the cross-reference stream says object 5, the
+/// page's font, is packed inside it. A reader that steps over an object
+/// stream past its inflation limit loses the font without a word.
+#[must_use]
+pub fn packed_font_pdf(marker: &str, inflated_bytes: usize) -> Vec<u8> {
+    let header = "5 0 ";
+    let mut packed = header.as_bytes().to_vec();
+    packed.extend_from_slice(b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>");
+    packed.resize(packed.len() + inflated_bytes, b' ');
+    let mut object_stream = Stream::new(dictionary! {}, packed);
+    object_stream
+        .compress()
+        .expect("compress the object stream");
+
+    let content = format!("BT /F1 12 Tf 50 750 Td ({marker} page 1) Tj ET");
+    // Objects 1 to 4 and 6 are plain; 5 is packed in 6; 7 is the
+    // cross-reference stream, written after them.
+    let plain: Vec<(u32, Vec<u8>)> = vec![
+        (1, b"<< /Type /Catalog /Pages 2 0 R >>".to_vec()),
+        (2, b"<< /Type /Pages /Kids [3 0 R] /Count 1 >>".to_vec()),
+        (
+            3,
+            b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] \
+              /Resources << /Font << /F1 5 0 R >> >> /Contents 4 0 R >>"
+                .to_vec(),
+        ),
+        (
+            4,
+            [
+                format!("<< /Length {} >>\nstream\n", content.len()).into_bytes(),
+                content.into_bytes(),
+                b"\nendstream".to_vec(),
+            ]
+            .concat(),
+        ),
+        (
+            6,
+            [
+                format!(
+                    "<< /Type /ObjStm /N 1 /First {} /Filter /FlateDecode /Length {} >>\nstream\n",
+                    header.len(),
+                    object_stream.content.len()
+                )
+                .into_bytes(),
+                object_stream.content,
+                b"\nendstream".to_vec(),
+            ]
+            .concat(),
+        ),
+    ];
+
+    let mut bytes = b"%PDF-1.5\n".to_vec();
+    let mut offsets = std::collections::BTreeMap::new();
+    for (number, body) in &plain {
+        offsets.insert(*number, bytes.len());
+        bytes.extend_from_slice(format!("{number} 0 obj\n").as_bytes());
+        bytes.extend_from_slice(body);
+        bytes.extend_from_slice(b"\nendobj\n");
+    }
+    let xref_offset = bytes.len();
+    offsets.insert(7, xref_offset);
+
+    // /W [1 4 2]: type, then offset or container, then generation or index.
+    let mut rows = Vec::new();
+    for number in 0..=7u32 {
+        let (kind, second, third): (u8, u32, u16) = match number {
+            0 => (0, 0, 65535),
+            5 => (2, 6, 0),
+            _ => (1, u32::try_from(offsets[&number]).expect("small file"), 0),
+        };
+        rows.push(kind);
+        rows.extend_from_slice(&second.to_be_bytes());
+        rows.extend_from_slice(&third.to_be_bytes());
+    }
+    bytes.extend_from_slice(
+        format!(
+            "7 0 obj\n<< /Type /XRef /Size 8 /W [1 4 2] /Root 1 0 R /Length {} >>\nstream\n",
+            rows.len()
+        )
+        .as_bytes(),
+    );
+    bytes.extend_from_slice(&rows);
+    bytes.extend_from_slice(b"\nendstream\nendobj\n");
+    bytes.extend_from_slice(format!("startxref\n{xref_offset}\n%%EOF\n").as_bytes());
+    bytes
+}
+
 /// Build a scanned-style PDF: `pages` pages, each a full-page raster with no
 /// text operators at all.
 ///

@@ -3977,6 +3977,7 @@ pub(crate) fn load_document_from_mem_with_password(
                 match load_document_bytes(&repaired, password) {
                     Ok(doc) => {
                         log::debug!("loaded PDF after repairing malformed container bytes");
+                        guard::refuse_lost_object_streams(&doc, &repaired, password)?;
                         let page_count = doc.get_pages().len() as u32;
                         return Ok((doc, page_count));
                     }
@@ -3990,6 +3991,9 @@ pub(crate) fn load_document_from_mem_with_password(
             return Err(first_err.into());
         }
     };
+    // lopdf steps over an object stream past the inflation limit and loses
+    // every object packed in it without an error; that is refused here.
+    guard::refuse_lost_object_streams(&doc, buf, password)?;
     let page_count = doc.get_pages().len() as u32;
     Ok((doc, page_count))
 }
