@@ -487,7 +487,8 @@ pub struct PageMarkdown {
     /// body content, with the boxes the page drew it at.
     ///
     /// Empty unless `PdfOptions.report_furniture` was set, and empty then too
-    /// for a page whose every run reached the markdown. The markdown renderer
+    /// for a page whose every run reached the markdown. They are counted in
+    /// `runs_not_in_markdown` either way. The markdown renderer
     /// reads a page's columns one after another and does not always emit
     /// every run it read; what it leaves behind is text a reader saw, and it
     /// belongs in the body rather than in `furniture`. A consumer folding
@@ -542,6 +543,16 @@ pub struct PageMarkdown {
     /// the password fallback's whole-document event (`page_no` 0).
     #[prost(enumeration="WalkTruncation", repeated, tag="12")]
     pub truncations: ::prost::alloc::vec::Vec<i32>,
+    /// How many text runs this page drew that `markdown` does not carry, on
+    /// every per-page FULL call whatever was asked: chrome the renderer or the
+    /// chrome report took out (running heads, footers, page numbers, margin
+    /// numbering) and runs the renderer left out. With
+    /// `PdfOptions.report_furniture` set they are told apart and returned, on
+    /// `furniture` and `dropped`; without it this count is the only sign of
+    /// them. A run of one or two letters or digits is counted only when it is
+    /// chrome: whether the renderer kept one cannot be told from its letters.
+    #[prost(uint32, tag="13")]
+    pub runs_not_in_markdown: u32,
 }
 /// StructureElement is one marked-content region and the role its author
 /// gave it.
@@ -906,6 +917,11 @@ pub struct ParseStatus {
     /// where each `page` event carries its own `needs_ocr`.
     #[prost(uint32, repeated, tag="9")]
     pub pages_needing_ocr: ::prost::alloc::vec::Vec<u32>,
+    /// The sum of `PageMarkdown.runs_not_in_markdown` over the pages sent: how
+    /// many runs the selected pages drew that their markdown does not carry.
+    /// Zero outside per-page FULL.
+    #[prost(uint32, tag="10")]
+    pub runs_not_in_markdown: u32,
 }
 /// ServerLimits reports the ceilings a server actually enforces.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
