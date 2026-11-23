@@ -760,6 +760,16 @@ fn ruled_table_page(with_borderless: bool) -> Vec<u8> {
 /// by default and used to strip silently.
 #[must_use]
 pub fn furniture_pdf(pages: u32, head: &str) -> Vec<u8> {
+    furniture_pdf_with(pages, head, None)
+}
+
+/// [`furniture_pdf`], with one more line of body text, `line.1`, drawn in a
+/// larger size above the paragraph of page `line.0`.
+///
+/// The line is the page's own content wherever its letters happen to match
+/// the running head's.
+#[must_use]
+pub fn furniture_pdf_with(pages: u32, head: &str, line: Option<(u32, &str)>) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
     let pages_id = doc.new_object_id();
     let font_id = doc.add_object(dictionary! {
@@ -772,6 +782,9 @@ pub fn furniture_pdf(pages: u32, head: &str) -> Vec<u8> {
     for page in 1..=pages {
         let mut content = String::new();
         content.push_str(&format!("BT /F1 9 Tf 72 760 Td ({head}) Tj ET\n"));
+        if let Some((_, text)) = line.filter(|(on, _)| *on == page) {
+            content.push_str(&format!("BT /F1 16 Tf 72 725 Td ({text}) Tj ET\n"));
+        }
         for line in 0..8 {
             let y = 700 - 16 * line;
             content.push_str(&format!(

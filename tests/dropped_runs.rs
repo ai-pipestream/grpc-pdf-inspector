@@ -248,26 +248,38 @@ async fn a_dropped_run_with_no_runs_to_place_it_among_is_still_body() {
 
 #[tokio::test]
 async fn an_underlined_running_head_is_chrome_once_and_not_body_as_well() {
-    // The renderer spells a run it considers underlined `<u>text</u>`, and
-    // those tags carry letters. Comparing the rendered block to the chrome
-    // report on letters alone therefore missed the match, and a head the
-    // report had already filed as furniture was folded into the body as
-    // well. On a review paper that is every page.
-    let mut fold = DocumentFold::new();
-    fold.consume(&info(1));
-    fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
-        page_no: 1,
-        markdown: "<u>Under review as a conference paper</u>\n\nthe body of the page\n".to_owned(),
-        furniture: vec!["Under review as a conference paper".to_owned()],
-        ..pb::PageMarkdown::default()
-    }));
-    let document = fold.take();
+    // The renderer spells a run it considers underlined `<u>text</u>`. The
+    // fold once kept a head out of the body by matching the rendering to
+    // the chrome report on letters, and the tags' letters broke the match.
+    // The head is now taken out of the page before the page is rendered,
+    // so there is nothing to match: it is furniture once per page and
+    // never body.
+    const HEAD: &str = "Under review as a conference paper";
+    let events = common::start()
+        .await
+        .parse(
+            &common::review_paper_pdf(3, HEAD),
+            pb::PdfOptions {
+                emit_document: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the fixture should parse");
+    let document = common::documents(&events)
+        .pop()
+        .expect("the document event");
 
+    let placed = common::placed(&document);
+    let heads: Vec<i32> = placed
+        .iter()
+        .filter(|item| item.text.contains(HEAD))
+        .map(|item| item.layer)
+        .collect();
     assert_eq!(
-        body_texts(&document),
-        ["the body of the page"],
-        "the head is chrome, so it is not body as well"
+        heads,
+        [doc::ContentLayer::Furniture as i32; 3],
+        "the head is chrome on each page, once, and never body"
     );
-    assert_eq!(document.texts.len(), 2, "one item for the head, not two");
     common::assert_layers_and_parents_agree(&document);
 }
