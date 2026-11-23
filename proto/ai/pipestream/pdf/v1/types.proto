@@ -1157,6 +1157,12 @@ enum ParseWarningCode {
   // Some pages listed in `PdfOptions.pages` are past the end of the
   // document. They were left out; the pages that exist were processed.
   PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE = 3;
+
+  // A table the markdown printed matched a grid the table detectors found,
+  // but the grid lacks some of its rows. The Document carries the grid as
+  // one TableItem and the rows only the markdown had as a second TableItem
+  // right after it, with no cell boxes. The message names the pages.
+  PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID = 7;
 }
 
 // ParseWarning is one non-fatal observation, carried on ParseStatus.

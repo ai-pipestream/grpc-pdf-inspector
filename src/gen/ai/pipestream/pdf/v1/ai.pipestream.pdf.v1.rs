@@ -1495,6 +1495,11 @@ pub enum ParseWarningCode {
     /// Some pages listed in `PdfOptions.pages` are past the end of the
     /// document. They were left out; the pages that exist were processed.
     PagesOutOfRange = 3,
+    /// A table the markdown printed matched a grid the table detectors found,
+    /// but the grid lacks some of its rows. The Document carries the grid as
+    /// one TableItem and the rows only the markdown had as a second TableItem
+    /// right after it, with no cell boxes. The message names the pages.
+    TableRowsOutsideGrid = 7,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1507,6 +1512,7 @@ impl ParseWarningCode {
             Self::PasswordFallback => "PARSE_WARNING_CODE_PASSWORD_FALLBACK",
             Self::MetadataUnavailable => "PARSE_WARNING_CODE_METADATA_UNAVAILABLE",
             Self::PagesOutOfRange => "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE",
+            Self::TableRowsOutsideGrid => "PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1516,6 +1522,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_PASSWORD_FALLBACK" => Some(Self::PasswordFallback),
             "PARSE_WARNING_CODE_METADATA_UNAVAILABLE" => Some(Self::MetadataUnavailable),
             "PARSE_WARNING_CODE_PAGES_OUT_OF_RANGE" => Some(Self::PagesOutOfRange),
+            "PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID" => Some(Self::TableRowsOutsideGrid),
             _ => None,
         }
     }
