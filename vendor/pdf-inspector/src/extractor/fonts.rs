@@ -740,8 +740,10 @@ pub(crate) fn get_operand_bytes(obj: &Object) -> Option<&[u8]> {
 }
 
 /// Build encoding maps for all fonts on a page.
-/// Returns `(encodings, has_gid_fonts)` where `has_gid_fonts` is true when
-/// any font uses raw glyph ID names (gidNNNNN) that can't be decoded.
+/// Returns `(encodings, gid_fonts)` where `gid_fonts` names the resources
+/// (`F1`) of the fonts that use raw glyph ID names (gidNNNNN) that can't be
+/// decoded. Whether a page shows text in one of them is the walk's to say:
+/// a font listed in the resources and never used decodes nothing.
 /// Gid names whose codes the font's own ToUnicode CMap maps are decodable
 /// and do not set the flag (LibreOffice subsets write /gidNNNN Differences
 /// names alongside a complete ToUnicode CMap).
@@ -749,9 +751,9 @@ pub(crate) fn build_font_encodings(
     doc: &Document,
     fonts: &std::collections::BTreeMap<Vec<u8>, &lopdf::Dictionary>,
     cmaps: &FontCMaps,
-) -> (PageFontEncodings, bool) {
+) -> (PageFontEncodings, std::collections::HashSet<String>) {
     let mut encodings = PageFontEncodings::new();
-    let mut has_gid_fonts = false;
+    let mut gid_fonts = std::collections::HashSet::new();
 
     for (font_name, font_dict) in fonts {
         let resource_name = String::from_utf8_lossy(font_name).to_string();
@@ -760,7 +762,7 @@ pub(crate) fn build_font_encodings(
             if !result.gid_codes.is_empty()
                 && !tounicode_maps_codes(font_dict, cmaps, &result.gid_codes)
             {
-                has_gid_fonts = true;
+                gid_fonts.insert(resource_name.clone());
             }
             if !result.map.is_empty() {
                 encodings.insert(resource_name, result.map);
@@ -768,7 +770,7 @@ pub(crate) fn build_font_encodings(
         }
     }
 
-    (encodings, has_gid_fonts)
+    (encodings, gid_fonts)
 }
 
 /// True when the font's ToUnicode CMap maps the gid-named character codes,
@@ -2379,8 +2381,8 @@ end",
         let (doc, page_id) = gid_font_doc(bfchar);
         let cmaps = FontCMaps::from_doc(&doc);
         let fonts = doc.get_page_fonts(page_id).unwrap();
-        let (_, has_gid_fonts) = build_font_encodings(&doc, &fonts, &cmaps);
-        has_gid_fonts
+        let (_, gid_fonts) = build_font_encodings(&doc, &fonts, &cmaps);
+        !gid_fonts.is_empty()
     }
 
     #[test]

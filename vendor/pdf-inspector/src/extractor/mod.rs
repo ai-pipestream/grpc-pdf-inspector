@@ -237,7 +237,7 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, ocr_layer_pages, turned_pages, truncated_pages, off_page_runs) =
+    let (extraction, forms, _thresholds, gid_pages, skipped_invisible, ocr_layer_pages, turned_pages, truncated_pages, off_page_runs) =
         extract_positioned_text_impl_reporting_invisible(
             &doc,
             &font_cmaps,
@@ -264,6 +264,7 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
             .map(|(page, _)| *page)
             .collect(),
         page_boxes,
+        gid_encoded_pages: gid_pages.into_iter().collect(),
         truncated_pages,
         off_page_runs,
     })

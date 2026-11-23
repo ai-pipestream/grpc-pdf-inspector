@@ -335,6 +335,8 @@ fn parse(
         pdf_type: pdf_type(detected.pdf_type).into(),
         confidence: detected.confidence,
         page_count: detected.page_count,
+        pages_sampled: detected.pages_sampled,
+        pages_with_text: detected.pages_with_text,
         title: detected.title.unwrap_or_default(),
         pages_needing_ocr: detected.pages_needing_ocr,
         ocr_reasons: detected
@@ -371,23 +373,40 @@ fn parse(
         metrics.parser_pass();
         let metadata = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::metadata::read(bytes, password, guard.max_stream_bytes)
-        }))
-        .ok()
-        .flatten();
+        }));
+        // Whoever asked, the event or the fold, a read that failed is
+        // reported. The fold used to go out without its source metadata,
+        // outline, attachments, page geometry and link targets, and say
+        // nothing.
+        let asked_by = match (options.emit_metadata, options.emit_document) {
+            (true, true) => "no metadata event was sent and the document carries none of it",
+            (true, false) => "no metadata event was sent",
+            (false, _) => {
+                "the document carries no source metadata, outline, attachments, page \
+                 geometry or link targets"
+            }
+        };
         match metadata {
-            Some(metadata) => {
+            Ok(Ok(metadata)) => {
                 events.route(
                     pb::parse_pdf_response::Event::Metadata(metadata),
                     options.emit_metadata,
                 )?;
             }
-            None if options.emit_metadata => warnings.push(pb::ParseWarning {
+            Ok(Err(error)) => warnings.push(pb::ParseWarning {
                 code: pb::ParseWarningCode::MetadataUnavailable.into(),
-                message: "the document's own dictionaries could not be read, so no \
-                          metadata event was sent; the text extraction is unaffected"
-                    .to_owned(),
+                message: format!(
+                    "the document's own dictionaries could not be read ({error}), so {asked_by}; \
+                     the text extraction is unaffected"
+                ),
             }),
-            None => {}
+            Err(_) => warnings.push(pb::ParseWarning {
+                code: pb::ParseWarningCode::MetadataReaderPanicked.into(),
+                message: format!(
+                    "the metadata reader panicked on this document, so {asked_by}; \
+                     the text extraction is unaffected"
+                ),
+            }),
         }
     }
 
@@ -396,6 +415,9 @@ fn parse(
     let mut has_encoding_issues = false;
     let mut extraction_ocr_reasons = Vec::new();
     let mut has_invisible_text = false;
+    let mut pages_needing_ocr = Vec::new();
+    let mut text_withheld = pb::TextWithheld::Unspecified;
+    let mut runs_not_in_markdown = 0u32;
     let mut runs_off_page = 0u32;
 
     // What happens after `info` depends on the mode and on what detection
@@ -416,6 +438,8 @@ fn parse(
             layout = Some(layout_proto(&analyzed.layout));
             has_encoding_issues = analyzed.has_encoding_issues;
             extraction_ocr_reasons = ocr_reasons_proto(&analyzed.ocr_reasons_by_page);
+            pages_needing_ocr.clone_from(&analyzed.pages_needing_ocr);
+            text_withheld = withheld(analyzed.text_withheld.as_ref(), &mut warnings);
         }
         pb::ProcessMode::Full if !options.password.is_empty() => {
             // The per-page extraction API takes no password, so an encrypted
@@ -462,6 +486,9 @@ fn parse(
                     literal_offsets: Vec::new(),
                     // The whole-document API does not report its walk.
                     truncations: Vec::new(),
+                    // Nor which runs it read, so there is nothing to count
+                    // its rendering against.
+                    runs_not_in_markdown: 0,
                     runs_off_page: 0,
                 }))?;
                 metrics.page_emitted(markdown_bytes);
@@ -469,13 +496,20 @@ fn parse(
             }
             warnings.push(pb::ParseWarning {
                 code: pb::ParseWarningCode::PasswordFallback.into(),
-                message: "a password was supplied, so the markdown was extracted \
-                          whole-document and delivered as a single page event"
-                    .to_owned(),
+                message: if pages_extracted == 1 {
+                    "a password was supplied, so the markdown was extracted \
+                     whole-document and delivered as a single page event"
+                } else {
+                    "a password was supplied, so the markdown was extracted \
+                     whole-document, and no text came back"
+                }
+                .to_owned(),
             });
             layout = Some(layout_proto(&processed.layout));
             has_encoding_issues = processed.has_encoding_issues;
             extraction_ocr_reasons = ocr_reasons_proto(&processed.ocr_reasons_by_page);
+            pages_needing_ocr.clone_from(&processed.pages_needing_ocr);
+            text_withheld = withheld(processed.text_withheld.as_ref(), &mut warnings);
         }
         pb::ProcessMode::Full => {
             // The extraction pass, and the only one this mode needs.
@@ -498,6 +532,7 @@ fn parse(
                 rotated_pages,
                 downward_pages,
                 page_boxes,
+                gid_encoded_pages,
                 truncated_pages,
                 off_page_runs,
             } = guarded(guard, || {
@@ -547,6 +582,16 @@ fn parse(
             for page in &ocr_layer_pages {
                 add_verdict(&mut verdicts, *page, pb::OcrReason::Scanned);
             }
+            // A page set in a font that names its glyphs by glyph id and
+            // has no ToUnicode CMap for them: the walk decoded the codes
+            // through the base encoding, which says nothing about what the
+            // glyphs are. However well the text reads, no reader saw it.
+            // The walk said so and this used to drop it.
+            for page in &gid_encoded_pages {
+                add_verdict(&mut verdicts, *page, pb::OcrReason::SuspectedGarbled);
+            }
+            has_encoding_issues |= !gid_encoded_pages.is_empty();
+
             // A page the walk stopped reading partway is not the page: what
             // a renderer draws of it is more than these runs hold. It used
             // to go out as an ordinary page, empty when the stop came
@@ -733,23 +778,23 @@ fn parse(
                     .iter()
                     .map(|item| item.text.trim().to_owned())
                     .collect();
+                let chrome_runs_count = chrome_runs.len();
                 // What is left is content, and what the rendering does with
-                // it is what `dropped` answers for.
-                let content: Vec<pb::TextSpan> = if events.wanted(options.report_furniture) {
-                    page_items
-                        .iter()
-                        .filter(|item| {
-                            matches!(
-                                item.item_type,
-                                pdf_inspector::types::ItemType::Text
-                                    | pdf_inspector::types::ItemType::FormField
-                            )
-                        })
-                        .map(|item| spans::span(item, frame))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
+                // it is what `dropped` answers for. It is measured on every
+                // call, because a plain call's renderer strips running
+                // heads and page numbers itself and leaves out runs it could
+                // not place, and the count is all such a call is told.
+                let content: Vec<pb::TextSpan> = page_items
+                    .iter()
+                    .filter(|item| {
+                        matches!(
+                            item.item_type,
+                            pdf_inspector::types::ItemType::Text
+                                | pdf_inspector::types::ItemType::FormField
+                        )
+                    })
+                    .map(|item| spans::span(item, frame))
+                    .collect();
 
                 // Rendered with the page's own `*`, `#`, backtick and `<`
                 // characters told apart from the markup written around
@@ -764,6 +809,17 @@ fn parse(
                     );
                 let (markdown, literal_offsets) = trimmed(rendered);
                 let dropped = absent_from(content, &markdown);
+                let page_runs_not_in_markdown =
+                    u32::try_from(chrome_runs_count + dropped.len()).unwrap_or(u32::MAX);
+                runs_not_in_markdown =
+                    runs_not_in_markdown.saturating_add(page_runs_not_in_markdown);
+                // The runs themselves go out only to a caller that asked
+                // for the report, as before; everyone gets the count.
+                let dropped = if events.wanted(options.report_furniture) {
+                    dropped
+                } else {
+                    Vec::new()
+                };
                 let markdown_bytes = markdown.len() as u64;
                 let reasons = verdicts.get(&page_no);
                 let needs_ocr = reasons.is_some();
@@ -775,8 +831,9 @@ fn parse(
                 // The rendering is the last thing the encoding backstop can
                 // look at, and it catches a page whose runs were each
                 // individually unremarkable.
-                let encoding_issues = !ocr_layer_pages.contains(&page_no)
-                    && pdf_inspector::detect_encoding_issues(&markdown);
+                let encoding_issues = gid_encoded_pages.contains(&page_no)
+                    || (!ocr_layer_pages.contains(&page_no)
+                        && pdf_inspector::detect_encoding_issues(&markdown));
                 has_encoding_issues |= encoding_issues;
                 let page_invisible: Vec<pb::TextSpan> = invisible
                     .remove(&page_no)
@@ -800,6 +857,7 @@ fn parse(
                         .get(&page_no)
                         .map(|why| why.iter().map(|why| walk_truncation(*why).into()).collect())
                         .unwrap_or_default(),
+                    runs_not_in_markdown: page_runs_not_in_markdown,
                     runs_off_page: off_page_runs.get(&page_no).copied().unwrap_or(0),
                 })?;
                 // Counted after the send: "emitted" means on the wire, and a
@@ -834,6 +892,25 @@ fn parse(
     // here — after the last `page`, before the `status` trailer that closes
     // the stream.
     check(guard)?;
+    if let Some(fold) = events.fold.as_ref()
+        && !fold.rows_outside_grid().is_empty()
+    {
+        let pages: Vec<String> = fold
+            .rows_outside_grid()
+            .iter()
+            .map(u32::to_string)
+            .collect();
+        warnings.push(pb::ParseWarning {
+            code: pb::ParseWarningCode::TableRowsOutsideGrid.into(),
+            message: format!(
+                "{} table(s) matched a detected grid that lacks some of their rows, on \
+                 page(s) {}; the rows only the markdown had follow each grid as a second \
+                 table with no cell boxes",
+                pages.len(),
+                pages.join(", ")
+            ),
+        });
+    }
     if options.emit_document
         && let Some(fold) = events.fold.as_mut()
     {
@@ -847,6 +924,9 @@ fn parse(
         processing_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         extraction_ocr_reasons,
         has_invisible_text,
+        text_withheld: text_withheld.into(),
+        pages_needing_ocr,
+        runs_not_in_markdown,
         runs_off_page,
     }))?;
     Ok(())
@@ -1162,6 +1242,47 @@ fn garble_score(quality: &pdf_inspector::TextQualityReport, page_no: u32) -> Opt
     score
         .is_measurable()
         .then(|| (1.0 - score.english_cosine).clamp(0.0, 1.0))
+}
+
+/// The wire form of why the whole-document pipeline withheld its text, with
+/// the warning that goes with it.
+fn withheld(
+    reason: Option<&pdf_inspector::TextWithheld>,
+    warnings: &mut Vec<pb::ParseWarning>,
+) -> pb::TextWithheld {
+    use pdf_inspector::TextWithheld as Why;
+    let Some(reason) = reason else {
+        return pb::TextWithheld::Unspecified;
+    };
+    let (code, message) = match reason {
+        Why::ExtractionFailed(error) => (
+            pb::TextWithheld::ExtractionFailed,
+            format!("extraction failed on this mixed document, so no text came back: {error}"),
+        ),
+        Why::ReclassifiedScanned => (
+            pb::TextWithheld::ReclassifiedScanned,
+            "this mixed document's text layer was mostly garbage, so it was reclassified \
+             as scanned and its text withheld"
+                .to_owned(),
+        ),
+        Why::GarbageText => (
+            pb::TextWithheld::GarbageText,
+            "this document's text was mostly garbage, so it was withheld and every page \
+             flagged for OCR"
+                .to_owned(),
+        ),
+        Why::AllPagesGidEncoded => (
+            pb::TextWithheld::AllPagesGidEncoded,
+            "every page draws its text with glyph-id fonts that map to no characters, so \
+             the text was withheld"
+                .to_owned(),
+        ),
+    };
+    warnings.push(pb::ParseWarning {
+        code: pb::ParseWarningCode::TextWithheld.into(),
+        message,
+    });
+    code
 }
 
 /// Map the library's per-page OCR reasons onto the wire message.

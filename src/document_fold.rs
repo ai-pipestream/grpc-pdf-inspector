@@ -160,6 +160,10 @@ pub struct DocumentFold {
     /// The list currently being accumulated: whether its markers count, and
     /// the self ref of the group its items hang off.
     open_list: Option<(bool, String)>,
+    /// Each page, once per table, where a pipe block matched a detected
+    /// grid that lacks some of its rows. The rows are kept as a table of
+    /// their own; this is what the trailer counts.
+    rows_outside_grid: Vec<u32>,
 }
 
 /// The arena lengths at one point of a fold, taken before a page is folded
@@ -223,7 +227,16 @@ impl DocumentFold {
             structure: None,
             detected_tables: None,
             open_list: None,
+            rows_outside_grid: Vec::new(),
         }
+    }
+
+    /// The pages, once per table, where a pipe block of the rendering
+    /// matched a detected grid that does not have all of its rows, so the
+    /// rows the grid lacks were folded as a second table beside it.
+    #[must_use]
+    pub fn rows_outside_grid(&self) -> &[u32] {
+        &self.rows_outside_grid
     }
 
     /// Fold one event of the stream.
@@ -557,10 +570,14 @@ impl DocumentFold {
         let mut pictures = self.pictures_of(page.page_no);
         let mut deferred: Vec<(String, Located)> = Vec::new();
 
-        // The page's chrome, by its letters, so a block of markdown the
-        // renderer kept and the chrome report claimed is not folded into
-        // the body as well. Nothing is in both layers.
-        let claimed: Vec<String> = page.furniture.iter().map(|line| letters(line)).collect();
+        // No block of the rendering is the page's chrome: the chrome runs
+        // were taken out of the page before the renderer saw it, which is
+        // what keeps anything from being in both layers. So no block is
+        // skipped for looking like a furniture line. One that does is a
+        // different run with the same letters, a section heading spelled
+        // like the running head, or, for a furniture line with no letters
+        // at all, any block with none; matching by text dropped those from
+        // the body without a word.
 
         // The runs the rendering left out, in the order the page drew
         // them. They are content, so they go into the body, and they go in
@@ -596,9 +613,6 @@ impl DocumentFold {
                 located.spans.extend(lifted.spans);
             }
             let block = block.with_text(lifted.text);
-            if claimed.contains(&letters(block.text())) {
-                continue;
-            }
             self.place_pictures_above(&mut pictures, located.bbox.as_ref(), page.page_no);
             self.place_deferred_above(&mut deferred, located.bbox.as_ref(), page.page_no);
             while dropped
@@ -987,6 +1001,32 @@ impl DocumentFold {
             ..doc::TableItem::default()
         });
         self.link_child(&parent, &self_ref);
+
+        // The pipe block and the grid come out of two detectors, and a
+        // match on half of either says they are the same table, not that
+        // they hold the same rows. Rows of the block the grid does not
+        // have are the page's content all the same: they follow as a table
+        // of their own, with no cell boxes because no detector measured
+        // them, and the trailer counts the split.
+        let missing = rows_outside(text, &region);
+        if missing.is_empty() {
+            return;
+        }
+        self.rows_outside_grid.push(page_no);
+        let self_ref = format!("#/tables/{}", self.document.tables.len());
+        self.document.tables.push(doc::TableItem {
+            self_ref: self_ref.clone(),
+            parent: Some(reference(&parent)),
+            content_layer: doc::ContentLayer::Body as i32,
+            label: doc::DocItemLabel::Table as i32,
+            prov: provenance(page_no, None),
+            data: Some(rows_data(&missing)),
+            source: vec![doc::SourceType {
+                source: Some(doc::source_type::Source::Collector(self.source.clone())),
+            }],
+            ..doc::TableItem::default()
+        });
+        self.link_child(&parent, &self_ref);
     }
 
     /// Append one code block. `CodeItem` inlines the base fields rather
@@ -1250,6 +1290,59 @@ fn table_data(region: &pb::TableRegion) -> doc::TableData {
     }
 }
 
+/// The rows of a pipe-syntax block, each as its non-empty cells, that a
+/// detected grid does not hold: rows whose cells' letters are not, by at
+/// least half, among the grid's. A row with no letters or digits at all is
+/// measured by none and kept with the grid.
+fn rows_outside(block: &str, region: &pb::TableRegion) -> Vec<Vec<String>> {
+    let grid_letters: String = region
+        .rows
+        .iter()
+        .flat_map(|row| row.cells.iter())
+        .map(|cell| letters(cell))
+        .collect();
+    pipe_rows(block)
+        .into_iter()
+        .filter(|row| {
+            let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+            cells.iter().any(|cell| !letters(cell).is_empty())
+                && found_in(&cells, &grid_letters) < SAME_TABLE
+        })
+        .collect()
+}
+
+/// A table of plain rows: no boxes, no header, one cell per pipe cell.
+fn rows_data(rows: &[Vec<String>]) -> doc::TableData {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    let mut cells = Vec::new();
+    let mut grid = Vec::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let row_cells: Vec<doc::TableCell> = row
+            .iter()
+            .enumerate()
+            .map(|(column_index, text)| doc::TableCell {
+                row_span: 1,
+                col_span: 1,
+                start_row_offset_idx: i32::try_from(row_index).unwrap_or(i32::MAX),
+                end_row_offset_idx: i32::try_from(row_index + 1).unwrap_or(i32::MAX),
+                start_col_offset_idx: i32::try_from(column_index).unwrap_or(i32::MAX),
+                end_col_offset_idx: i32::try_from(column_index + 1).unwrap_or(i32::MAX),
+                text: text.clone(),
+                ..doc::TableCell::default()
+            })
+            .collect();
+        cells.extend(row_cells.iter().cloned());
+        grid.push(doc::TableRow { cells: row_cells });
+    }
+    doc::TableData {
+        table_cells: cells,
+        num_rows: i32::try_from(rows.len()).unwrap_or(i32::MAX),
+        num_cols: i32::try_from(columns).unwrap_or(i32::MAX),
+        grid,
+        ..doc::TableData::default()
+    }
+}
+
 /// The share of two boxes' overlap, or of two tables' cells, that makes a
 /// pipe block and a detected grid the same table.
 const SAME_TABLE: f64 = 0.5;
@@ -1298,6 +1391,12 @@ fn matching_grid(
 /// The cells of a pipe-syntax block, row by row, without the separator
 /// row and without empty cells.
 fn pipe_cells(block: &str) -> Vec<String> {
+    pipe_rows(block).into_iter().flatten().collect()
+}
+
+/// The rows of a pipe-syntax block, each as its non-empty cells, without
+/// the separator row.
+fn pipe_rows(block: &str) -> Vec<Vec<String>> {
     block
         .lines()
         .filter(|line| {
@@ -1305,10 +1404,14 @@ fn pipe_cells(block: &str) -> Vec<String> {
                 .chars()
                 .all(|character| matches!(character, '|' | '-' | ':' | ' ' | '\t'))
         })
-        .flat_map(|line| line.split('|'))
-        .map(str::trim)
-        .filter(|cell| !cell.is_empty())
-        .map(ToOwned::to_owned)
+        .map(|line| {
+            line.split('|')
+                .map(str::trim)
+                .filter(|cell| !cell.is_empty())
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|row| !row.is_empty())
         .collect()
 }
 
@@ -2662,6 +2765,86 @@ mod tests {
     }
 
     #[test]
+    fn rows_the_grid_did_not_see_are_folded_beside_it_not_dropped() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        // The grid detector saw the header and two rows; the renderer's
+        // table finder printed all four rows. Half of the block's cells
+        // are in the grid, which is enough to call them the same table.
+        fold.consume(&pb::parse_pdf_response::Event::Tables(pb::PageTables {
+            page_no: 1,
+            tables: vec![pb::TableRegion {
+                rows: vec![
+                    pb::TableCells {
+                        cells: vec!["Year".to_owned(), "Count".to_owned()],
+                        boxes: Vec::new(),
+                    },
+                    pb::TableCells {
+                        cells: vec!["1843".to_owned(), "seven".to_owned()],
+                        boxes: Vec::new(),
+                    },
+                    pb::TableCells {
+                        cells: vec!["1844".to_owned(), "eight".to_owned()],
+                        boxes: Vec::new(),
+                    },
+                ],
+                kind: pb::TableKind::Data.into(),
+                ..pb::TableRegion::default()
+            }],
+        }));
+        fold.consume(&page(
+            1,
+            "| Year | Count |\n|---|---|\n| 1843 | seven |\n| 1844 | eight |\n\
+             | 1845 | nine |\n| 1846 | ten |\n",
+        ));
+        assert_eq!(fold.rows_outside_grid(), [1], "the split is counted");
+        let document = fold.take();
+
+        assert_eq!(document.tables.len(), 2, "{:?}", document.tables);
+        let grid = document.tables[0].data.as_ref().expect("a grid");
+        assert_eq!(grid.num_rows, 3);
+        let rest = document.tables[1].data.as_ref().expect("the rest");
+        let texts: Vec<&str> = rest
+            .table_cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect();
+        assert_eq!(
+            texts,
+            ["1845", "nine", "1846", "ten"],
+            "the rows only the rendering had are in the Document too"
+        );
+        assert_eq!((rest.num_rows, rest.num_cols), (2, 2));
+        assert_sound(&document);
+    }
+
+    #[test]
+    fn a_grid_that_holds_every_row_is_one_table() {
+        let mut fold = DocumentFold::new();
+        fold.consume(&info(1, "", 1.0));
+        fold.consume(&pb::parse_pdf_response::Event::Tables(pb::PageTables {
+            page_no: 1,
+            tables: vec![pb::TableRegion {
+                rows: vec![
+                    pb::TableCells {
+                        cells: vec!["Year".to_owned(), "Count".to_owned()],
+                        boxes: Vec::new(),
+                    },
+                    pb::TableCells {
+                        cells: vec!["1843".to_owned(), "seven".to_owned()],
+                        boxes: Vec::new(),
+                    },
+                ],
+                kind: pb::TableKind::Data.into(),
+                ..pb::TableRegion::default()
+            }],
+        }));
+        fold.consume(&page(1, "| Year | Count |\n|---|---|\n| 1843 | seven |\n"));
+        assert!(fold.rows_outside_grid().is_empty());
+        assert_eq!(fold.take().tables.len(), 1);
+    }
+
+    #[test]
     fn a_flattened_table_becomes_a_grid_again() {
         let mut fold = DocumentFold::new();
         fold.consume(&info(1, "", 1.0));
@@ -3005,30 +3188,38 @@ mod tests {
     }
 
     #[test]
-    fn a_block_the_chrome_report_claimed_is_not_folded_into_the_body_as_well() {
+    fn a_block_spelled_like_a_furniture_line_is_still_body() {
         let mut fold = DocumentFold::new();
         fold.consume(&info(1, "", 1.0));
         fold.consume(&pb::parse_pdf_response::Event::Page(pb::PageMarkdown {
             page_no: 1,
-            // The renderer is shown one page at a time and one page
-            // repeats nothing, so the head it could not prove is chrome
-            // stays in the markdown. The report proved it over the whole
-            // document.
-            markdown: "A Running Head\n\nthe body of the page\n".to_owned(),
-            furniture: vec!["A Running Head".to_owned()],
+            // The chrome run "Results" was taken out of the page before
+            // it was rendered, so the "Results" the markdown carries is
+            // the page's own heading, a different run with the same
+            // letters.
+            markdown: "## Results\n\nthe body of the page\n".to_owned(),
+            furniture: vec!["Results".to_owned()],
             ..pb::PageMarkdown::default()
         }));
         let document = fold.take();
 
-        let head = base_of(&document.texts[0]);
-        assert_eq!(head.text, "A Running Head");
-        assert_eq!(head.content_layer, doc::ContentLayer::Furniture as i32);
+        let texts: Vec<(&str, i32)> = document
+            .texts
+            .iter()
+            .map(|item| {
+                let base = base_of(item);
+                (base.text.as_str(), base.content_layer)
+            })
+            .collect();
         assert_eq!(
-            document.texts.len(),
-            2,
-            "the head is one item, not one per layer"
+            texts,
+            [
+                ("Results", doc::ContentLayer::Furniture as i32),
+                ("Results", doc::ContentLayer::Body as i32),
+                ("the body of the page", doc::ContentLayer::Body as i32),
+            ],
+            "one item per layer, because they are two runs"
         );
-        assert_eq!(base_of(&document.texts[1]).text, "the body of the page");
         assert_sound(&document);
     }
 
