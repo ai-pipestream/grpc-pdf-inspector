@@ -129,6 +129,13 @@ Some patches go further than visibility, because the service could not be
 made safe or correct from outside the crate. Each is written up with its
 reasons in `docs/capture-deferrals.md`.
 
+- **The whole-document pipeline says why it returned no text**
+  (`src/lib.rs`). `process_document` returned `markdown: None` and `Ok` when
+  extraction failed on a mixed document (`.ok()` dropped the error), when a
+  mixed document's garbage text reclassified it as scanned, when a text
+  document's text was garbage, and when every page used glyph-id fonts. The
+  result now carries `text_withheld: Option<TextWithheld>` naming which, with
+  the extraction error kept in `ExtractionFailed`.
 - **Symbol soup is garbled text** (`src/text_quality.rs`). A page whose
   characters are mostly rare ASCII symbols (glyph codes passed through by a
   font with no ToUnicode CMap) is SUSPECTED_GARBLED, which the letter

@@ -413,6 +413,8 @@ fn parse(
     let mut has_encoding_issues = false;
     let mut extraction_ocr_reasons = Vec::new();
     let mut has_invisible_text = false;
+    let mut pages_needing_ocr = Vec::new();
+    let mut text_withheld = pb::TextWithheld::Unspecified;
 
     // What happens after `info` depends on the mode and on what detection
     // found. Scanned and image-based documents have no text layer at all, so
@@ -432,6 +434,8 @@ fn parse(
             layout = Some(layout_proto(&analyzed.layout));
             has_encoding_issues = analyzed.has_encoding_issues;
             extraction_ocr_reasons = ocr_reasons_proto(&analyzed.ocr_reasons_by_page);
+            pages_needing_ocr.clone_from(&analyzed.pages_needing_ocr);
+            text_withheld = withheld(analyzed.text_withheld.as_ref(), &mut warnings);
         }
         pb::ProcessMode::Full if !options.password.is_empty() => {
             // The per-page extraction API takes no password, so an encrypted
@@ -484,13 +488,20 @@ fn parse(
             }
             warnings.push(pb::ParseWarning {
                 code: pb::ParseWarningCode::PasswordFallback.into(),
-                message: "a password was supplied, so the markdown was extracted \
-                          whole-document and delivered as a single page event"
-                    .to_owned(),
+                message: if pages_extracted == 1 {
+                    "a password was supplied, so the markdown was extracted \
+                     whole-document and delivered as a single page event"
+                } else {
+                    "a password was supplied, so the markdown was extracted \
+                     whole-document, and no text came back"
+                }
+                .to_owned(),
             });
             layout = Some(layout_proto(&processed.layout));
             has_encoding_issues = processed.has_encoding_issues;
             extraction_ocr_reasons = ocr_reasons_proto(&processed.ocr_reasons_by_page);
+            pages_needing_ocr.clone_from(&processed.pages_needing_ocr);
+            text_withheld = withheld(processed.text_withheld.as_ref(), &mut warnings);
         }
         pb::ProcessMode::Full => {
             // The extraction pass, and the only one this mode needs.
@@ -857,6 +868,8 @@ fn parse(
         processing_time_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
         extraction_ocr_reasons,
         has_invisible_text,
+        text_withheld: text_withheld.into(),
+        pages_needing_ocr,
     }))?;
     Ok(())
 }
@@ -1171,6 +1184,47 @@ fn garble_score(quality: &pdf_inspector::TextQualityReport, page_no: u32) -> Opt
     score
         .is_measurable()
         .then(|| (1.0 - score.english_cosine).clamp(0.0, 1.0))
+}
+
+/// The wire form of why the whole-document pipeline withheld its text, with
+/// the warning that goes with it.
+fn withheld(
+    reason: Option<&pdf_inspector::TextWithheld>,
+    warnings: &mut Vec<pb::ParseWarning>,
+) -> pb::TextWithheld {
+    use pdf_inspector::TextWithheld as Why;
+    let Some(reason) = reason else {
+        return pb::TextWithheld::Unspecified;
+    };
+    let (code, message) = match reason {
+        Why::ExtractionFailed(error) => (
+            pb::TextWithheld::ExtractionFailed,
+            format!("extraction failed on this mixed document, so no text came back: {error}"),
+        ),
+        Why::ReclassifiedScanned => (
+            pb::TextWithheld::ReclassifiedScanned,
+            "this mixed document's text layer was mostly garbage, so it was reclassified \
+             as scanned and its text withheld"
+                .to_owned(),
+        ),
+        Why::GarbageText => (
+            pb::TextWithheld::GarbageText,
+            "this document's text was mostly garbage, so it was withheld and every page \
+             flagged for OCR"
+                .to_owned(),
+        ),
+        Why::AllPagesGidEncoded => (
+            pb::TextWithheld::AllPagesGidEncoded,
+            "every page draws its text with glyph-id fonts that map to no characters, so \
+             the text was withheld"
+                .to_owned(),
+        ),
+    };
+    warnings.push(pb::ParseWarning {
+        code: pb::ParseWarningCode::TextWithheld.into(),
+        message,
+    });
+    code
 }
 
 /// Map the library's per-page OCR reasons onto the wire message.

@@ -1888,6 +1888,21 @@ pub fn symbol_soup_pdf() -> Vec<u8> {
     prose_then(symbol_soup)
 }
 
+/// Build a one-page PDF whose only text is [`PROSE`] put through
+/// [`symbol_soup`]: a text layer, and no text worth keeping in it.
+#[must_use]
+pub fn soup_only_pdf() -> Vec<u8> {
+    let mut content = String::new();
+    for (index, line) in PROSE.iter().enumerate() {
+        let y = 700 - 16 * i32::try_from(index).expect("eight lines fit in an i32");
+        content.push_str(&format!(
+            "BT /F1 11 Tf 72 {y} Td ({}) Tj ET\n",
+            symbol_soup(line)
+        ));
+    }
+    framed_pdf(&content, None, None)
+}
+
 /// Two pages of [`PROSE`], the second put through `second`.
 fn prose_then(second: fn(&str) -> String) -> Vec<u8> {
     let mut doc = Document::with_version("1.5");
