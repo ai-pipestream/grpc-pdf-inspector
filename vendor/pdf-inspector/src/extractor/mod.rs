@@ -204,7 +204,7 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_invisible(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, _ocr_layer_pages, _rotated, _truncated) =
+    let (extraction, forms, _thresholds, _gid_pages, skipped_invisible, _ocr_layer_pages, _rotated, _truncated, _off_page) =
         extract_positioned_text_impl_reporting_invisible(
             &doc,
             &font_cmaps,
@@ -237,7 +237,7 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
     crate::validate_pdf_bytes(buffer)?;
     let (doc, _) = crate::load_document_from_mem(buffer)?;
     let font_cmaps = FontCMaps::from_doc(&doc);
-    let (extraction, forms, _thresholds, gid_pages, skipped_invisible, ocr_layer_pages, turned_pages, truncated_pages) =
+    let (extraction, forms, _thresholds, gid_pages, skipped_invisible, ocr_layer_pages, turned_pages, truncated_pages, off_page_runs) =
         extract_positioned_text_impl_reporting_invisible(
             &doc,
             &font_cmaps,
@@ -266,6 +266,7 @@ pub fn extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
         page_boxes,
         gid_encoded_pages: gid_pages.into_iter().collect(),
         truncated_pages,
+        off_page_runs,
     })
 }
 
@@ -484,7 +485,7 @@ pub(crate) fn extract_positioned_text_from_doc_reporting_invisible(
     page_filter: Option<&HashSet<u32>>,
     include_invisible: bool,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>, bool), PdfError> {
-    let (extraction, _forms, thresholds, gid_pages, skipped_invisible, _ocr_layer_pages, _rotated, _truncated) =
+    let (extraction, _forms, thresholds, gid_pages, skipped_invisible, _ocr_layer_pages, _rotated, _truncated, _off_page) =
         extract_positioned_text_impl_reporting_invisible(
             doc,
             font_cmaps,
@@ -503,7 +504,7 @@ fn extract_positioned_text_impl(
     include_invisible: bool,
     required_pages: Option<&HashSet<u32>>,
 ) -> Result<(PageExtraction, PageThresholds, HashSet<u32>), PdfError> {
-    let (extraction, _forms, thresholds, gid_pages, _skipped_invisible, _ocr_layer_pages, _rotated, _truncated) =
+    let (extraction, _forms, thresholds, gid_pages, _skipped_invisible, _ocr_layer_pages, _rotated, _truncated, _off_page) =
         extract_positioned_text_impl_reporting_invisible(
             doc,
             font_cmaps,
@@ -542,6 +543,7 @@ fn extract_positioned_text_impl_reporting_invisible(
         BTreeSet<u32>,
         BTreeMap<u32, PageTurn>,
         BTreeMap<u32, Vec<WalkTruncation>>,
+        BTreeMap<u32, u32>,
     ),
     PdfError,
 > {
@@ -556,6 +558,9 @@ fn extract_positioned_text_impl_reporting_invisible(
     let mut ocr_layer_pages: BTreeSet<u32> = BTreeSet::new();
     let mut turned_pages: BTreeMap<u32, PageTurn> = BTreeMap::new();
     let mut truncated_pages: BTreeMap<u32, Vec<WalkTruncation>> = BTreeMap::new();
+    // Per page, the text runs and images dropped below for lying outside
+    // the visible box: content the page carries and no reader sees.
+    let mut off_page_runs: BTreeMap<u32, u32> = BTreeMap::new();
     // Embedded-font style flags are document-scoped: the same font program
     // is shared across pages, so parse it once, not once per page.
     let mut style_cache = FontStyleCache::new();
@@ -685,6 +690,13 @@ fn extract_positioned_text_impl_reporting_invisible(
                     off.len() >= 10 && wordy_chars * 2 >= total_chars.max(1) && !straddles;
                 if bx1 - bx0 >= 72.0 && by1 - by0 >= 72.0 && coherent {
                     let before = items.len();
+                    let dropped = items
+                        .iter()
+                        .filter(|it| outside(it) && matches!(it.item_type, ItemType::Text | ItemType::Image))
+                        .count() as u32;
+                    if dropped > 0 {
+                        *off_page_runs.entry(*page_num).or_default() += dropped;
+                    }
                     items.retain(|it| !outside(it));
                     if items.len() < before {
                         debug!(
@@ -766,6 +778,12 @@ fn extract_positioned_text_impl_reporting_invisible(
                         })
                         .collect();
                     let before = items.len();
+                    // Everything this drops is a text run or an image: the
+                    // keep list spares every other kind.
+                    let dropped = keep.iter().filter(|&&kept| !kept).count() as u32;
+                    if dropped > 0 {
+                        *off_page_runs.entry(*page_num).or_default() += dropped;
+                    }
                     let mut keep = keep.into_iter();
                     items.retain(|_| keep.next().unwrap_or(true));
                     // A form placement on a turned page is in the walk's
@@ -855,6 +873,7 @@ fn extract_positioned_text_impl_reporting_invisible(
         ocr_layer_pages,
         turned_pages,
         truncated_pages,
+        off_page_runs,
     ))
 }
 

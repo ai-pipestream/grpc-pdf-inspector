@@ -741,6 +741,15 @@ message PageMarkdown {
   // them. A run of one or two letters or digits is counted only when it is
   // chrome: whether the renderer kept one cannot be told from its letters.
   uint32 runs_not_in_markdown = 13;
+  // Text runs and images on this page drawn wholly outside the visible
+  // page box (the crop box, cut to the media box), which the walk leaves
+  // out: no reader sees them, so they are in neither `markdown` nor any
+  // other field, but the page carries them. A wrong or deliberately small
+  // crop box, the facing page of an imposed spread and a producer's tag
+  // below the sheet all land here. A run that continues an on-box line is
+  // kept and not counted, and a scan's adopted OCR layer is never cut.
+  // Always 0 on the password fallback's whole-document event (`page_no` 0).
+  uint32 runs_off_page = 14;
 }
 
 // WalkTruncation names a limit or a fault that stopped the walk of a page
@@ -1358,6 +1367,12 @@ message ParseStatus {
   // many runs the selected pages drew that their markdown does not carry.
   // Zero outside per-page FULL.
   uint32 runs_not_in_markdown = 10;
+
+  // `PageMarkdown.runs_off_page` summed over the extracted pages: text
+  // runs and images drawn outside the visible box, which no page's
+  // markdown carries. Reported in FULL for text-bearing documents; 0 on
+  // the password fallback, whose pipeline does not report its walk.
+  uint32 runs_off_page = 11;
 }
 
 // TextWithheld says why the whole-document pipeline returned no text for a

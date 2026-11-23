@@ -418,6 +418,7 @@ fn parse(
     let mut pages_needing_ocr = Vec::new();
     let mut text_withheld = pb::TextWithheld::Unspecified;
     let mut runs_not_in_markdown = 0u32;
+    let mut runs_off_page = 0u32;
 
     // What happens after `info` depends on the mode and on what detection
     // found. Scanned and image-based documents have no text layer at all, so
@@ -488,6 +489,7 @@ fn parse(
                     // Nor which runs it read, so there is nothing to count
                     // its rendering against.
                     runs_not_in_markdown: 0,
+                    runs_off_page: 0,
                 }))?;
                 metrics.page_emitted(markdown_bytes);
                 pages_extracted = 1;
@@ -532,6 +534,7 @@ fn parse(
                 page_boxes,
                 gid_encoded_pages,
                 truncated_pages,
+                off_page_runs,
             } = guarded(guard, || {
                 pdf_inspector::extract_text_with_positions_rects_and_forms_mem_with_ocr_layer(
                     bytes,
@@ -556,6 +559,9 @@ fn parse(
             // out, and the OCR layers it adopted as a scan's text. A text
             // layer nobody is told about is what this reports.
             has_invisible_text = skipped_invisible || !ocr_layer_pages.is_empty();
+            // And the runs no reader sees for lying outside the visible
+            // box, which the walk left out of `items`.
+            runs_off_page = off_page_runs.values().sum();
 
             // The text-quality verdicts, from the runs this call already
             // holds rather than from a second read of the file.
@@ -852,6 +858,7 @@ fn parse(
                         .map(|why| why.iter().map(|why| walk_truncation(*why).into()).collect())
                         .unwrap_or_default(),
                     runs_not_in_markdown: page_runs_not_in_markdown,
+                    runs_off_page: off_page_runs.get(&page_no).copied().unwrap_or(0),
                 })?;
                 // Counted after the send: "emitted" means on the wire, and a
                 // counter that runs ahead of a blocked send is how a batch
@@ -920,6 +927,7 @@ fn parse(
         text_withheld: text_withheld.into(),
         pages_needing_ocr,
         runs_not_in_markdown,
+        runs_off_page,
     }))?;
     Ok(())
 }
