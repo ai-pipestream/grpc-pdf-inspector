@@ -270,7 +270,7 @@ async fn an_underlined_running_head_is_chrome_once_and_not_body_as_well() {
         .pop()
         .expect("the document event");
 
-    let placed = common::placed(&document);
+    let placed = common::placed(document);
     let heads: Vec<i32> = placed
         .iter()
         .filter(|item| item.text.contains(HEAD))
@@ -281,5 +281,5 @@ async fn an_underlined_running_head_is_chrome_once_and_not_body_as_well() {
         [doc::ContentLayer::Furniture as i32; 3],
         "the head is chrome on each page, once, and never body"
     );
-    common::assert_layers_and_parents_agree(&document);
+    common::assert_layers_and_parents_agree(document);
 }
