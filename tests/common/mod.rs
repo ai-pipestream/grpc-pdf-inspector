@@ -674,6 +674,46 @@ pub fn table_pdf() -> Vec<u8> {
     bytes
 }
 
+/// Build a one-page PDF with a borderless table of short aligned cells,
+/// `rows` rows by three columns under a line of prose, whose first `ruled`
+/// rows are also boxed in by drawn rules.
+///
+/// Two detectors read it: the markdown renderer's table finder sees every
+/// aligned row, and the line-driven detector sees the ruled ones. They
+/// agree that this is one table, and disagree about how many rows it has.
+#[must_use]
+pub fn partly_ruled_table_pdf(rows: usize, ruled: usize) -> Vec<u8> {
+    const COLUMNS: [i32; 3] = [72, 240, 400];
+    const RIGHT: i32 = 540;
+    const PITCH: i32 = 24;
+    const TOP: i32 = 700;
+
+    let mut content = String::from(
+        "BT /F1 11 Tf 72 760 Td (A line of ordinary running prose above the table, set to fill the measure.) Tj ET\n",
+    );
+    let edge = |row: usize| TOP + 16 - PITCH * i32::try_from(row).expect("rows fit in an i32");
+    for row in 0..=ruled {
+        let y = edge(row);
+        content.push_str(&format!("{} {y} m {RIGHT} {y} l S\n", COLUMNS[0] - 6));
+    }
+    for x in COLUMNS.iter().map(|x| x - 6).chain([RIGHT]) {
+        content.push_str(&format!("{x} {} m {x} {} l S\n", edge(ruled), edge(0)));
+    }
+    for row in 0..rows {
+        let y = TOP - PITCH * i32::try_from(row).expect("rows fit in an i32");
+        let year = 1830 + row;
+        let cells = [
+            format!("{year}"),
+            format!("Entry{row}"),
+            format!("Value{row}"),
+        ];
+        for (column, text) in COLUMNS.iter().zip(cells) {
+            content.push_str(&format!("BT /F1 11 Tf {column} {y} Td ({text}) Tj ET\n"));
+        }
+    }
+    framed_pdf(&content, None, None)
+}
+
 /// The [`table_pdf`] grid on a page with `rotate`, drawn upright in user
 /// space, or drawn turned (`turned`) so that it reads upright on a
 /// `/Rotate 270` page: the text runs down the sheet, the rows advance

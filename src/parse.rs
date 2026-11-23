@@ -883,6 +883,25 @@ fn parse(
     // here — after the last `page`, before the `status` trailer that closes
     // the stream.
     check(guard)?;
+    if let Some(fold) = events.fold.as_ref()
+        && !fold.rows_outside_grid().is_empty()
+    {
+        let pages: Vec<String> = fold
+            .rows_outside_grid()
+            .iter()
+            .map(u32::to_string)
+            .collect();
+        warnings.push(pb::ParseWarning {
+            code: pb::ParseWarningCode::TableRowsOutsideGrid.into(),
+            message: format!(
+                "{} table(s) matched a detected grid that lacks some of their rows, on \
+                 page(s) {}; the rows only the markdown had follow each grid as a second \
+                 table with no cell boxes",
+                pages.len(),
+                pages.join(", ")
+            ),
+        });
+    }
     if options.emit_document
         && let Some(fold) = events.fold.as_mut()
     {

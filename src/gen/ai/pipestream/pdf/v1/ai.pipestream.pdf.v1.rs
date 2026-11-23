@@ -1629,6 +1629,11 @@ pub enum ParseWarningCode {
     /// The whole-document pipeline returned no text for a text-bearing
     /// document. `ParseStatus.text_withheld` says why.
     TextWithheld = 6,
+    /// A table the markdown printed matched a grid the table detectors found,
+    /// but the grid lacks some of its rows. The Document carries the grid as
+    /// one TableItem and the rows only the markdown had as a second TableItem
+    /// right after it, with no cell boxes. The message names the pages.
+    TableRowsOutsideGrid = 7,
 }
 impl ParseWarningCode {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -1644,6 +1649,7 @@ impl ParseWarningCode {
             Self::ContentTruncated => "PARSE_WARNING_CODE_CONTENT_TRUNCATED",
             Self::MetadataReaderPanicked => "PARSE_WARNING_CODE_METADATA_READER_PANICKED",
             Self::TextWithheld => "PARSE_WARNING_CODE_TEXT_WITHHELD",
+            Self::TableRowsOutsideGrid => "PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -1656,6 +1662,7 @@ impl ParseWarningCode {
             "PARSE_WARNING_CODE_CONTENT_TRUNCATED" => Some(Self::ContentTruncated),
             "PARSE_WARNING_CODE_METADATA_READER_PANICKED" => Some(Self::MetadataReaderPanicked),
             "PARSE_WARNING_CODE_TEXT_WITHHELD" => Some(Self::TextWithheld),
+            "PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID" => Some(Self::TableRowsOutsideGrid),
             _ => None,
         }
     }

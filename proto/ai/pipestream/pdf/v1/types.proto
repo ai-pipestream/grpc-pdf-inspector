@@ -1248,6 +1248,12 @@ enum ParseWarningCode {
   // The whole-document pipeline returned no text for a text-bearing
   // document. `ParseStatus.text_withheld` says why.
   PARSE_WARNING_CODE_TEXT_WITHHELD = 6;
+
+  // A table the markdown printed matched a grid the table detectors found,
+  // but the grid lacks some of its rows. The Document carries the grid as
+  // one TableItem and the rows only the markdown had as a second TableItem
+  // right after it, with no cell boxes. The message names the pages.
+  PARSE_WARNING_CODE_TABLE_ROWS_OUTSIDE_GRID = 7;
 }
 
 // ParseWarning is one non-fatal observation, carried on ParseStatus.
